@@ -1,0 +1,20 @@
+{
+  "name": "@shinick/sharepoint-linux-arm64",
+  "version": "0.1.0",
+  "description": "Prebuilt sharepoint binary for Linux arm64",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shinick-dev/sharepoint.git",
+    "directory": "npm/sharepoint-linux-arm64"
+  },
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin"
+  ]
+}

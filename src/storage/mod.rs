@@ -1,0 +1,394 @@
+//! Local SQLite WAL persistence + 4-reader pool + FTS5 (`trigram` + `LIKE` hybrid) search repository.
+
+pub mod db;
+pub mod drives;
+pub mod search;
+
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use anyhow::Result;
+
+use crate::models::{
+    DriveInfo, DriveItem, DriveSearchHit, PinnedTarget, SharePointSite, SyncCursor,
+};
+
+const MAX_READER_POOL_SIZE: usize = 4;
+
+#[derive(Clone)]
+pub struct Storage {
+    path: PathBuf,
+    writer: Arc<Mutex<rusqlite::Connection>>,
+    readers: Option<Arc<Mutex<Vec<rusqlite::Connection>>>>,
+    trigram_enabled: bool,
+}
+
+enum ReadConnInner<'a> {
+    Pooled {
+        conn: Option<rusqlite::Connection>,
+        pool: &'a Arc<Mutex<Vec<rusqlite::Connection>>>,
+    },
+    Writer(std::sync::MutexGuard<'a, rusqlite::Connection>),
+}
+
+struct ReadConnGuard<'a>(ReadConnInner<'a>);
+
+impl std::ops::Deref for ReadConnGuard<'_> {
+    type Target = rusqlite::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            ReadConnInner::Pooled { conn, .. } => conn
+                .as_ref()
+                .expect("pooled reader connection available until Drop"),
+            ReadConnInner::Writer(guard) => guard,
+        }
+    }
+}
+
+impl Drop for ReadConnGuard<'_> {
+    fn drop(&mut self) {
+        if let ReadConnInner::Pooled { conn, pool } = &mut self.0 {
+            if let Some(c) = conn.take() {
+                if let Ok(mut guard) = pool.lock() {
+                    if guard.len() < MAX_READER_POOL_SIZE {
+                        guard.push(c);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Storage {
+    pub fn open(path: &Path) -> Result<Self> {
+        crate::config::ensure_parent(path)?;
+        let conn = rusqlite::Connection::open(path)?;
+        let trigram_enabled = db::init_connection(&conn, false)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            writer: Arc::new(Mutex::new(conn)),
+            readers: Some(Arc::new(Mutex::new(Vec::with_capacity(
+                MAX_READER_POOL_SIZE,
+            )))),
+            trigram_enabled,
+        })
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        let trigram_enabled = db::init_connection(&conn, true)?;
+        Ok(Self {
+            path: PathBuf::from(":memory:"),
+            writer: Arc::new(Mutex::new(conn)),
+            readers: None,
+            trigram_enabled,
+        })
+    }
+
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = rusqlite::Connection::open_with_flags(path, flags)?;
+        db::init_reader_connection(&conn)?;
+        let trigram_enabled: bool = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'drive_items_fts'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|s| s.to_ascii_lowercase().contains("trigram"))
+            .unwrap_or(false);
+        Ok(Self {
+            path: path.to_path_buf(),
+            writer: Arc::new(Mutex::new(conn)),
+            readers: None,
+            trigram_enabled,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn conn(&self) -> &Arc<Mutex<rusqlite::Connection>> {
+        &self.writer
+    }
+
+    pub fn trigram_enabled(&self) -> bool {
+        self.trigram_enabled
+    }
+
+    pub fn shrink_memory(&self) {
+        if let Ok(conn) = self.writer.lock() {
+            let _ = conn.execute_batch("PRAGMA optimize;");
+            db::shrink_connection_memory(&conn);
+        }
+        if let Some(pool) = &self.readers {
+            if let Ok(guard) = pool.lock() {
+                for c in guard.iter() {
+                    db::shrink_connection_memory(c);
+                }
+            }
+        }
+    }
+
+    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+        self.writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to acquire SQLite connection lock (poisoned mutex)"))
+    }
+
+    fn read_conn(&self) -> Result<ReadConnGuard<'_>> {
+        if let Some(pool) = &self.readers {
+            let existing = {
+                let mut guard = pool.lock().map_err(|_| {
+                    anyhow::anyhow!("Failed to acquire SQLite reader pool lock (poisoned mutex)")
+                })?;
+                guard.pop()
+            };
+            let conn = match existing {
+                Some(c) => c,
+                None => {
+                    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+                    let c = rusqlite::Connection::open_with_flags(&self.path, flags)?;
+                    db::init_reader_connection(&c)?;
+                    c
+                }
+            };
+            Ok(ReadConnGuard(ReadConnInner::Pooled {
+                conn: Some(conn),
+                pool,
+            }))
+        } else {
+            Ok(ReadConnGuard(ReadConnInner::Writer(self.lock_conn()?)))
+        }
+    }
+
+    // --- Sites ---
+
+    pub fn upsert_sites(&self, sites: &[SharePointSite]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        drives::upsert_sites(&mut conn, sites)
+    }
+
+    pub fn list_sites(&self) -> Result<Vec<SharePointSite>> {
+        let conn = self.read_conn()?;
+        drives::list_sites(&conn)
+    }
+
+    // --- Drives ---
+
+    pub fn upsert_drives(&self, drives_list: &[DriveInfo]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        drives::upsert_drives(&mut conn, drives_list)
+    }
+
+    pub fn list_drives(&self, site_id: Option<&str>) -> Result<Vec<DriveInfo>> {
+        let conn = self.read_conn()?;
+        drives::list_drives(&conn, site_id)
+    }
+
+    // --- Drive Items ---
+
+    pub fn upsert_drive_items(&self, items: &[DriveItem]) -> Result<usize> {
+        let mut conn = self.lock_conn()?;
+        drives::upsert_drive_items(&mut conn, items)
+    }
+
+    pub fn replace_folder_children(
+        &self,
+        drive_id: &str,
+        parent_id: Option<&str>,
+        items: &[DriveItem],
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        drives::replace_folder_children(&mut conn, drive_id, parent_id, items)
+    }
+
+    pub fn list_folder_children(
+        &self,
+        drive_id: &str,
+        parent_id: Option<&str>,
+        parent_path: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DriveItem>> {
+        let conn = self.read_conn()?;
+        drives::list_folder_children(&conn, drive_id, parent_id, parent_path, limit)
+    }
+
+    pub fn get_drive_item(&self, drive_id: &str, item_id: &str) -> Result<Option<DriveItem>> {
+        let conn = self.read_conn()?;
+        drives::get_drive_item(&conn, drive_id, item_id)
+    }
+
+    pub fn get_drive_item_by_id_any_drive(&self, item_id: &str) -> Result<Option<DriveItem>> {
+        let conn = self.read_conn()?;
+        drives::get_drive_item_by_id_any_drive(&conn, item_id)
+    }
+
+    pub fn delete_drive_item(&self, drive_id: &str, item_id: &str) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        drives::delete_drive_item(&mut conn, drive_id, item_id)
+    }
+
+    pub fn search_items(
+        &self,
+        query: &str,
+        drive_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DriveSearchHit>> {
+        let conn = self.read_conn()?;
+        search::search_items(&conn, query, drive_id, limit, self.trigram_enabled)
+    }
+
+    // --- Recent & Shared Lists ---
+
+    pub fn replace_recent_items(&self, items: &[DriveItem]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        drives::replace_named_item_list(&mut conn, "recent", items)
+    }
+
+    pub fn list_recent_items(&self, limit: usize) -> Result<Vec<DriveItem>> {
+        let conn = self.read_conn()?;
+        drives::list_named_items(&conn, "recent", limit)
+    }
+
+    pub fn replace_shared_items(&self, items: &[DriveItem]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        drives::replace_named_item_list(&mut conn, "shared", items)
+    }
+
+    pub fn list_shared_items(&self, limit: usize) -> Result<Vec<DriveItem>> {
+        let conn = self.read_conn()?;
+        drives::list_named_items(&conn, "shared", limit)
+    }
+
+    // --- Pins ---
+
+    pub fn upsert_pin(&self, pin: &PinnedTarget) -> Result<()> {
+        let conn = self.lock_conn()?;
+        drives::upsert_pin(&conn, pin)
+    }
+
+    pub fn remove_pin(&self, key: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        drives::remove_pin(&conn, key)
+    }
+
+    pub fn list_pins(&self) -> Result<Vec<PinnedTarget>> {
+        let conn = self.read_conn()?;
+        drives::list_pins(&conn)
+    }
+
+    // --- Sync Cursors ---
+
+    pub fn get_sync_cursor(&self, scope_key: &str) -> Result<Option<SyncCursor>> {
+        let conn = self.read_conn()?;
+        drives::get_sync_cursor(&conn, scope_key)
+    }
+
+    pub fn upsert_sync_cursor(&self, cursor: &SyncCursor) -> Result<()> {
+        let conn = self.lock_conn()?;
+        drives::upsert_sync_cursor(&conn, cursor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sites_drives_items_fts5_and_korean_short_like_fallback() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_sites(&[SharePointSite {
+                id: "site-eng".into(),
+                name: "engineering".into(),
+                display_name: "Engineering Hub".into(),
+                description: Some("Core docs".into()),
+                web_url: Some("https://contoso.sharepoint.com/sites/eng".into()),
+                is_followed: true,
+                created_at: None,
+                last_modified_at: None,
+            }])
+            .unwrap();
+        assert_eq!(storage.list_sites().unwrap().len(), 1);
+
+        storage
+            .upsert_drives(&[DriveInfo {
+                id: "drv-1".into(),
+                name: "Documents".into(),
+                drive_type: "documentLibrary".into(),
+                site_id: Some("site-eng".into()),
+                site_name: Some("Engineering Hub".into()),
+                ..Default::default()
+            }])
+            .unwrap();
+        assert_eq!(storage.list_drives(Some("site-eng")).unwrap().len(), 1);
+
+        let items = vec![
+            DriveItem {
+                id: "item-1".into(),
+                drive_id: "drv-1".into(),
+                parent_id: Some("root".into()),
+                parent_path: "/Architecture".into(),
+                name: "kubernetes-plan.md".into(),
+                size: 1024,
+                mime_type: Some("text/markdown".into()),
+                last_modified_by: Some("Alice Kim".into()),
+                ..Default::default()
+            },
+            DriveItem {
+                id: "item-2".into(),
+                drive_id: "drv-1".into(),
+                parent_id: Some("root".into()),
+                parent_path: "/보고서".into(),
+                name: "기획서.docx".into(),
+                size: 4096,
+                last_modified_by: Some("홍길동".into()),
+                ..Default::default()
+            },
+        ];
+        storage.upsert_drive_items(&items).unwrap();
+
+        // FTS5 trigram match (>= 3 chars)
+        let fts_hits = storage.search_items("kubernetes", Some("drv-1"), 10).unwrap();
+        assert_eq!(fts_hits.len(), 1);
+        assert_eq!(fts_hits[0].item.id, "item-1");
+
+        // Korean < 3 char LIKE fallback!
+        let ko_hits = storage.search_items("기획", Some("drv-1"), 10).unwrap();
+        assert_eq!(ko_hits.len(), 1);
+        assert_eq!(ko_hits[0].item.id, "item-2");
+
+        // Author search
+        let author_hits = storage.search_items("홍길", None, 10).unwrap();
+        assert_eq!(author_hits.len(), 1);
+        assert_eq!(author_hits[0].item.id, "item-2");
+
+        // Recent & Pins
+        storage.replace_recent_items(&items).unwrap();
+        assert_eq!(storage.list_recent_items(10).unwrap().len(), 2);
+
+        storage
+            .upsert_pin(&PinnedTarget {
+                key: "site:site-eng".into(),
+                kind: "site".into(),
+                drive_id: None,
+                item_id: None,
+                site_id: Some("site-eng".into()),
+                label: "Engineering Hub".into(),
+            })
+            .unwrap();
+        assert_eq!(storage.list_pins().unwrap().len(), 1);
+
+        // Delete removes item and FTS entry cleanly
+        storage.delete_drive_item("drv-1", "item-1").unwrap();
+        assert!(storage.get_drive_item("drv-1", "item-1").unwrap().is_none());
+        assert!(storage.search_items("kubernetes", None, 10).unwrap().is_empty());
+    }
+}

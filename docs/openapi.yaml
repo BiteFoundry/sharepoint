@@ -1,0 +1,120 @@
+openapi: 3.1.0
+info:
+  title: "@shinick/sharepoint Local HTTP API"
+  version: 0.1.0
+  description: Local HTTP JSON API for Microsoft SharePoint & OneDrive (`sharepoint serve`, default port 8790).
+servers:
+  - url: http://127.0.0.1:8790
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: Service status
+  /openapi.yaml:
+    get:
+      summary: OpenAPI 3.1 specification
+      responses:
+        "200":
+          description: OpenAPI YAML document
+  /v1/whoami:
+    get:
+      summary: Current Microsoft 365 user and OAuth scope diagnostics
+      responses:
+        "200":
+          description: Identity and scope diagnostics
+  /v1/sites:
+    get:
+      summary: List followed and discovered SharePoint sites
+      responses:
+        "200":
+          description: Sites list
+  /v1/drives:
+    get:
+      summary: List Personal OneDrive and SharePoint document libraries
+      responses:
+        "200":
+          description: Drives list
+  /v1/items:
+    get:
+      summary: List folder items in a OneDrive or SharePoint drive
+      responses:
+        "200":
+          description: Drive items list
+  /v1/items/folder:
+    post:
+      summary: Create a new folder
+      responses:
+        "200":
+          description: Created folder item
+  /v1/items/upload:
+    post:
+      summary: Upload a file (local_path, content_base64, or content_text)
+      responses:
+        "200":
+          description: Uploaded DriveItem
+  /v1/items/{id}:
+    get:
+      summary: Get item metadata
+      responses:
+        "200":
+          description: DriveItem metadata
+    patch:
+      summary: Rename or move an item
+      responses:
+        "200":
+          description: Updated DriveItem
+    delete:
+      summary: Delete an item
+      responses:
+        "200":
+          description: Deletion confirmation
+  /v1/items/{id}/children:
+    get:
+      summary: List child items of a folder
+      responses:
+        "200":
+          description: Child DriveItems
+  /v1/items/{id}/content:
+    get:
+      summary: Read text/code file preview up to safe byte cap
+      responses:
+        "200":
+          description: Text content preview
+  /v1/items/{id}/versions:
+    get:
+      summary: List item version history
+      responses:
+        "200":
+          description: Version list
+  /v1/items/{id}/share:
+    post:
+      summary: Create a sharing link
+      responses:
+        "200":
+          description: Share link result
+  /v1/recent:
+    get:
+      summary: List recently accessed OneDrive files
+      responses:
+        "200":
+          description: Recent items
+  /v1/shared:
+    get:
+      summary: List files shared with me
+      responses:
+        "200":
+          description: Shared items
+  /v1/search:
+    get:
+      summary: Search files via SQLite FTS5 and/or Microsoft Graph
+      responses:
+        "200":
+          description: Matching items
+  /v1/download:
+    post:
+      summary: Download a file to local disk
+      responses:
+        "200":
+          description: "{ ok, path, file_name, mime_type, size_bytes, is_image }"

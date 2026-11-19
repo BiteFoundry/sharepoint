@@ -1,0 +1,60 @@
+[package]
+name = "sharepoint-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Unified Microsoft SharePoint & OneDrive terminal client & AI agent toolkit — Sites, Document Libraries & Personal Files (CLI, TUI, HTTP API, MCP)"
+license = "MIT"
+
+[lib]
+name = "sharepoint_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sharepoint"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+arboard = { version = "3", features = ["image-data"] }
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+dirs = "5"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+notify-rust = "4"
+open = "5"
+rand = "0.8"
+ratatui = "0.28"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2", "gzip"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+scraper = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+unicode-width = "0.2"
+url = "2"
+urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
