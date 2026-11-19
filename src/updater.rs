@@ -42,7 +42,7 @@ pub fn cleanup_stale_old_binary() {
     }
 }
 
-/// Checks GitHub Releases (`repo` = `"shinick-dev/sharepoint"`) for a newer version and optionally replaces the current binary.
+/// Checks GitHub Releases (`repo` = `"BiteFoundry/sharepoint"`) for a newer version and optionally replaces the current binary.
 pub async fn check_or_apply_update(
     repo: &str,
     check_only: bool,
@@ -733,7 +733,7 @@ mod tests {
         }
         let body = serde_json::json!({
             "tag_name": state.tag_name,
-            "html_url": format!("{}/shinick-dev/sharepoint/releases/tag/{}", state.base_url, state.tag_name),
+            "html_url": format!("{}/BiteFoundry/sharepoint/releases/tag/{}", state.base_url, state.tag_name),
             "assets": [
                 {
                     "name": state.asset_name,
@@ -799,7 +799,7 @@ mod tests {
 
         let app = Router::new()
             .route(
-                "/repos/shinick-dev/sharepoint/releases/latest",
+                "/repos/BiteFoundry/sharepoint/releases/latest",
                 get(mock_latest_release),
             )
             .route("/assets/binary", get(mock_binary_api))
@@ -819,7 +819,7 @@ mod tests {
         // 1. check_only = true leaves binary untouched
         let check_res = check_or_apply_update_at(
             &base_url,
-            "shinick-dev/sharepoint",
+            "BiteFoundry/sharepoint",
             true,
             false,
             &fake_exe,
@@ -838,7 +838,7 @@ mod tests {
         // 2. check_only = false downloads, verifies SHA-256, and atomically moves old -> .old
         let apply_res = check_or_apply_update_at(
             &base_url,
-            "shinick-dev/sharepoint",
+            "BiteFoundry/sharepoint",
             false,
             false,
             &fake_exe,
@@ -888,7 +888,7 @@ mod tests {
 
         let app = Router::new()
             .route(
-                "/repos/shinick-dev/sharepoint/releases/latest",
+                "/repos/BiteFoundry/sharepoint/releases/latest",
                 get(mock_latest_release),
             )
             .route("/assets/binary", get(mock_binary_api))
@@ -907,7 +907,7 @@ mod tests {
 
         let err = check_or_apply_update_at(
             &base_url,
-            "shinick-dev/sharepoint",
+            "BiteFoundry/sharepoint",
             false,
             false,
             &fake_exe,
@@ -929,8 +929,8 @@ mod tests {
     #[test]
     fn test_validate_github_repo_and_auth_host_check() {
         assert_eq!(
-            validate_github_repo("shinick-dev/sharepoint").unwrap(),
-            "shinick-dev/sharepoint"
+            validate_github_repo("BiteFoundry/sharepoint").unwrap(),
+            "BiteFoundry/sharepoint"
         );
         assert!(validate_github_repo("../evil/outlook").is_err());
         assert!(validate_github_repo("owner/repo/extra").is_err());
@@ -971,14 +971,14 @@ mod tests {
         let base_clone = base_url.clone();
 
         let app = Router::new().route(
-            "/repos/shinick-dev/sharepoint/releases/latest",
+            "/repos/BiteFoundry/sharepoint/releases/latest",
             get(move || {
                 let asset_name = asset_name_clone.clone();
                 let base_url = base_clone.clone();
                 async move {
                     Json(serde_json::json!({
                         "tag_name": "v9.9.9",
-                        "html_url": format!("{base_url}/shinick-dev/sharepoint/releases/tag/v9.9.9"),
+                        "html_url": format!("{base_url}/BiteFoundry/sharepoint/releases/tag/v9.9.9"),
                         "assets": [
                             {
                                 "name": asset_name,
@@ -1002,7 +1002,7 @@ mod tests {
 
         let err = check_or_apply_update_at(
             &base_url,
-            "shinick-dev/sharepoint",
+            "BiteFoundry/sharepoint",
             false,
             false,
             &fake_exe,

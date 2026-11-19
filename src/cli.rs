@@ -1443,7 +1443,7 @@ async fn cmd_doctor(config: &AppConfig, persona: Persona, online: bool, as_json:
     if as_json {
         println!("{}", serde_json::to_string_pretty(&info)?);
     } else {
-        println!("@shinick/sharepoint v{} ({})", env!("CARGO_PKG_VERSION"), persona.display_name());
+        println!("@bitefoundry/sharepoint v{} ({})", env!("CARGO_PKG_VERSION"), persona.display_name());
         println!("Config:         {}", config::config_file_path().display());
         println!("SQLite DB:      {}", config::db_path(user_id.as_deref()).display());
         println!("Download dir:   {}", config.resolved_download_dir().display());

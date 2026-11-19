@@ -1,4 +1,4 @@
-# `@shinick/sharepoint` MCP Server
+# `@bitefoundry/sharepoint` MCP Server
 
 Start the stdio JSON-RPC 2.0 MCP server:
 

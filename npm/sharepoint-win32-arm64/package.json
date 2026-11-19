@@ -1,10 +1,10 @@
 {
-  "name": "@shinick/sharepoint-win32-arm64",
+  "name": "@bitefoundry/sharepoint-win32-arm64",
   "version": "0.1.0",
   "description": "Prebuilt sharepoint binary for Windows arm64",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shinick-dev/sharepoint.git",
+    "url": "git+https://github.com/BiteFoundry/sharepoint.git",
     "directory": "npm/sharepoint-win32-arm64"
   },
   "license": "MIT",

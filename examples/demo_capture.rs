@@ -1,4 +1,4 @@
-//! Captures real 120x34 Ratatui TUI frames for `@shinick/sharepoint` using synthetic English demo
+//! Captures real 120x34 Ratatui TUI frames for `@bitefoundry/sharepoint` using synthetic English demo
 //! data and renders `assets/demo.gif` via the shared `render_tui_gif.py` script.
 
 use std::{
@@ -875,7 +875,7 @@ fn main() -> Result<()> {
 
     let spec = json!({
         "title": "sharepoint / onedrive — Acme Engineering · Microsoft 365 Files TUI",
-        "badge": "@shinick/sharepoint v0.1.0",
+        "badge": "@bitefoundry/sharepoint v0.1.0",
         "width": WIDTH,
         "height": HEIGHT,
         "bg": [17, 19, 24],

@@ -1,10 +1,10 @@
 <div align="center">
 
-# `@shinick/sharepoint`
+# `@bitefoundry/sharepoint`
 
 **Unified Microsoft SharePoint & OneDrive terminal client, CLI, HTTP API, and MCP server — powered by Rust, Ratatui, and local SQLite FTS5.**
 
-[![npm version](https://img.shields.io/npm/v/%40shinick%2Fsharepoint?style=flat-square&color=038387&label=npm)](https://www.npmjs.com/package/@shinick/sharepoint)
+[![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fsharepoint?style=flat-square&color=038387&label=npm)](https://www.npmjs.com/package/@bitefoundry/sharepoint)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-2b3137?style=flat-square)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-dea584?style=flat-square)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](package.json)
@@ -32,7 +32,7 @@
 
 ```sh
 # 1. Install globally via npm (precompiled native binary for win32 / darwin / linux)
-npm i -g @shinick/sharepoint
+npm i -g @bitefoundry/sharepoint
 
 # 2. Authenticate with Microsoft 365 (PKCE loopback, --device-code, or shared M365 token)
 sharepoint login
@@ -113,16 +113,16 @@ Full tool catalog & schemas: [docs/MCP.md](docs/MCP.md).
 
 ---
 
-## `@shinick` Enterprise Terminal Suite
+## `@bitefoundry` Enterprise Terminal Suite
 
 | Package | Commands | Workspace Coverage |
 | --- | --- | --- |
-| [`@shinick/teams`](https://www.npmjs.com/package/@shinick/teams) | `teams`, `tm` | Microsoft Teams chats, channels, threads & meetings |
-| [`@shinick/outlook`](https://www.npmjs.com/package/@shinick/outlook) | `outlook`, `mail`, `cal` | Microsoft Outlook mail, calendar & contacts |
-| [`@shinick/onenote`](https://www.npmjs.com/package/@shinick/onenote) | `onenote`, `note` | Microsoft OneNote notebooks, sections, pages & XHTML/Markdown |
-| **`@shinick/sharepoint`** | `sharepoint`, `sp`, `onedrive`, `od` | Microsoft SharePoint sites, document libraries & OneDrive files |
-| [`@shinick/atlassian`](https://www.npmjs.com/package/@shinick/atlassian) | `atlassian`, `jira`, `confluence` | Atlassian Jira issues, boards, sprints & Confluence pages |
-| [`@shinick/notion`](https://www.npmjs.com/package/@shinick/notion) | `notion`, `nt` | Notion pages, databases, blocks & Markdown sync |
+| [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams`, `tm` | Microsoft Teams chats, channels, threads & meetings |
+| [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook`, `mail`, `cal` | Microsoft Outlook mail, calendar & contacts |
+| [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote`, `note` | Microsoft OneNote notebooks, sections, pages & XHTML/Markdown |
+| **`@bitefoundry/sharepoint`** | `sharepoint`, `sp`, `onedrive`, `od` | Microsoft SharePoint sites, document libraries & OneDrive files |
+| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `jira`, `confluence` | Atlassian Jira issues, boards, sprints & Confluence pages |
+| [`@bitefoundry/notion`](https://www.npmjs.com/package/@bitefoundry/notion) | `notion`, `nt` | Notion pages, databases, blocks & Markdown sync |
 
 ---
 

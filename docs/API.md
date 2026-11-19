@@ -1,4 +1,4 @@
-# `@shinick/sharepoint` Local HTTP JSON API
+# `@bitefoundry/sharepoint` Local HTTP JSON API
 
 Run locally on port `8790` (default):
 

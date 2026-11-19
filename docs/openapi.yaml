@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: "@shinick/sharepoint Local HTTP API"
+  title: "@bitefoundry/sharepoint Local HTTP API"
   version: 0.1.0
   description: Local HTTP JSON API for Microsoft SharePoint & OneDrive (`sharepoint serve`, default port 8790).
 servers:

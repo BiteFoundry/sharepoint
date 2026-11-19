@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     1. Ensures <RepoRoot>\target\release\sharepoint.exe exists (downloads the prebuilt
-       release binary from GitHub `shinick-dev/sharepoint` via `gh` when missing, so
+       release binary from GitHub `BiteFoundry/sharepoint` via `gh` when missing, so
        Rust/Cargo is NOT required on target PCs).
     2. Registers/updates `# >>> sharepoint launcher >>>` (`function sharepoint`, `sp`, `onedrive`, `od`) in PowerShell $PROFILE.
 
@@ -35,9 +35,9 @@ $releaseExe = Join-Path $releaseDir 'sharepoint.exe'
 if (-not (Test-Path -LiteralPath $releaseExe)) {
     $gh = Get-Command gh -ErrorAction SilentlyContinue
     if ($gh) {
-        Write-Output "[sharepoint] Downloading prebuilt sharepoint.exe from shinick-dev/sharepoint GitHub Release..."
+        Write-Output "[sharepoint] Downloading prebuilt sharepoint.exe from BiteFoundry/sharepoint GitHub Release..."
         New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-        & $gh.Source release download -R 'shinick-dev/sharepoint' --pattern 'sharepoint.exe' --dir $releaseDir --clobber
+        & $gh.Source release download -R 'BiteFoundry/sharepoint' --pattern 'sharepoint.exe' --dir $releaseDir --clobber
     }
 }
 
@@ -55,7 +55,7 @@ function sharepoint {
         if (Get-Command gh -ErrorAction SilentlyContinue) {
             `$relDir = Split-Path -Parent `$exe
             New-Item -ItemType Directory -Force -Path `$relDir | Out-Null
-            gh release download -R 'shinick-dev/sharepoint' --pattern 'sharepoint.exe' --dir `$relDir --clobber 2>`$null
+            gh release download -R 'BiteFoundry/sharepoint' --pattern 'sharepoint.exe' --dir `$relDir --clobber 2>`$null
         }
     }
     if (-not (Test-Path -LiteralPath `$exe)) {

@@ -21,7 +21,7 @@ pub const DEFAULT_AUTH_BASE_URL: &str = "https://login.microsoftonline.com";
 /// Users can always override via `--client-id`, `SHAREPOINT_CLIENT_ID`, `ONEDRIVE_CLIENT_ID`, `TEAMS_CLIENT_ID`, `AZURE_CLIENT_ID`, or `config.toml`.
 pub const DEFAULT_PUBLIC_CLIENT_ID: &str = "14d82eec-204b-4c2f-b7e8-296a70dab67e";
 pub const DEFAULT_TENANT_ID: &str = "common";
-pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/sharepoint";
+pub const DEFAULT_GITHUB_REPO: &str = "BiteFoundry/sharepoint";
 pub const DEFAULT_SERVE_PORT: u16 = 8790;
 
 /// List density mode in TUI (`Cozy` default vs `Compact`).
@@ -785,7 +785,7 @@ mod tests {
         let mut cfg = AppConfig::default();
         assert_eq!(DEFAULT_SERVE_PORT, 8790);
         assert_eq!(APP_DIR_NAME, "sharepoint-cli");
-        assert_eq!(DEFAULT_GITHUB_REPO, "shinick-dev/sharepoint");
+        assert_eq!(DEFAULT_GITHUB_REPO, "BiteFoundry/sharepoint");
         assert!(cfg.effective_scopes().iter().any(|s| s == "Files.ReadWrite.All"));
         assert!(cfg.effective_scopes().iter().any(|s| s == "Sites.ReadWrite.All"));
 

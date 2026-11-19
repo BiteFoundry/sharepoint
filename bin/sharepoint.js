@@ -27,7 +27,7 @@ function launch(
   const platform = process.platform;
   const arch = process.arch;
   const platformKey = `${platform}-${arch}`;
-  const packageName = `@shinick/sharepoint-${platformKey}`;
+  const packageName = `@bitefoundry/sharepoint-${platformKey}`;
   const binaryName = platform === 'win32' ? 'sharepoint.exe' : 'sharepoint';
 
   let packageDir = null;
@@ -42,8 +42,8 @@ function launch(
   if (!binaryPath || !fs.existsSync(binaryPath)) {
     const fallbackNpx =
       commandName === 'sharepoint'
-        ? '  npx --yes @shinick/sharepoint'
-        : `  npx --yes -p @shinick/sharepoint ${commandName}`;
+        ? '  npx --yes @bitefoundry/sharepoint'
+        : `  npx --yes -p @bitefoundry/sharepoint ${commandName}`;
     const lines = [
       `no prebuilt binary found for ${platformKey}.`,
       '',
@@ -53,8 +53,8 @@ function launch(
       `Supported platforms: ${SUPPORTED.join(', ')}`,
       '',
       'Try one of:',
-      '  npm install -g @shinick/sharepoint --include=optional',
-      '  npm install @shinick/sharepoint --include=optional',
+      '  npm install -g @bitefoundry/sharepoint --include=optional',
+      '  npm install @bitefoundry/sharepoint --include=optional',
       fallbackNpx,
       '',
       'If you are on an unsupported platform (for example Alpine/musl Linux),',

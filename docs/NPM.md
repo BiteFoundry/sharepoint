@@ -1,6 +1,6 @@
-# `@shinick/sharepoint` npm Packaging
+# `@bitefoundry/sharepoint` npm Packaging
 
-`@shinick/sharepoint` ships a single prebuilt native Rust binary across 6 optional platform packages (`win32-x64`, `win32-arm64`, `darwin-x64`, `darwin-arm64`, `linux-x64`, `linux-arm64`) with 4 launchers:
+`@bitefoundry/sharepoint` ships a single prebuilt native Rust binary across 6 optional platform packages (`win32-x64`, `win32-arm64`, `darwin-x64`, `darwin-arm64`, `linux-x64`, `linux-arm64`) with 4 launchers:
 
 - `sharepoint` / `sp`: SharePoint Sites & Document Libraries persona
 - `onedrive` / `od`: Personal OneDrive persona (`SHAREPOINT_PERSONA=onedrive` + `argv[0]` detection)
