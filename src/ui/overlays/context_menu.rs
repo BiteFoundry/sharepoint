@@ -60,6 +60,18 @@ impl ContextMenu {
                     if item.is_image() {
                         list.push(MenuItem::new("HD Image Preview", Some("v"), Action::OpenImagePreview));
                     }
+                    if item.markup_kind() == Some(crate::models::MarkupKind::Html) {
+                        list.push(MenuItem::new(
+                            "Interactive HTML Viewer",
+                            Some("v"),
+                            Action::OpenHtmlPreview,
+                        ));
+                        list.push(MenuItem::new(
+                            "Serve HTML Locally in Browser",
+                            Some("o"),
+                            Action::ServeActiveHtml,
+                        ));
+                    }
                     if item.markup_kind().is_some() {
                         list.push(MenuItem::new(
                             "Toggle Rendered / Raw Preview",

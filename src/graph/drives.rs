@@ -851,6 +851,7 @@ impl GraphClient {
         let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, file);
         let mut stream = resp.bytes_stream();
         let mut total_written: u64 = 0;
+        let mut head_sample: Vec<u8> = Vec::new();
 
         while let Some(chunk_res) = stream.next().await {
             let chunk = match chunk_res {
@@ -860,6 +861,10 @@ impl GraphClient {
                     return Err(err).context("Failed to stream download chunk");
                 }
             };
+            if head_sample.len() < 4096 {
+                let take = (4096 - head_sample.len()).min(chunk.len());
+                head_sample.extend_from_slice(&chunk[..take]);
+            }
             if let Err(err) = writer.write_all(&chunk).await {
                 let _ = tokio::fs::remove_file(&dest_path).await;
                 return Err(err).context("Failed to write downloaded chunk");
@@ -874,7 +879,15 @@ impl GraphClient {
             .map(str::to_string)
             .or(header_mime)
             .unwrap_or_else(|| guess_mime_type(&dest_path).to_string());
-        let is_image = crate::img_preview::is_image_mime_or_name(&mime_type, Some(&final_name));
+        let is_image = if head_sample.is_empty() {
+            crate::img_preview::is_image_mime_or_name(&mime_type, Some(&final_name))
+        } else {
+            bitefoundry_html::is_safe_raster_image(
+                Some(&mime_type),
+                Some(&final_name),
+                Some(&head_sample),
+            )
+        };
 
         Ok(DownloadedFile {
             ok: true,

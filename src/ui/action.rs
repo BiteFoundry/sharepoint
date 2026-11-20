@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 
-use crate::models::PinnedTarget;
+use crate::cli::DEFAULT_TEXT_PREVIEW_MAX_BYTES;
+use crate::models::{MarkupKind, PinnedTarget};
 use crate::sync::SyncCommand;
 
 use super::app::{
@@ -11,6 +12,7 @@ use super::app::{
 use super::hitmap::{ButtonId, HitTarget};
 use super::nav_pane::{build_nav_rows, NavRow};
 use super::overlays::context_menu::{ContextMenu, ContextTarget};
+use super::overlays::html_preview::HtmlPreviewOverlay;
 use super::overlays::image_preview::ImagePreviewOverlay;
 use super::overlays::links::LinkExtractorOverlay;
 use super::overlays::quick_input::QuickInputOverlay;
@@ -92,6 +94,12 @@ pub enum Action {
     CopyUrlToClipboard(String),
     ToggleInlineImages,
     OpenImagePreview,
+    OpenHtmlPreview,
+    ServeActiveHtml,
+    ServeHtmlInBrowser {
+        title: String,
+        html: String,
+    },
     LoadPreviewImage,
     CycleImageProtocol,
     DownloadPreviewImage,
@@ -381,6 +389,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     if item.is_image() {
                         return dispatch(Action::OpenImagePreview, app, ui);
                     }
+                    if item.markup_kind() == Some(MarkupKind::Html) {
+                        return dispatch(Action::OpenHtmlPreview, app, ui);
+                    }
                 }
             }
             Focus::Overlay => {}
@@ -641,11 +652,17 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
         }
         Action::OpenActiveWebUrl => {
-            if let Some(url) = app.active_item().and_then(|i| i.web_url) {
-                return dispatch(Action::OpenUrl(url), app, ui);
-            } else {
-                ui.toast("No web URL available for selected item", ToastKind::Warning);
+            if let Some(item) = app.active_item() {
+                if item.markup_kind() == Some(MarkupKind::Html)
+                    && app.text_previews.contains_key(&item.id)
+                {
+                    return dispatch(Action::ServeActiveHtml, app, ui);
+                }
+                if let Some(url) = item.web_url {
+                    return dispatch(Action::OpenUrl(url), app, ui);
+                }
             }
+            ui.toast("No web URL available for selected item", ToastKind::Warning);
         }
 
         // Links & image preview
@@ -699,6 +716,11 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             );
         }
         Action::OpenImagePreview => {
+            if let Some(active) = app.active_item() {
+                if active.markup_kind() == Some(MarkupKind::Html) {
+                    return dispatch(Action::OpenHtmlPreview, app, ui);
+                }
+            }
             let items = app.sorted_visible_items();
             let active_id = app.active_item().map(|i| i.id);
             if let Some(overlay) = ImagePreviewOverlay::from_folder_items(&items, active_id.as_deref()) {
@@ -707,6 +729,125 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             } else {
                 ui.toast("No images in current folder", ToastKind::Info);
             }
+        }
+        Action::OpenHtmlPreview => {
+            let Some(item) = app.active_item() else {
+                ui.toast("No HTML file selected", ToastKind::Info);
+                return false;
+            };
+            if item.markup_kind() != Some(MarkupKind::Html) {
+                ui.toast("Selected item is not an HTML file", ToastKind::Info);
+                return false;
+            }
+            if let Some(html) = app.text_previews.get(&item.id).cloned() {
+                ui.push_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
+                    item.name,
+                    html,
+                    Some(item.id),
+                )));
+            } else {
+                let graph = app.graph.clone();
+                let tx = app.ui_tx.clone();
+                let did = item.effective_drive_id().to_string();
+                let iid = item.effective_item_id().to_string();
+                let dl = item.download_url.clone();
+                let item_id = item.id.clone();
+                let title = item.name.clone();
+                ui.toast(format!("Loading interactive HTML: {}...", item.name), ToastKind::Info);
+                tokio::spawn(async move {
+                    match graph
+                        .download_item_bytes(&did, &iid, dl.as_deref(), DEFAULT_TEXT_PREVIEW_MAX_BYTES)
+                        .await
+                    {
+                        Ok(bytes) => {
+                            let html = String::from_utf8_lossy(&bytes).into_owned();
+                            let _ = tx.send(UiMsg::HtmlPreviewReady {
+                                item_id,
+                                title,
+                                html,
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(UiMsg::PreviewFailed {
+                                item_id,
+                                error: format!("{err:#}"),
+                            });
+                        }
+                    }
+                });
+            }
+        }
+        Action::ServeActiveHtml => {
+            let Some(item) = app.active_item() else {
+                ui.toast("No HTML file selected", ToastKind::Info);
+                return false;
+            };
+            if item.markup_kind() != Some(MarkupKind::Html) {
+                ui.toast("Selected item is not an HTML file", ToastKind::Info);
+                return false;
+            }
+            if let Some(html) = app.text_previews.get(&item.id).cloned() {
+                return dispatch(
+                    Action::ServeHtmlInBrowser {
+                        title: item.name,
+                        html,
+                    },
+                    app,
+                    ui,
+                );
+            }
+            let graph = app.graph.clone();
+            let server = app.html_server.clone();
+            let tx = app.ui_tx.clone();
+            let did = item.effective_drive_id().to_string();
+            let iid = item.effective_item_id().to_string();
+            let dl = item.download_url.clone();
+            let title = item.name.clone();
+            ui.toast(format!("Preparing local server for {}...", item.name), ToastKind::Info);
+            tokio::spawn(async move {
+                match graph
+                    .download_item_bytes(&did, &iid, dl.as_deref(), DEFAULT_TEXT_PREVIEW_MAX_BYTES)
+                    .await
+                {
+                    Ok(bytes) => {
+                        let html = String::from_utf8_lossy(&bytes).into_owned();
+                        match server.serve_html(&title, &html).await {
+                            Ok(url) => {
+                                let _ = tx.send(UiMsg::HtmlServed { url });
+                            }
+                            Err(err) => {
+                                let _ = tx.send(UiMsg::TaskError {
+                                    label: "Serve HTML".into(),
+                                    error: format!("{err:#}"),
+                                });
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(UiMsg::TaskError {
+                            label: "Serve HTML".into(),
+                            error: format!("{err:#}"),
+                        });
+                    }
+                }
+            });
+        }
+        Action::ServeHtmlInBrowser { title, html } => {
+            let server = app.html_server.clone();
+            let tx = app.ui_tx.clone();
+            tokio::spawn(async move {
+                match server.serve_html(&title, &html).await {
+                    Ok(url) => {
+                        let _ = tx.send(UiMsg::HtmlServed { url });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(UiMsg::TaskError {
+                            label: "Serve HTML".into(),
+                            error: format!("{err:#}"),
+                        });
+                    }
+                }
+            });
         }
         Action::LoadPreviewImage => {
             if let Some(Overlay::ImagePreview(ov)) = ui.overlays.last() {
@@ -824,6 +965,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             OverlayKind::Help => ui.push_overlay(Overlay::help()),
             OverlayKind::Links => return dispatch(Action::OpenLinkExtractor, app, ui),
             OverlayKind::ImagePreview => return dispatch(Action::OpenImagePreview, app, ui),
+            OverlayKind::HtmlPreview => return dispatch(Action::OpenHtmlPreview, app, ui),
             _ => {}
         },
         Action::CloseOverlay => {
@@ -992,7 +1134,29 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
                 ui.pop_overlay();
                 return false;
             }
-            Some(HitTarget::OverlayBody) => return false,
+            Some(HitTarget::Button(ButtonId::PreviewRenderToggle)) => {
+                return dispatch(Action::TogglePreviewRenderMode, app, ui);
+            }
+            Some(HitTarget::Button(ButtonId::ServeHtml)) => {
+                return dispatch(Action::ServeActiveHtml, app, ui);
+            }
+            Some(HitTarget::OverlayBody) => {
+                if matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))) {
+                    let outcome = {
+                        let mut top = ui.overlays.pop().unwrap();
+                        let res = match &mut top {
+                            Overlay::HtmlPreview(ov) => ov.handle_click_at(column, row, ui),
+                            _ => OverlayOutcome::Handled,
+                        };
+                        ui.overlays.push(top);
+                        res
+                    };
+                    if let OverlayOutcome::Dispatch(next) = outcome {
+                        return dispatch(next, app, ui);
+                    }
+                }
+                return false;
+            }
             _ => return false,
         }
     }
@@ -1021,14 +1185,31 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             return dispatch(Action::OpenActiveWebUrl, app, ui);
         }
         Some(HitTarget::Button(btn)) => match btn {
-            ButtonId::SortToggle => return dispatch(Action::CycleSortMode, app, ui),
-            ButtonId::PreviewRenderToggle => {
-                return dispatch(Action::TogglePreviewRenderMode, app, ui)
+            ButtonId::Search => return dispatch(Action::OpenSearch, app, ui),
+            ButtonId::CommandPalette => {
+                return dispatch(Action::OpenOverlay(OverlayKind::CommandPalette), app, ui)
             }
+            ButtonId::DensityToggle => return dispatch(Action::ToggleDensity, app, ui),
+            ButtonId::SortToggle => return dispatch(Action::CycleSortMode, app, ui),
             ButtonId::Help => return dispatch(Action::OpenOverlay(OverlayKind::Help), app, ui),
             ButtonId::Settings => {
                 return dispatch(Action::OpenOverlay(OverlayKind::Settings), app, ui)
             }
+            ButtonId::Refresh => return dispatch(Action::RefreshAll, app, ui),
+            ButtonId::UploadFile => return dispatch(Action::OpenFilePicker, app, ui),
+            ButtonId::NewFolder => return dispatch(Action::OpenNewFolder, app, ui),
+            ButtonId::DownloadItem => return dispatch(Action::DownloadSelected, app, ui),
+            ButtonId::ShareItem => return dispatch(Action::CreateAndCopyShareLink, app, ui),
+            ButtonId::RenameItem => return dispatch(Action::OpenRenameItem, app, ui),
+            ButtonId::DeleteItem => return dispatch(Action::ConfirmDeleteSelected, app, ui),
+            ButtonId::ImagePreview => return dispatch(Action::OpenImagePreview, app, ui),
+            ButtonId::HtmlPreview => return dispatch(Action::OpenHtmlPreview, app, ui),
+            ButtonId::ServeHtml => return dispatch(Action::ServeActiveHtml, app, ui),
+            ButtonId::PreviewRenderToggle => {
+                return dispatch(Action::TogglePreviewRenderMode, app, ui)
+            }
+            ButtonId::LinksModal => return dispatch(Action::OpenLinkExtractor, app, ui),
+            ButtonId::OpenInBrowser => return dispatch(Action::OpenActiveWebUrl, app, ui),
             ButtonId::NarrowSidebar => {
                 return dispatch(Action::SelectNarrowPane(NarrowPane::Sidebar), app, ui)
             }
@@ -1038,7 +1219,7 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             ButtonId::NarrowInspector => {
                 return dispatch(Action::SelectNarrowPane(NarrowPane::Inspector), app, ui)
             }
-            _ => {}
+            ButtonId::ConfirmOk | ButtonId::ConfirmCancel => {}
         },
         _ => {}
     }

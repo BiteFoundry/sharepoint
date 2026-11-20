@@ -4,6 +4,7 @@ pub mod command_palette;
 pub mod confirm;
 pub mod context_menu;
 pub mod file_picker;
+pub mod html_preview;
 pub mod image_preview;
 pub mod links;
 pub mod quick_input;
@@ -24,9 +25,9 @@ use crate::ui::{
     hitmap::{HitMap, HitTarget},
     overlays::{
         command_palette::CommandPalette, confirm::ConfirmDialog, context_menu::ContextMenu,
-        file_picker::FilePickerOverlay, image_preview::ImagePreviewOverlay,
-        links::LinkExtractorOverlay, quick_input::QuickInputOverlay, search::SearchOverlay,
-        settings::SettingsState,
+        file_picker::FilePickerOverlay, html_preview::HtmlPreviewOverlay,
+        image_preview::ImagePreviewOverlay, links::LinkExtractorOverlay,
+        quick_input::QuickInputOverlay, search::SearchOverlay, settings::SettingsState,
     },
 };
 
@@ -40,6 +41,7 @@ pub enum OverlayKind {
     Links,
     QuickInput,
     ImagePreview,
+    HtmlPreview,
     Help,
     Confirm,
 }
@@ -53,7 +55,7 @@ pub enum OverlayOutcome {
     NotHandled,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Overlay {
     ContextMenu(ContextMenu),
     CommandPalette(CommandPalette),
@@ -63,6 +65,7 @@ pub enum Overlay {
     Links(LinkExtractorOverlay),
     QuickInput(QuickInputOverlay),
     ImagePreview(ImagePreviewOverlay),
+    HtmlPreview(HtmlPreviewOverlay),
     Help(HelpOverlay),
     Confirm(ConfirmDialog),
 }
@@ -78,19 +81,21 @@ impl Overlay {
             Overlay::Links(_) => OverlayKind::Links,
             Overlay::QuickInput(_) => OverlayKind::QuickInput,
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
+            Overlay::HtmlPreview(_) => OverlayKind::HtmlPreview,
             Overlay::Help(_) => OverlayKind::Help,
             Overlay::Confirm(_) => OverlayKind::Confirm,
         }
     }
 
     pub fn accepts_text(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Overlay::Search(_)
-                | Overlay::CommandPalette(_)
-                | Overlay::FilePicker(_)
-                | Overlay::QuickInput(_)
-        )
+            | Overlay::CommandPalette(_)
+            | Overlay::FilePicker(_)
+            | Overlay::QuickInput(_) => true,
+            Overlay::HtmlPreview(html) => html.is_editing_input(),
+            _ => false,
+        }
     }
 
     pub fn context_menu(menu: ContextMenu) -> Self {
@@ -160,6 +165,7 @@ impl Overlay {
             Overlay::Links(links) => links.handle(action),
             Overlay::QuickInput(input) => input.handle(action),
             Overlay::ImagePreview(preview) => preview.handle(action),
+            Overlay::HtmlPreview(html) => html.handle(action, ui),
             Overlay::Help(_) => match action {
                 Action::CloseOverlay | Action::Activate | Action::Input('q') => {
                     OverlayOutcome::Close
@@ -181,6 +187,7 @@ impl Overlay {
             Overlay::Links(links) => links.select(index),
             Overlay::QuickInput(_)
             | Overlay::ImagePreview(_)
+            | Overlay::HtmlPreview(_)
             | Overlay::Help(_)
             | Overlay::Confirm(_) => {}
         }
@@ -227,6 +234,10 @@ impl Overlay {
                 preview.draw(frame, area, app, ui, hitmap);
                 None
             }
+            Overlay::HtmlPreview(html) => {
+                html.draw(frame, area, app, ui, hitmap);
+                None
+            }
             Overlay::Help(_) => {
                 draw_help(frame, area, ui, hitmap);
                 None
@@ -270,7 +281,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     (
         "Preview & Links",
         &[
-            ("v / Alt+v", "HD terminal image preview overlay"),
+            ("v / Alt+v", "HD image or interactive HTML preview overlay"),
             ("m", "Toggle Rendered / Raw preview (.md / .html)"),
             ("u", "Link Extractor (web URL, share link, file URLs)"),
             ("h", "Toggle inline href URLs in inspector"),

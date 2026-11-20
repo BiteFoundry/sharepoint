@@ -21,6 +21,8 @@ pub enum ButtonId {
     RenameItem,
     DeleteItem,
     ImagePreview,
+    HtmlPreview,
+    ServeHtml,
     PreviewRenderToggle,
     LinksModal,
     OpenInBrowser,

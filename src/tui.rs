@@ -1,6 +1,7 @@
 //! TUI entry shell: terminal raw mode, 80ms CSI/DA1/Kitty active graphics probing,
 //! pixel graphics overlay flush, mouse capture, event loop, and shared IPC daemon attachment.
 
+use std::borrow::Cow;
 use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -104,6 +105,22 @@ impl PixelLayerTracker {
         self.active = desired;
         self.last_term_size = term_size;
     }
+}
+
+fn parse_pixel_key(key: &str) -> (&str, Option<(u16, u16, u16, u16)>) {
+    if let Some((base, crop_str)) = key.rsplit_once("#crop:") {
+        let mut parts = crop_str.split(',');
+        if let (Some(sx), Some(sy), Some(vw), Some(vh), None) = (
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next().and_then(|s| s.parse::<u16>().ok()),
+            parts.next(),
+        ) {
+            return (base, Some((sx, sy, vw, vh)));
+        }
+    }
+    (key, None)
 }
 
 /// Overlay Z-order guard: blocks inline pixel graphics whenever any modal overlay is active,
@@ -387,6 +404,7 @@ pub async fn run_tui(
         }
     }
 
+    app.html_server.shutdown();
     app.sync_ctrl.request(SyncCommand::Shutdown);
     Ok(())
 }
@@ -414,8 +432,9 @@ fn draw_frame(
         }
     }
 
-    // Resolve desired pixel graphic placements with overlay Z-order, scroll, and overflow guards.
+    // Resolve desired pixel graphic placements with overlay Z-order, scroll, crop, and overflow guards.
     let mut desired: Vec<ActivePixelGraphic> = Vec::new();
+    let mut desired_payloads: Vec<Cow<'_, str>> = Vec::new();
     let pending_list = std::mem::take(&mut ui.pending_pixel_graphics);
     let body_h = ui.inspector_scroll.area.height.saturating_sub(1);
     let max_off = ui.inspector_scroll.total_lines.saturating_sub(body_h as usize);
@@ -426,18 +445,29 @@ fn draw_frame(
         if !pixel_graphics_allowed_for_overlays(&ui.overlays, &pending.cache_key) {
             continue;
         }
-        let Some(rendered) = app.rendered_images.get(&pending.cache_key) else {
+        let (base_key, crop) = parse_pixel_key(&pending.cache_key);
+        let Some(rendered) = app.rendered_images.get(base_key) else {
             continue;
         };
-        let Some(ref payload) = rendered.pixel_payload else {
+        let resolved: Option<(Cow<'_, str>, u16, u16)> = if let Some((sx, sy, vw, vh)) = crop {
+            rendered
+                .viewport_pixel_payload(sx, sy, vw, vh)
+                .map(|(p, dw, dh)| (Cow::Owned(p), dw, dh))
+        } else {
+            rendered
+                .pixel_payload
+                .as_deref()
+                .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
+        };
+        let Some((payload, draw_cols, draw_rows)) = resolved else {
             continue;
         };
 
         match evaluate_pixel_placement(
             &pending.cache_key,
             pending.rect,
-            rendered.cols,
-            rendered.rows,
+            draw_cols,
+            draw_rows,
             ui.inspector_scroll.area,
             inspector_scroll_y,
             ui.term_width,
@@ -448,17 +478,23 @@ fn draw_frame(
                     cache_key: pending.cache_key,
                     rect: placement_rect,
                     protocol: rendered.protocol,
-                    cols: rendered.cols,
-                    rows: rendered.rows,
+                    cols: draw_cols,
+                    rows: draw_rows,
                     payload_len: payload.len(),
                 });
+                desired_payloads.push(payload);
             }
             Err(Some((fit_w, fit_h))) => {
-                redecode_requests.push((pending.cache_key, fit_w, fit_h));
+                redecode_requests.push((base_key.to_string(), fit_w, fit_h));
             }
             Err(None) => {}
         }
     }
+
+    let emitted_payloads: Vec<String> = desired_payloads
+        .into_iter()
+        .map(Cow::into_owned)
+        .collect();
 
     for (cache_key, fit_w, fit_h) in redecode_requests {
         app.rendered_images.remove(&cache_key);
@@ -508,17 +544,13 @@ fn draw_frame(
     }
 
     if plan.emit_desired {
-        for graphic in &desired {
-            if let Some(rendered) = app.rendered_images.get(&graphic.cache_key) {
-                if let Some(ref payload) = rendered.pixel_payload {
-                    let move_seq = format!("\x1b[{};{}H", graphic.rect.y + 1, graphic.rect.x + 1);
-                    let _ = stdout.write_all(move_seq.as_bytes());
-                    let _ = stdout.write_all(payload.as_bytes());
-                    if graphic.protocol == TerminalImageProtocol::Kitty {
-                        guard.kitty_used = true;
-                        KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
-                    }
-                }
+        for (graphic, payload) in desired.iter().zip(emitted_payloads.iter()) {
+            let move_seq = format!("\x1b[{};{}H", graphic.rect.y + 1, graphic.rect.x + 1);
+            let _ = stdout.write_all(move_seq.as_bytes());
+            let _ = stdout.write_all(payload.as_bytes());
+            if graphic.protocol == TerminalImageProtocol::Kitty {
+                guard.kitty_used = true;
+                KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
             }
         }
     } else if plan.delete_kitty {

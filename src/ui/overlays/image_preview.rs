@@ -1,21 +1,27 @@
 //! Full-screen HD inline terminal image preview modal (`v` / `Alt+v`).
-//! Supports prev/next cycling (`[`/`]`, `←`/`→`), zoom (`+`/`-`/`0`), protocol cycle (`p`),
-//! download (`d`), and close (`Esc`/`q`/`v`).
+//! Supports vertical/horizontal scrolling for tall/zoomed images (`j`/`k`/`↑`/`↓`/wheel + Scrollbar),
+//! prev/next cycling (`[`/`]`, `←`/`→`), zoom (`+`/`-`/`0`), protocol cycle (`p`),
+//! download (`d`), and close (`Esc`/`q`/`v` or `[✕ Esc]`).
 
 use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
+    },
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    img_preview::TerminalImageProtocol,
     models::DriveItem,
     ui::{
         action::Action,
         app::{AppState, PendingPixelGraphic, UiState},
-        hitmap::{HitMap, HitTarget},
+        hitmap::{ButtonId, HitMap, HitTarget},
         overlays::{centered_rect, OverlayOutcome},
     },
 };
@@ -24,8 +30,10 @@ use crate::{
 pub struct ImagePreviewOverlay {
     pub items: Vec<DriveItem>,
     pub index: usize,
-    /// Zoom percentage (`25..=200`, default `100`).
+    /// Zoom percentage (`25..=300`, default `100`).
     pub zoom_pct: u16,
+    pub scroll_y: u16,
+    pub scroll_x: u16,
     pub error: Option<String>,
 }
 
@@ -42,6 +50,8 @@ impl ImagePreviewOverlay {
             items: images,
             index: start,
             zoom_pct: 100,
+            scroll_y: 0,
+            scroll_x: 0,
             error: None,
         })
     }
@@ -60,45 +70,100 @@ impl ImagePreviewOverlay {
 
     pub fn target_dimensions(&self, term_width: u16, term_height: u16) -> (u16, u16) {
         let rect = Self::modal_rect(Rect::new(0, 0, term_width.max(24), term_height.max(12)));
+        let inner_w = rect.width.saturating_sub(2).max(12);
+        let inner_h = rect.height.saturating_sub(3).max(6);
         let base_cols = rect.width.saturating_sub(4).max(12);
-        let base_rows = rect.height.saturating_sub(4).max(6);
+        let max_cols = inner_w.saturating_mul(2).max(base_cols).min(240);
         let scaled_cols = ((base_cols as u32 * self.zoom_pct as u32) / 100)
-            .clamp(8, base_cols as u32) as u16;
-        let scaled_rows = ((base_rows as u32 * self.zoom_pct as u32) / 100)
-            .clamp(4, base_rows as u32) as u16;
-        (scaled_cols, scaled_rows)
+            .clamp(8, max_cols as u32) as u16;
+        // Pass `scrollable_max_rows >= scaled_cols` so `img_preview` fits tall images to width
+        // and lets them scroll vertically immediately at 100% zoom.
+        let scrollable_max_rows = ((inner_h as u32 * 4 * self.zoom_pct as u32) / 100)
+            .max(scaled_cols as u32)
+            .clamp(6, 240) as u16;
+        (scaled_cols, scrollable_max_rows)
     }
 
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
         match action {
-            Action::CloseOverlay | Action::OpenImagePreview | Action::Input('q') | Action::Input('v') => {
-                OverlayOutcome::Close
-            }
+            Action::CloseOverlay
+            | Action::OpenImagePreview
+            | Action::Input('q')
+            | Action::Input('v') => OverlayOutcome::Close,
             Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
-            Action::CursorRight | Action::Input(']') | Action::Input('l') => {
+            Action::MoveUp | Action::Input('k') => {
+                self.scroll_y = self.scroll_y.saturating_sub(2);
+                OverlayOutcome::Handled
+            }
+            Action::MoveDown | Action::Input('j') => {
+                self.scroll_y = self.scroll_y.saturating_add(2);
+                OverlayOutcome::Handled
+            }
+            Action::ScrollPageUp => {
+                self.scroll_y = self.scroll_y.saturating_sub(10);
+                OverlayOutcome::Handled
+            }
+            Action::ScrollPageDown => {
+                self.scroll_y = self.scroll_y.saturating_add(10);
+                OverlayOutcome::Handled
+            }
+            Action::CursorHome | Action::ScrollTop | Action::Input('g') => {
+                self.scroll_y = 0;
+                self.scroll_x = 0;
+                OverlayOutcome::Handled
+            }
+            Action::CursorEnd | Action::ScrollBottom | Action::Input('G') => {
+                self.scroll_y = u16::MAX;
+                OverlayOutcome::Handled
+            }
+            Action::Input('h') => {
+                self.scroll_x = self.scroll_x.saturating_sub(4);
+                OverlayOutcome::Handled
+            }
+            Action::Input('l') => {
+                self.scroll_x = self.scroll_x.saturating_add(4);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScroll { delta, .. } => {
+                if *delta < 0 {
+                    self.scroll_y = self.scroll_y.saturating_sub((-*delta) as u16);
+                } else {
+                    self.scroll_y = self.scroll_y.saturating_add(*delta as u16);
+                }
+                OverlayOutcome::Handled
+            }
+            Action::CursorRight | Action::Input(']') => {
                 if !self.items.is_empty() {
                     self.index = (self.index + 1) % self.items.len();
+                    self.scroll_y = 0;
+                    self.scroll_x = 0;
                     self.error = None;
                 }
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
-            Action::CursorLeft | Action::Input('[') | Action::Input('h') => {
+            Action::CursorLeft | Action::Input('[') => {
                 if !self.items.is_empty() {
                     self.index = (self.index + self.items.len() - 1) % self.items.len();
+                    self.scroll_y = 0;
+                    self.scroll_x = 0;
                     self.error = None;
                 }
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
             Action::Input('+') | Action::Input('=') => {
-                self.zoom_pct = (self.zoom_pct + 25).min(200);
+                self.zoom_pct = (self.zoom_pct + 25).min(300);
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
             Action::Input('-') => {
                 self.zoom_pct = self.zoom_pct.saturating_sub(25).max(25);
+                self.scroll_y = 0;
+                self.scroll_x = 0;
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
             Action::Input('0') => {
                 self.zoom_pct = 100;
+                self.scroll_y = 0;
+                self.scroll_x = 0;
                 OverlayOutcome::Dispatch(Action::LoadPreviewImage)
             }
             Action::Input('p') => OverlayOutcome::Dispatch(Action::CycleImageProtocol),
@@ -110,40 +175,68 @@ impl ImagePreviewOverlay {
     }
 
     pub fn draw(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         app: &AppState,
         ui: &mut UiState,
         hitmap: &mut HitMap,
     ) {
-        let theme = &ui.theme;
+        let theme = ui.theme.clone();
         let rect = Self::modal_rect(area);
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
+
+        let proto = ui.graphics_caps.protocol;
+        let close_label = "[✕ Esc]";
+        let close_w = close_label.width() as u16;
+        let show_close_pill = rect.width > close_w + 4;
+        let title_budget = rect
+            .width
+            .saturating_sub(2 + if show_close_pill { close_w + 2 } else { 0 })
+            as usize;
 
         let name = self
             .current()
             .map(|i| i.name.as_str())
             .unwrap_or("Image");
         let title = format!(
-            " {name} ({}/{}) · {}% · {} · [/] Prev/Next · +/- Zoom · p Proto · d DL · Esc Close ",
+            " {name} ({}/{}) · {}% · {} · ↑↓/Wheel Scroll · [/] Prev/Next · +/- Zoom · p Proto · d DL ",
             self.index + 1,
             self.items.len().max(1),
             self.zoom_pct,
-            ui.graphics_caps.protocol.label()
+            proto.label()
         );
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                crate::ui::truncate_width(&title, rect.width.saturating_sub(2) as usize),
+                crate::ui::truncate_width(&title, title_budget),
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+
+        if show_close_pill {
+            let close_x = rect.right().saturating_sub(close_w + 1);
+            let close_rect = Rect::new(close_x, rect.y, close_w, 1);
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    close_label,
+                    Style::default().fg(theme.fg).bg(theme.bg_elevated),
+                )),
+                close_rect,
+            );
+            hitmap.add_line(
+                close_x,
+                rect.y,
+                close_w,
+                HitTarget::Button(ButtonId::ConfirmCancel),
+            );
+        }
+
         if inner.width == 0 || inner.height == 0 {
             return;
         }
@@ -152,27 +245,73 @@ impl ImagePreviewOverlay {
             return;
         };
         let (cols, rows) = self.target_dimensions(area.width, area.height);
-        let key = app.modal_image_cache_key(cur, cols, rows, ui.graphics_caps.protocol);
+        let key = app.modal_image_cache_key(cur, cols, rows, proto);
         let max_safe_bottom = area.bottom().saturating_sub(1);
         let safe_inner_h = inner.height.min(max_safe_bottom.saturating_sub(inner.y));
+
         if let Some(rendered) = app.rendered_images.get(&key) {
-            if rendered.protocol.is_pixel() && rendered.pixel_payload.is_some() {
-                if rendered.cols > 0
-                    && rendered.rows > 0
-                    && rendered.cols <= inner.width
-                    && rendered.rows <= safe_inner_h
-                {
-                    let draw_w = rendered.cols;
-                    let draw_h = rendered.rows;
+            let is_pixel =
+                rendered.pixel_payload.is_some() && proto != TerminalImageProtocol::Halfblock;
+            let total_rows = if is_pixel {
+                rendered.rows
+            } else {
+                rendered.lines.len() as u16
+            };
+            let total_cols = rendered.cols;
+
+            let avail_h = if is_pixel
+                && !ui.graphics_caps.cell_px_exact
+                && proto == TerminalImageProtocol::Sixel
+            {
+                safe_inner_h.saturating_sub(1).max(1)
+            } else {
+                safe_inner_h
+            };
+            let show_scrollbar = total_rows > avail_h && inner.width > 2;
+            let avail_w = if show_scrollbar {
+                inner.width.saturating_sub(1)
+            } else {
+                inner.width
+            };
+
+            let max_scroll_y = total_rows.saturating_sub(avail_h);
+            let max_scroll_x = total_cols.saturating_sub(avail_w);
+            self.scroll_y = self.scroll_y.min(max_scroll_y);
+            self.scroll_x = self.scroll_x.min(max_scroll_x);
+            let sy = self.scroll_y;
+            let sx = self.scroll_x;
+
+            if is_pixel {
+                let fits_without_crop = total_cols > 0
+                    && total_rows > 0
+                    && total_cols <= avail_w
+                    && total_rows <= avail_h
+                    && sx == 0
+                    && sy == 0;
+                if fits_without_crop {
+                    let draw_w = total_cols;
+                    let draw_h = total_rows;
                     let draw_rect = Rect::new(
-                        inner.x + inner.width.saturating_sub(draw_w) / 2,
-                        inner.y + safe_inner_h.saturating_sub(draw_h) / 2,
+                        inner.x + avail_w.saturating_sub(draw_w) / 2,
+                        inner.y + avail_h.saturating_sub(draw_h) / 2,
                         draw_w,
                         draw_h,
                     );
                     debug_assert!(draw_rect.bottom() <= max_safe_bottom);
                     ui.pending_pixel_graphics.push(PendingPixelGraphic {
                         cache_key: key,
+                        rect: draw_rect,
+                        protocol: rendered.protocol,
+                    });
+                } else if rendered.has_scroll_backing() && total_cols > 0 && total_rows > 0 {
+                    let draw_w = total_cols.saturating_sub(sx).min(avail_w);
+                    let draw_h = total_rows.saturating_sub(sy).min(avail_h);
+                    let px_x = inner.x + avail_w.saturating_sub(draw_w) / 2;
+                    let px_y = inner.y + avail_h.saturating_sub(draw_h) / 2;
+                    let draw_rect = Rect::new(px_x, px_y, draw_w, draw_h);
+                    debug_assert!(draw_rect.bottom() <= max_safe_bottom);
+                    ui.pending_pixel_graphics.push(PendingPixelGraphic {
+                        cache_key: format!("{key}#crop:{sx},{sy},{avail_w},{avail_h}"),
                         rect: draw_rect,
                         protocol: rendered.protocol,
                     });
@@ -186,7 +325,25 @@ impl ImagePreviewOverlay {
                     );
                 }
             } else {
-                frame.render_widget(Paragraph::new(rendered.lines.clone()), inner);
+                let view_w = total_cols.saturating_sub(sx).min(avail_w);
+                let view_h = total_rows.saturating_sub(sy).min(avail_h);
+                let pad_x = avail_w.saturating_sub(view_w) / 2;
+                let pad_y = avail_h.saturating_sub(view_h) / 2;
+                let draw_rect = Rect::new(inner.x + pad_x, inner.y + pad_y, view_w, view_h);
+                frame.render_widget(
+                    Paragraph::new(rendered.lines.clone()).scroll((sy, sx)),
+                    draw_rect,
+                );
+            }
+
+            if show_scrollbar {
+                let sb_area = Rect::new(inner.right().saturating_sub(1), inner.y, 1, inner.height);
+                let mut sb_state = ScrollbarState::new(max_scroll_y.saturating_add(1) as usize)
+                    .position(sy as usize);
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_style(Style::default().fg(theme.accent))
+                    .track_style(theme.muted_style());
+                frame.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
             }
         } else if let Some(err) = self
             .error
@@ -214,18 +371,25 @@ impl ImagePreviewOverlay {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
+    use ratatui::{backend::TestBackend, Terminal};
+    use tokio::sync::{mpsc, watch};
+
     use super::*;
     use crate::{
         auth::AuthManager,
         config::{AppConfig, Persona},
         graph::GraphClient,
-        img_preview::{RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol},
+        img_preview::{
+            decode_and_render_for_protocol, RenderedTerminalImage, TerminalGraphicsCaps,
+            TerminalImageProtocol,
+        },
         storage::Storage,
         sync::{FocusTarget, SyncCommand, SyncController},
         ui::app::UiMsg,
     };
-    use ratatui::{backend::TestBackend, Terminal};
-    use tokio::sync::{mpsc, watch};
 
     fn test_app_and_ui() -> (AppState, UiState) {
         let cfg = AppConfig::default();
@@ -251,6 +415,22 @@ mod tests {
         }
     }
 
+    fn make_tall_png(w: u32, h: u32) -> Vec<u8> {
+        let img: RgbaImage = ImageBuffer::from_fn(w, h, |x, y| {
+            Rgba([
+                ((x * 255) / w.max(1)) as u8,
+                ((y * 255) / h.max(1)) as u8,
+                160,
+                255,
+            ])
+        });
+        let mut buf = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, ImageFormat::Png)
+            .unwrap();
+        buf.into_inner()
+    }
+
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         let buf = terminal.backend().buffer();
         let mut out = String::new();
@@ -270,7 +450,8 @@ mod tests {
         app.preview_errors
             .insert(item.id.clone(), "403 Forbidden".to_string());
 
-        let overlay = ImagePreviewOverlay::from_folder_items(&[item], Some("img-err-1")).unwrap();
+        let mut overlay =
+            ImagePreviewOverlay::from_folder_items(&[item], Some("img-err-1")).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
         let mut hitmap = HitMap::default();
         terminal
@@ -299,7 +480,7 @@ mod tests {
             cell_px_exact: true,
         };
         let item = sample_image_item("img-ok-1", "chart.png");
-        let overlay =
+        let mut overlay =
             ImagePreviewOverlay::from_folder_items(&[item.clone()], Some("img-ok-1")).unwrap();
         let area = Rect::new(0, 0, 80, 24);
         let (cols, rows) = overlay.target_dimensions(area.width, area.height);
@@ -317,6 +498,7 @@ mod tests {
                 protocol: TerminalImageProtocol::Sixel,
                 lines: Vec::new(),
                 pixel_payload: Some("\x1bP0;1;q\"1;1;400;200#0;2;0;0;0\x1b\\".into()),
+                scroll_backing: None,
             },
         );
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
@@ -330,7 +512,7 @@ mod tests {
         let placed = ui.pending_pixel_graphics[0].rect;
         assert!(placed.bottom() <= area.bottom().saturating_sub(1));
 
-        // Oversized image -> suppressed instead of overflowing modal border
+        // Oversized image without scroll_backing -> suppressed instead of overflowing modal border
         ui.pending_pixel_graphics.clear();
         app.rendered_images.insert(
             key,
@@ -343,6 +525,7 @@ mod tests {
                 protocol: TerminalImageProtocol::Sixel,
                 lines: Vec::new(),
                 pixel_payload: Some("\x1bP0;1;q\"1;1;800;600#0;2;0;0;0\x1b\\".into()),
+                scroll_backing: None,
             },
         );
         terminal
@@ -351,6 +534,86 @@ mod tests {
             })
             .unwrap();
         assert!(ui.pending_pixel_graphics.is_empty());
+    }
+
+    #[test]
+    fn test_modal_tall_image_scroll_clamps_and_emits_crop_for_halfblock_and_sixel() {
+        let png = make_tall_png(400, 2000);
+        let area = Rect::new(0, 0, 100, 30);
+
+        for proto in [TerminalImageProtocol::Halfblock, TerminalImageProtocol::Sixel] {
+            let (mut app, mut ui) = test_app_and_ui();
+            ui.graphics_caps = TerminalGraphicsCaps {
+                protocol: proto,
+                cell_px: (8, 16),
+                cell_px_exact: true,
+            };
+            let item = sample_image_item("tall-1", "tall.png");
+            let mut overlay =
+                ImagePreviewOverlay::from_folder_items(&[item.clone()], Some("tall-1")).unwrap();
+            let (cols, rows) = overlay.target_dimensions(area.width, area.height);
+            let rendered =
+                decode_and_render_for_protocol(&png, cols, rows, (25, 25, 25), ui.graphics_caps)
+                    .unwrap();
+            let total_rows = if proto == TerminalImageProtocol::Halfblock {
+                rendered.lines.len() as u16
+            } else {
+                rendered.rows
+            };
+            let rect = ImagePreviewOverlay::modal_rect(area);
+            let inner_h = rect.height.saturating_sub(2);
+            let expected_max_scroll = total_rows.saturating_sub(inner_h);
+            assert!(expected_max_scroll > 0);
+
+            let base_key = app.modal_image_cache_key(&item, cols, rows, proto);
+            app.rendered_images.insert(base_key.clone(), rendered);
+
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            let mut hitmap = HitMap::new();
+
+            terminal
+                .draw(|frame| {
+                    ui.pending_pixel_graphics.clear();
+                    hitmap.clear();
+                    overlay.draw(frame, area, &app, &mut ui, &mut hitmap);
+                })
+                .unwrap();
+
+            assert!(hitmap
+                .region_of(HitTarget::Button(ButtonId::ConfirmCancel))
+                .is_some());
+
+            if proto == TerminalImageProtocol::Sixel {
+                let pg0 = ui
+                    .pending_pixel_graphics
+                    .first()
+                    .expect("expected cropped pixel graphic");
+                assert!(pg0.cache_key.starts_with(&format!("{base_key}#crop:0,0,")));
+                let rendered_ref = app.rendered_images.get(&base_key).unwrap();
+                let (payload, dw, dh) = rendered_ref
+                    .viewport_pixel_payload(0, 0, pg0.rect.width, pg0.rect.height)
+                    .expect("viewport_pixel_payload must succeed");
+                assert!(payload.starts_with("\x1bP0;1;q\"1;1;"));
+                assert!(dw <= pg0.rect.width && dh <= pg0.rect.height);
+            }
+
+            overlay.handle(&Action::ScrollBottom);
+            terminal
+                .draw(|frame| {
+                    ui.pending_pixel_graphics.clear();
+                    hitmap.clear();
+                    overlay.draw(frame, area, &app, &mut ui, &mut hitmap);
+                })
+                .unwrap();
+            assert_eq!(overlay.scroll_y, expected_max_scroll);
+
+            overlay.handle(&Action::MouseScroll {
+                delta: -3,
+                column: 50,
+                row: 15,
+            });
+            assert_eq!(overlay.scroll_y, expected_max_scroll.saturating_sub(3));
+        }
     }
 
     #[test]
@@ -390,7 +653,6 @@ mod tests {
 
         overlay.handle(&Action::Input('+'));
         assert_eq!(overlay.zoom_pct, 125);
-        // Clamps to base bounds at >=100% and resets cleanly on `0`
         overlay.handle(&Action::Input('0'));
         assert_eq!(overlay.zoom_pct, 100);
         assert_eq!(overlay.target_dimensions(120, 40), (base_c, base_r));

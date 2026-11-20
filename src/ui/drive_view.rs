@@ -34,49 +34,101 @@ pub fn draw_list(
     let theme = &ui.theme;
     let focused = ui.focus == Focus::List;
 
-    // Row 0: Breadcrumb bar + sort badge
+    // Row 0: Breadcrumb bar + clickable right-side pills ([Sort], [Density], [↻])
     let breadcrumb = app.breadcrumb_label();
-    let sort_label = format!(" [Sort: {}] ", app.sort_mode.label());
-    let bc_budget = (area.width as usize).saturating_sub(sort_label.len() + 2);
-    let header_line = Line::from(vec![
-        Span::styled(
-            format!(" {}", truncate_width(&breadcrumb, bc_budget)),
-            theme.title(focused),
-        ),
-        Span::styled(sort_label.clone(), theme.muted_style()),
-    ]);
+    let sort_label = format!("[Sort: {}]", app.sort_mode.label());
+    let density_label = match ui.density {
+        DensityMode::Cozy => "[Cozy]",
+        DensityMode::Compact => "[Comp]",
+    };
+    let refresh_label = "[↻]";
     let header_bg = if theme.no_color {
         Style::default()
     } else {
         Style::default().bg(theme.bg_header)
     };
+
+    let refresh_w = unicode_width::UnicodeWidthStr::width(refresh_label) as u16;
+    let density_w = unicode_width::UnicodeWidthStr::width(density_label) as u16;
+    let sort_w = unicode_width::UnicodeWidthStr::width(sort_label.as_str()) as u16;
+    let show_refresh = area.width > sort_w + density_w + refresh_w + 10;
+    let show_density = area.width > sort_w + density_w + 8;
+    let pills_total = sort_w
+        + if show_density { density_w + 1 } else { 0 }
+        + if show_refresh { refresh_w + 1 } else { 0 }
+        + 1;
+    let bc_budget = (area.width as usize).saturating_sub(pills_total as usize + 2);
+    let bc_text = format!(" {}", truncate_width(&breadcrumb, bc_budget));
+    let bc_w = unicode_width::UnicodeWidthStr::width(bc_text.as_str()) as u16;
+    let pad = area.width.saturating_sub(bc_w + pills_total) as usize;
+
+    let mut header_spans = vec![
+        Span::styled(bc_text, theme.title(focused)),
+        Span::styled(" ".repeat(pad), header_bg),
+        Span::styled(sort_label.clone(), theme.muted_style()),
+    ];
+    if show_density {
+        header_spans.push(Span::styled(" ", header_bg));
+        header_spans.push(Span::styled(density_label, theme.muted_style()));
+    }
+    if show_refresh {
+        header_spans.push(Span::styled(" ", header_bg));
+        header_spans.push(Span::styled(refresh_label, theme.muted_style()));
+    }
+    header_spans.push(Span::styled(" ", header_bg));
     frame.render_widget(
-        Paragraph::new(header_line).style(header_bg),
+        Paragraph::new(Line::from(header_spans)).style(header_bg),
         Rect::new(area.x, area.y, area.width, 1),
     );
-    let sort_x = area.x + area.width.saturating_sub(sort_label.len() as u16);
-    hitmap.add_line(
-        sort_x,
-        area.y,
-        sort_label.len() as u16,
-        HitTarget::Button(ButtonId::SortToggle),
-    );
+
+    let mut pill_x = area.x + area.width.saturating_sub(pills_total);
+    hitmap.add_line(pill_x, area.y, sort_w, HitTarget::Button(ButtonId::SortToggle));
+    pill_x = pill_x.saturating_add(sort_w + 1);
+    if show_density {
+        hitmap.add_line(
+            pill_x,
+            area.y,
+            density_w,
+            HitTarget::Button(ButtonId::DensityToggle),
+        );
+        pill_x = pill_x.saturating_add(density_w + 1);
+    }
+    if show_refresh {
+        hitmap.add_line(pill_x, area.y, refresh_w, HitTarget::Button(ButtonId::Refresh));
+    }
     if !app.folder_stack.is_empty() {
         hitmap.add_line(area.x, area.y, 12.min(area.width), HitTarget::BreadcrumbUp);
     }
 
-    // Row 1: Action toolbar strip
+    // Row 1: Clickable action toolbar strip
     let mut list_start_y = area.y + 1;
     if area.height >= 4 {
-        let toolbar = Line::from(vec![
-            Span::styled(" [n] NewDir ", theme.muted_style()),
-            Span::styled(" [Ctrl+F] Upload ", theme.muted_style()),
-            Span::styled(" [Ctrl+V] PastePNG ", theme.muted_style()),
-            Span::styled(" [d] DL ", theme.muted_style()),
-            Span::styled(" [s] Share ", theme.muted_style()),
-        ]);
+        let toolbar_pills: [(&str, ButtonId); 6] = [
+            ("[n] New", ButtonId::NewFolder),
+            ("[Ctrl+F] Up", ButtonId::UploadFile),
+            ("[d] DL", ButtonId::DownloadItem),
+            ("[s] Share", ButtonId::ShareItem),
+            ("[r] Ren", ButtonId::RenameItem),
+            ("[x] Del", ButtonId::DeleteItem),
+        ];
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+        let mut cur_x = area.x.saturating_add(1);
+        for (idx, (label, btn)) in toolbar_pills.iter().enumerate() {
+            let w = unicode_width::UnicodeWidthStr::width(*label) as u16;
+            let sep_w: u16 = if idx > 0 { 1 } else { 0 };
+            if cur_x + sep_w + w > area.right() {
+                break;
+            }
+            if sep_w > 0 {
+                spans.push(Span::raw(" "));
+                cur_x = cur_x.saturating_add(1);
+            }
+            spans.push(Span::styled((*label).to_string(), theme.muted_style()));
+            hitmap.add_line(cur_x, area.y + 1, w, HitTarget::Button(*btn));
+            cur_x = cur_x.saturating_add(w);
+        }
         frame.render_widget(
-            Paragraph::new(toolbar),
+            Paragraph::new(Line::from(spans)),
             Rect::new(area.x, area.y + 1, area.width, 1),
         );
         list_start_y = area.y + 2;
@@ -247,7 +299,7 @@ pub fn draw_inspector(
         return;
     };
 
-    // Row 0: Inspector Title (+ clickable Rendered/Raw pill for Markdown/HTML)
+    // Row 0: Inspector Title (+ clickable pills for HTML/Markdown/Image items)
     let markup_kind = MarkupKind::detect(&item);
     let header_bg = if theme.no_color {
         Style::default()
@@ -255,51 +307,79 @@ pub fn draw_inspector(
         Style::default().bg(theme.bg_header)
     };
     let title = format!(" [{}] {} ", item.type_badge(), item.name);
-    if markup_kind.is_some() {
-        let pill_label = if ui.render_markup {
+    let mut right_pills: Vec<(&str, Style, ButtonId)> = Vec::new();
+    if markup_kind == Some(MarkupKind::Html) {
+        right_pills.push(("[⚡ Interactive (v)]", theme.reaction_style(true), ButtonId::HtmlPreview));
+        right_pills.push(("[🌐 Serve (o)]", theme.reaction_style(false), ButtonId::ServeHtml));
+        let mode_label = if ui.render_markup {
+            "[m: Rendered]"
+        } else {
+            "[m: Raw]"
+        };
+        let mode_style = if ui.render_markup {
+            theme.reaction_style(true)
+        } else {
+            theme.muted_style()
+        };
+        right_pills.push((mode_label, mode_style, ButtonId::PreviewRenderToggle));
+    } else if markup_kind.is_some() {
+        let mode_label = if ui.render_markup {
             " [m: Rendered] "
         } else {
             " [m: Raw] "
         };
-        let pill_w = unicode_width::UnicodeWidthStr::width(pill_label) as u16;
-        if area.width > pill_w + 4 {
-            let title_budget = (area.width as usize).saturating_sub(pill_w as usize + 1);
-            let trunc_title = truncate_width(&title, title_budget);
-            let title_w = unicode_width::UnicodeWidthStr::width(trunc_title.as_str());
-            let pad = (area.width as usize)
-                .saturating_sub(title_w)
-                .saturating_sub(pill_w as usize);
-            let pill_style = if ui.render_markup {
-                theme.reaction_style(true)
-            } else {
-                theme.muted_style()
-            };
-            let header_line = Line::from(vec![
-                Span::styled(trunc_title, theme.title(focused)),
-                Span::styled(" ".repeat(pad), header_bg),
-                Span::styled(pill_label, pill_style),
-            ]);
-            frame.render_widget(
-                Paragraph::new(header_line).style(header_bg),
-                Rect::new(area.x, area.y, area.width, 1),
-            );
-            let pill_x = area.x + area.width.saturating_sub(pill_w);
-            hitmap.add_line(
-                pill_x,
-                area.y,
-                pill_w,
-                HitTarget::Button(ButtonId::PreviewRenderToggle),
-            );
+        let mode_style = if ui.render_markup {
+            theme.reaction_style(true)
         } else {
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    truncate_width(&title, area.width as usize),
-                    theme.title(focused),
-                ))
-                .style(header_bg),
-                Rect::new(area.x, area.y, area.width, 1),
-            );
+            theme.muted_style()
+        };
+        right_pills.push((mode_label, mode_style, ButtonId::PreviewRenderToggle));
+    } else if item.is_image() {
+        right_pills.push(("[v: HD Preview]", theme.reaction_style(true), ButtonId::ImagePreview));
+    }
+
+    // Select as many right pills as fit cleanly alongside the title
+    let mut chosen_pills: Vec<(&str, Style, ButtonId, u16)> = Vec::new();
+    let mut used_pills_w: u16 = 0;
+    for (label, style, btn) in right_pills {
+        let w = unicode_width::UnicodeWidthStr::width(label) as u16;
+        let gap: u16 = if chosen_pills.is_empty() { 0 } else { 1 };
+        if area.width > used_pills_w + gap + w + 6 {
+            chosen_pills.push((label, style, btn, w));
+            used_pills_w = used_pills_w.saturating_add(gap + w);
         }
+    }
+
+    if !chosen_pills.is_empty() {
+        let trailing_space: u16 = if markup_kind == Some(MarkupKind::Markdown) { 0 } else { 1 };
+        let total_right = used_pills_w.saturating_add(trailing_space);
+        let title_budget = (area.width as usize).saturating_sub(total_right as usize + 1);
+        let trunc_title = truncate_width(&title, title_budget);
+        let title_w = unicode_width::UnicodeWidthStr::width(trunc_title.as_str());
+        let pad = (area.width as usize)
+            .saturating_sub(title_w)
+            .saturating_sub(total_right as usize);
+        let mut header_spans = vec![
+            Span::styled(trunc_title, theme.title(focused)),
+            Span::styled(" ".repeat(pad), header_bg),
+        ];
+        let mut pill_x = area.x + area.width.saturating_sub(total_right);
+        for (idx, (label, style, btn, w)) in chosen_pills.iter().enumerate() {
+            if idx > 0 {
+                header_spans.push(Span::styled(" ", header_bg));
+                pill_x = pill_x.saturating_add(1);
+            }
+            header_spans.push(Span::styled((*label).to_string(), *style));
+            hitmap.add_line(pill_x, area.y, *w, HitTarget::Button(*btn));
+            pill_x = pill_x.saturating_add(*w);
+        }
+        if trailing_space > 0 {
+            header_spans.push(Span::styled(" ", header_bg));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(header_spans)).style(header_bg),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
     } else {
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -311,11 +391,51 @@ pub fn draw_inspector(
         );
     }
 
+    // Row 1: Clickable Inspector Action Pills ([u: Links], [o: Open], [v: HD], [d: DL], [s: Share])
+    let mut body_start_y = area.y + 1;
+    if area.height >= 4 {
+        let mut insp_pills: Vec<(&str, ButtonId)> = Vec::new();
+        if item.is_image() {
+            insp_pills.push(("[v: HD]", ButtonId::ImagePreview));
+        } else if markup_kind == Some(MarkupKind::Html) {
+            insp_pills.push(("[v: Interactive]", ButtonId::HtmlPreview));
+            insp_pills.push(("[o: Serve]", ButtonId::ServeHtml));
+        }
+        insp_pills.push(("[u: Links]", ButtonId::LinksModal));
+        insp_pills.push(("[o: Open]", ButtonId::OpenInBrowser));
+        if !item.is_folder {
+            insp_pills.push(("[d: DL]", ButtonId::DownloadItem));
+        }
+        insp_pills.push(("[s: Share]", ButtonId::ShareItem));
+
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+        let mut cur_x = area.x.saturating_add(1);
+        for (idx, (label, btn)) in insp_pills.iter().enumerate() {
+            let w = unicode_width::UnicodeWidthStr::width(*label) as u16;
+            let sep_w: u16 = if idx > 0 { 1 } else { 0 };
+            if cur_x + sep_w + w > area.right() {
+                break;
+            }
+            if sep_w > 0 {
+                spans.push(Span::raw(" "));
+                cur_x = cur_x.saturating_add(1);
+            }
+            spans.push(Span::styled((*label).to_string(), theme.muted_style()));
+            hitmap.add_line(cur_x, body_start_y, w, HitTarget::Button(*btn));
+            cur_x = cur_x.saturating_add(w);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(area.x, body_start_y, area.width, 1),
+        );
+        body_start_y = area.y + 2;
+    }
+
     let body_area = Rect::new(
         area.x,
-        area.y + 1,
+        body_start_y,
         area.width,
-        area.height.saturating_sub(1),
+        area.bottom().saturating_sub(body_start_y),
     );
     if body_area.height == 0 {
         return;
@@ -773,5 +893,266 @@ mod tests {
         assert!(rs_hitmap
             .region_of(HitTarget::Button(ButtonId::PreviewRenderToggle))
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn html_item_header_pills_open_interactive_overlay_and_v_opens_html_preview() {
+        let _lock = TEST_ENV_LOCK.lock().await;
+        let cfg_dir = tempdir().unwrap();
+        let _env = EnvVarGuard::set(&[(
+            "SHAREPOINT_CONFIG_DIR",
+            Some(cfg_dir.path().to_str().unwrap()),
+        )]);
+
+        let (mut app, mut ui, mut rx) = build_test_app_and_ui();
+        let html_item = DriveItem {
+            id: "html-v-1".into(),
+            drive_id: "d1".into(),
+            name: "demo.html".into(),
+            size: 180,
+            ..Default::default()
+        };
+        app.current_items = vec![html_item.clone()];
+        app.active_selected_id = Some(html_item.id.clone());
+        app.text_previews.insert(
+            html_item.id.clone(),
+            "<html><body><p id=\"out\">Ready</p><button onclick=\"document.getElementById('out').textContent='Done'\">Go</button></body></html>"
+                .into(),
+        );
+
+        let mut hitmap = HitMap::new();
+        let screen = render_inspector_to_string(&app, &mut ui, &mut hitmap, 100, 24);
+        assert!(screen.contains("⚡") && screen.contains("Interactive (v)]"), "{screen}");
+        assert!(screen.contains("🌐") && screen.contains("Serve (o)]"), "{screen}");
+        assert!(screen.contains("[m: Rendered]"), "{screen}");
+        let interactive_rect = hitmap
+            .region_of(HitTarget::Button(ButtonId::HtmlPreview))
+            .expect("HtmlPreview pill must be registered");
+        let serve_rect = hitmap
+            .region_of(HitTarget::Button(ButtonId::ServeHtml))
+            .expect("ServeHtml pill must be registered");
+        assert!(hitmap
+            .region_of(HitTarget::Button(ButtonId::PreviewRenderToggle))
+            .is_some());
+
+        // Clicking [⚡ Interactive (v)] opens Overlay::HtmlPreview
+        ui.hitmap = hitmap;
+        dispatch(
+            Action::Click {
+                column: interactive_rect.x + 1,
+                row: interactive_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(crate::ui::overlays::Overlay::HtmlPreview(_))
+        ));
+
+        // Close overlay, then pressing `v` (`Action::OpenImagePreview`) on HTML item opens HtmlPreview (not "No images")
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+        assert!(ui.overlays.is_empty());
+        dispatch(Action::OpenImagePreview, &mut app, &mut ui);
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(crate::ui::overlays::Overlay::HtmlPreview(_))
+        ));
+        dispatch(Action::CloseOverlay, &mut app, &mut ui);
+
+        // Clicking [🌐 Serve (o)] serves HTML via lazy NativeHtmlServer and emits UiMsg::HtmlServed
+        dispatch(
+            Action::Click {
+                column: serve_rect.x + 1,
+                row: serve_rect.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        let served_msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("expected UiMsg::HtmlServed")
+            .expect("channel open");
+        let url = match served_msg {
+            UiMsg::HtmlServed { url } => url,
+            _ => panic!("expected UiMsg::HtmlServed"),
+        };
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        app.html_server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn html_and_svg_sniff_routing_from_image_decode_path() {
+        let (mut app, mut ui, mut rx) = build_test_app_and_ui();
+
+        // 1. HTML bytes masquerading as .png -> routed cleanly to Overlay::HtmlPreview, never raster-decoded
+        let fake_png = DriveItem {
+            id: "fake-png-1".into(),
+            drive_id: "d1".into(),
+            name: "avatar.png".into(),
+            mime_type: Some("image/png".into()),
+            ..Default::default()
+        };
+        app.current_items = vec![fake_png.clone()];
+        app.active_selected_id = Some(fake_png.id.clone());
+        app.raw_image_bytes.insert(
+            fake_png.id.clone(),
+            std::sync::Arc::from(b"<!DOCTYPE html><html><body><h1>Sign In</h1></body></html>".as_slice()),
+        );
+        let key = app.modal_image_cache_key(&fake_png, 40, 20, crate::img_preview::TerminalImageProtocol::Halfblock);
+        app.request_image_decode(&fake_png, key, 40, 20, ui.graphics_caps);
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("expected UiMsg from request_image_decode")
+            .expect("channel open");
+        assert!(matches!(msg, UiMsg::HtmlContentSniffed { .. }));
+        app.apply_ui_msg(msg, &mut ui);
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(crate::ui::overlays::Overlay::HtmlPreview(_))
+        ));
+        assert!(app.rendered_images.is_empty());
+
+        // 2. SVG bytes masquerading as .png -> informative SVG preview error, never raster-decoded
+        let fake_svg = DriveItem {
+            id: "fake-svg-1".into(),
+            drive_id: "d1".into(),
+            name: "logo.png".into(),
+            mime_type: Some("image/png".into()),
+            ..Default::default()
+        };
+        app.raw_image_bytes.insert(
+            fake_svg.id.clone(),
+            std::sync::Arc::from(b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>".as_slice()),
+        );
+        let svg_key = app.modal_image_cache_key(&fake_svg, 40, 20, crate::img_preview::TerminalImageProtocol::Halfblock);
+        app.request_image_decode(&fake_svg, svg_key, 40, 20, ui.graphics_caps);
+
+        let svg_msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("expected SVG PreviewFailed")
+            .expect("channel open");
+        app.apply_ui_msg(svg_msg, &mut ui);
+        let err = app
+            .preview_errors
+            .get(&fake_svg.id)
+            .expect("expected SVG preview error");
+        assert!(err.contains("SVG"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn wired_button_ids_register_in_full_ui_and_dispatch_on_click() {
+        let _lock = TEST_ENV_LOCK.lock().await;
+        let cfg_dir = tempdir().unwrap();
+        let _env = EnvVarGuard::set(&[(
+            "SHAREPOINT_CONFIG_DIR",
+            Some(cfg_dir.path().to_str().unwrap()),
+        )]);
+
+        let (mut app, mut ui, _rx) = build_test_app_and_ui();
+        let img_item = DriveItem {
+            id: "btn-img-1".into(),
+            drive_id: "d1".into(),
+            name: "photo.png".into(),
+            mime_type: Some("image/png".into()),
+            size: 1024,
+            web_url: Some("https://contoso.sharepoint.com/photo.png".into()),
+            ..Default::default()
+        };
+        app.current_items = vec![img_item.clone()];
+        app.active_selected_id = Some(img_item.id.clone());
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 32)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = crate::ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        let expected_buttons = [
+            ButtonId::Search,
+            ButtonId::CommandPalette,
+            ButtonId::DensityToggle,
+            ButtonId::SortToggle,
+            ButtonId::Help,
+            ButtonId::Settings,
+            ButtonId::Refresh,
+            ButtonId::UploadFile,
+            ButtonId::NewFolder,
+            ButtonId::DownloadItem,
+            ButtonId::ShareItem,
+            ButtonId::RenameItem,
+            ButtonId::DeleteItem,
+            ButtonId::ImagePreview,
+            ButtonId::LinksModal,
+            ButtonId::OpenInBrowser,
+        ];
+        for btn in expected_buttons {
+            assert!(
+                ui.hitmap.region_of(HitTarget::Button(btn)).is_some(),
+                "expected ButtonId::{btn:?} to be registered in full UI hitmap"
+            );
+        }
+
+        // Click Search -> opens Search overlay
+        let r = ui.hitmap.region_of(HitTarget::Button(ButtonId::Search)).unwrap();
+        dispatch(Action::Click { column: r.x + 1, row: r.y }, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(crate::ui::overlays::Overlay::Search(_))));
+        ui.pop_overlay();
+
+        // Click CommandPalette -> opens CommandPalette overlay
+        let r = ui.hitmap.region_of(HitTarget::Button(ButtonId::CommandPalette)).unwrap();
+        dispatch(Action::Click { column: r.x + 1, row: r.y }, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(crate::ui::overlays::Overlay::CommandPalette(_))));
+        ui.pop_overlay();
+
+        // Click NewFolder -> opens QuickInput overlay
+        let r = ui.hitmap.region_of(HitTarget::Button(ButtonId::NewFolder)).unwrap();
+        dispatch(Action::Click { column: r.x + 1, row: r.y }, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(crate::ui::overlays::Overlay::QuickInput(_))));
+        ui.pop_overlay();
+
+        // Click RenameItem -> opens QuickInput overlay
+        let r = ui.hitmap.region_of(HitTarget::Button(ButtonId::RenameItem)).unwrap();
+        dispatch(Action::Click { column: r.x + 1, row: r.y }, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(crate::ui::overlays::Overlay::QuickInput(_))));
+        ui.pop_overlay();
+
+        // Click DeleteItem -> opens Confirm overlay
+        let r = ui.hitmap.region_of(HitTarget::Button(ButtonId::DeleteItem)).unwrap();
+        dispatch(Action::Click { column: r.x + 1, row: r.y }, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(crate::ui::overlays::Overlay::Confirm(_))));
+        ui.pop_overlay();
+
+        // Click UploadFile -> opens FilePicker overlay
+        let r = ui.hitmap.region_of(HitTarget::Button(ButtonId::UploadFile)).unwrap();
+        dispatch(Action::Click { column: r.x + 1, row: r.y }, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(crate::ui::overlays::Overlay::FilePicker(_))));
+        ui.pop_overlay();
+
+        // Click LinksModal -> opens Links overlay
+        let r = ui.hitmap.region_of(HitTarget::Button(ButtonId::LinksModal)).unwrap();
+        dispatch(Action::Click { column: r.x + 1, row: r.y }, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(crate::ui::overlays::Overlay::Links(_))));
+        ui.pop_overlay();
+
+        // Click ImagePreview -> opens ImagePreview overlay
+        let r = ui.hitmap.region_of(HitTarget::Button(ButtonId::ImagePreview)).unwrap();
+        dispatch(Action::Click { column: r.x + 1, row: r.y }, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(crate::ui::overlays::Overlay::ImagePreview(_))));
+        ui.pop_overlay();
+
+        // Click DensityToggle -> toggles density mode
+        let prev_density = ui.density;
+        let r = ui.hitmap.region_of(HitTarget::Button(ButtonId::DensityToggle)).unwrap();
+        dispatch(Action::Click { column: r.x + 1, row: r.y }, &mut app, &mut ui);
+        assert_ne!(ui.density, prev_density);
+
+        // Click Settings -> opens Settings overlay
+        let r = ui.hitmap.region_of(HitTarget::Button(ButtonId::Settings)).unwrap();
+        dispatch(Action::Click { column: r.x + 1, row: r.y }, &mut app, &mut ui);
+        assert!(matches!(ui.overlays.last(), Some(crate::ui::overlays::Overlay::Settings(_))));
+        ui.pop_overlay();
     }
 }

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bitefoundry_html::{is_safe_raster_image, sniff_content_kind, ContentKind, NativeHtmlServer};
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
@@ -24,6 +25,7 @@ use super::hitmap::HitMap;
 use super::keymap::Keymap;
 use super::markup::CachedMarkupPreview;
 use super::notification;
+use super::overlays::html_preview::HtmlPreviewOverlay;
 use super::overlays::Overlay;
 use super::theme::Theme;
 use super::toast::{TaskBoard, ToastKind, ToastQueue};
@@ -152,6 +154,20 @@ pub enum UiMsg {
     ImageDecoded {
         cache_key: String,
         rendered: RenderedTerminalImage,
+    },
+    HtmlContentSniffed {
+        item_id: String,
+        title: String,
+        html: String,
+        cache_key: String,
+    },
+    HtmlPreviewReady {
+        item_id: String,
+        title: String,
+        html: String,
+    },
+    HtmlServed {
+        url: String,
     },
     ItemDownloaded(DownloadedFile),
     ItemUploaded(DriveItem),
@@ -310,6 +326,8 @@ pub struct AppState {
     pub inflight_previews: HashSet<String>,
     pub search_results: Vec<DriveItem>,
     pub active_selected_id: Option<String>,
+    /// Lazy localhost Axum HTML server (`0 MB` idle until `o` is pressed).
+    pub html_server: NativeHtmlServer,
 }
 
 impl AppState {
@@ -357,6 +375,7 @@ impl AppState {
             inflight_previews: HashSet::new(),
             search_results: Vec::new(),
             active_selected_id: None,
+            html_server: NativeHtmlServer::new(),
         }
     }
 
@@ -626,9 +645,37 @@ impl AppState {
         }
         let tx = self.ui_tx.clone();
         let item_id = item.id.clone();
+        let item_name = item.name.clone();
+        let item_mime = item.mime_type.clone();
 
         if let Some(raw) = self.raw_image_bytes.get(&item_id).cloned() {
             tokio::task::spawn_blocking(move || {
+                match sniff_content_kind(item_mime.as_deref(), Some(&item_name), Some(&raw)) {
+                    ContentKind::Html => {
+                        let _ = tx.send(UiMsg::HtmlContentSniffed {
+                            item_id,
+                            title: item_name,
+                            html: String::from_utf8_lossy(&raw).into_owned(),
+                            cache_key,
+                        });
+                        return;
+                    }
+                    ContentKind::Svg => {
+                        let _ = tx.send(UiMsg::PreviewFailed {
+                            item_id,
+                            error: "SVG vector image (image/svg+xml) cannot be raster-decoded — press o to open in browser".into(),
+                        });
+                        return;
+                    }
+                    kind if kind != ContentKind::RasterImage => {
+                        let _ = tx.send(UiMsg::PreviewFailed {
+                            item_id,
+                            error: format!("Unsupported image response ({kind:?}); refusing raster decode"),
+                        });
+                        return;
+                    }
+                    _ => {}
+                }
                 match img_preview::decode_and_render_for_protocol(&raw, cols, rows, (18, 20, 26), caps) {
                     Ok(rendered) => {
                         let _ = tx.send(UiMsg::ImageDecoded {
@@ -657,6 +704,30 @@ impl AppState {
                 .await
             {
                 Ok(bytes) => {
+                    let kind = sniff_content_kind(item_mime.as_deref(), Some(&item_name), Some(&bytes));
+                    if kind == ContentKind::Html {
+                        let _ = tx.send(UiMsg::HtmlContentSniffed {
+                            item_id,
+                            title: item_name,
+                            html: String::from_utf8_lossy(&bytes).into_owned(),
+                            cache_key,
+                        });
+                        return;
+                    }
+                    if kind == ContentKind::Svg {
+                        let _ = tx.send(UiMsg::PreviewFailed {
+                            item_id,
+                            error: "SVG vector image (image/svg+xml) cannot be raster-decoded — press o to open in browser".into(),
+                        });
+                        return;
+                    }
+                    if !is_safe_raster_image(item_mime.as_deref(), Some(&item_name), Some(&bytes)) {
+                        let _ = tx.send(UiMsg::PreviewFailed {
+                            item_id,
+                            error: format!("Unsupported image response ({kind:?}); refusing raster decode"),
+                        });
+                        return;
+                    }
                     let arc: Arc<[u8]> = Arc::from(bytes);
                     let _ = tx.send(UiMsg::ImageBytesFetched {
                         item_id: item_id.clone(),
@@ -923,6 +994,7 @@ impl AppState {
                 self.item_versions.insert(item_id, versions);
             }
             UiMsg::PreviewFailed { item_id, error } => {
+                self.inflight_previews.retain(|k| !k.contains(&item_id));
                 self.preview_errors.insert(item_id, error);
             }
             UiMsg::ImageBytesFetched { item_id, bytes } => {
@@ -941,6 +1013,55 @@ impl AppState {
                 }
                 self.rendered_images.insert(cache_key, rendered);
             }
+            UiMsg::HtmlContentSniffed {
+                item_id,
+                title,
+                html,
+                cache_key,
+            } => {
+                self.inflight_previews.remove(&cache_key);
+                self.preview_errors.remove(&item_id);
+                self.text_previews.insert(item_id.clone(), html.clone());
+                if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
+                    ui.pop_overlay();
+                }
+                let already_open = matches!(
+                    ui.overlays.last(),
+                    Some(Overlay::HtmlPreview(ov)) if ov.item_id.as_deref() == Some(item_id.as_str())
+                );
+                if !already_open {
+                    ui.push_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
+                        title,
+                        html,
+                        Some(item_id),
+                    )));
+                }
+                ui.toast(
+                    "HTML content detected — opened interactive HTML viewer",
+                    ToastKind::Info,
+                );
+            }
+            UiMsg::HtmlPreviewReady {
+                item_id,
+                title,
+                html,
+            } => {
+                self.inflight_previews.remove(&format!("txt:{item_id}"));
+                self.preview_errors.remove(&item_id);
+                self.text_previews.insert(item_id.clone(), html.clone());
+                ui.push_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
+                    title,
+                    html,
+                    Some(item_id),
+                )));
+            }
+            UiMsg::HtmlServed { url } => match open::that(&url) {
+                Ok(()) => ui.toast(format!("Serving HTML at {url}"), ToastKind::Success),
+                Err(err) => ui.toast(
+                    format!("HTML ready at {url} (browser open failed: {err})"),
+                    ToastKind::Warning,
+                ),
+            },
             UiMsg::ItemDownloaded(dl) => {
                 let msg = format!("Downloaded {} -> {}", dl.file_name, dl.path.display());
                 ui.toast(msg.clone(), ToastKind::Success);

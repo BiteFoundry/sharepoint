@@ -289,25 +289,58 @@ fn draw_status_bar(
     } else {
         String::new()
     };
-    let status_text = format!(
-        " {} · {}{}  |  / Search · Ctrl+P Palette · Ctrl+F Upload · Ctrl+V PastePNG · ? Help ",
+
+    let pills: [(&str, ButtonId); 6] = [
+        ("[/ Search]", ButtonId::Search),
+        ("[Ctrl+P Palette]", ButtonId::CommandPalette),
+        ("[Ctrl+F Upload]", ButtonId::UploadFile),
+        ("[Ctrl+R Sync]", ButtonId::Refresh),
+        ("[Ctrl+, Prefs]", ButtonId::Settings),
+        ("[? Help]", ButtonId::Help),
+    ];
+
+    let left_prefix = format!(
+        " {} · {}{}  ",
         app.persona.display_name(),
         spinner,
         app.sync_summary
     );
+
+    let mut chosen: Vec<(&str, ButtonId, u16)> = Vec::new();
+    let mut right_w: u16 = 0;
+    for (label, btn) in pills.iter().rev() {
+        let w = label.width() as u16;
+        let gap: u16 = if chosen.is_empty() { 1 } else { 1 };
+        if area.width > right_w + w + gap + 12 {
+            chosen.push((*label, *btn, w));
+            right_w = right_w.saturating_add(w + gap);
+        }
+    }
+    chosen.reverse();
+
+    let left_budget = (area.width as usize).saturating_sub(right_w as usize + 1);
+    let left_trunc = truncate_width(&left_prefix, left_budget);
+    let left_w = left_trunc.width();
+    let pad = (area.width as usize)
+        .saturating_sub(left_w)
+        .saturating_sub(right_w as usize);
+
+    let mut spans = vec![
+        Span::styled(left_trunc, bg),
+        Span::styled(" ".repeat(pad), bg),
+    ];
+    let mut pill_x = area.x + area.width.saturating_sub(right_w);
+    for (label, btn, w) in &chosen {
+        spans.push(Span::styled((*label).to_string(), bg));
+        hitmap.add_line(pill_x, area.y, *w, HitTarget::Button(*btn));
+        pill_x = pill_x.saturating_add(*w);
+        spans.push(Span::styled(" ", bg));
+        pill_x = pill_x.saturating_add(1);
+    }
+
     frame.render_widget(
-        Paragraph::new(Span::styled(
-            truncate_width(&status_text, area.width as usize),
-            bg,
-        ))
-        .style(bg),
+        Paragraph::new(ratatui::text::Line::from(spans)).style(bg),
         area,
-    );
-    hitmap.add_line(
-        area.right().saturating_sub(8),
-        area.y,
-        8.min(area.width),
-        HitTarget::Button(ButtonId::Help),
     );
 }
 
