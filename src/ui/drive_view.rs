@@ -289,6 +289,7 @@ pub fn draw_inspector(
     let focused = ui.focus == Focus::Inspector;
 
     let Some(item) = app.active_item() else {
+        ui.markup_cache = None;
         frame.render_widget(
             Paragraph::new(Span::styled(
                 " Select a file or folder to inspect metadata, preview images, or read text",
@@ -514,6 +515,16 @@ pub fn draw_inspector(
     let meta_rows_used = lines.len() as u16;
 
     // Live inline image preview for image files
+    let active_preview_key = AppState::text_preview_key(item.effective_drive_id(), &item.id);
+    if markup_kind.is_none()
+        || ui
+            .markup_cache
+            .as_ref()
+            .is_some_and(|cached| cached.key.item_id != active_preview_key)
+    {
+        ui.markup_cache = None;
+    }
+
     if item.is_image() && ui.inline_images {
         let preview_key = app.inline_image_cache_key(&item);
         if let Some(rendered) = app.rendered_images.get(&preview_key) {
@@ -564,7 +575,7 @@ pub fn draw_inspector(
             )));
         }
     } else if item.is_text_previewable() {
-        if let Some(content) = app.text_previews.get(&item.id) {
+        if let Some(content) = app.text_preview_for(&item) {
             if let Some(kind) = markup_kind {
                 if ui.render_markup {
                     lines.push(Line::from(Span::styled(
@@ -577,7 +588,7 @@ pub fn draw_inspector(
                     )));
                     let render_w = body_area.width.saturating_sub(2);
                     let cache_key = MarkupCacheKey::new(
-                        &item.id,
+                        &active_preview_key,
                         kind,
                         content,
                         render_w,
@@ -637,7 +648,7 @@ pub fn draw_inspector(
                     )));
                 }
             }
-        } else if let Some(err) = app.preview_errors.get(&item.id) {
+        } else if let Some(err) = app.text_preview_error_for(&item) {
             lines.push(Line::from(Span::styled(
                 format!(" Text preview unavailable: {err}"),
                 Style::default().fg(theme.warning),
@@ -765,8 +776,9 @@ mod tests {
         };
         app.current_items = vec![md_item.clone()];
         app.active_selected_id = Some(md_item.id.clone());
-        app.text_previews.insert(
-            md_item.id.clone(),
+        app.set_text_preview(
+            md_item.effective_drive_id(),
+            &md_item.id,
             "# Launch Plan\n\nCheck **bold** and [Docs](https://example.com/docs).\n".into(),
         );
 
@@ -857,8 +869,9 @@ mod tests {
         };
         app.current_items = vec![html_item.clone()];
         app.active_selected_id = Some(html_item.id.clone());
-        app.text_previews.insert(
-            html_item.id.clone(),
+        app.set_text_preview(
+            html_item.effective_drive_id(),
+            &html_item.id,
             "<html><head><script>evil()</script></head><body><h1>Q4 &amp; Review</h1><p>All good.</p></body></html>"
                 .into(),
         );
@@ -883,8 +896,7 @@ mod tests {
         };
         app.current_items = vec![rs_item.clone()];
         app.active_selected_id = Some(rs_item.id.clone());
-        app.text_previews
-            .insert(rs_item.id.clone(), "fn main() {}\n".into());
+        app.set_text_preview(rs_item.effective_drive_id(), &rs_item.id, "fn main() {}\n".into());
 
         let mut rs_hitmap = HitMap::new();
         let rs_screen = render_inspector_to_string(&app, &mut ui, &mut rs_hitmap, 80, 24);
@@ -914,8 +926,9 @@ mod tests {
         };
         app.current_items = vec![html_item.clone()];
         app.active_selected_id = Some(html_item.id.clone());
-        app.text_previews.insert(
-            html_item.id.clone(),
+        app.set_text_preview(
+            html_item.effective_drive_id(),
+            &html_item.id,
             "<html><body><p id=\"out\">Ready</p><button onclick=\"document.getElementById('out').textContent='Done'\">Go</button></body></html>"
                 .into(),
         );

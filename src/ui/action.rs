@@ -396,8 +396,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         }
                         app.folder_stack
                             .push((item.effective_item_id().to_string(), item.name.clone()));
-                        ui.inspector_scroll.top();
-                        app.load_active_folder();
+                        app.navigate_to_active_folder(ui);
                     } else {
                         ui.focus = Focus::Inspector;
                         ui.narrow_pane = NarrowPane::Inspector;
@@ -419,8 +418,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         },
         Action::NavigateUp => {
             if app.folder_stack.pop().is_some() {
-                ui.inspector_scroll.top();
-                app.load_active_folder();
+                app.navigate_to_active_folder(ui);
             } else if ui.focus == Focus::Inspector {
                 ui.focus = Focus::List;
                 ui.narrow_pane = NarrowPane::Files;
@@ -430,25 +428,25 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             app.active_source = ActiveViewSource::OneDriveRoot;
             app.folder_stack.clear();
             ui.focus = Focus::List;
-            app.load_active_folder();
+            app.navigate_to_active_folder(ui);
         }
         Action::OpenRecent => {
             app.active_source = ActiveViewSource::Recent;
             app.folder_stack.clear();
             ui.focus = Focus::List;
-            app.load_active_folder();
+            app.navigate_to_active_folder(ui);
         }
         Action::OpenSharedWithMe => {
             app.active_source = ActiveViewSource::SharedWithMe;
             app.folder_stack.clear();
             ui.focus = Focus::List;
-            app.load_active_folder();
+            app.navigate_to_active_folder(ui);
         }
         Action::SelectDrive { drive_id, label } => {
             app.active_source = ActiveViewSource::Drive { drive_id, label };
             app.folder_stack.clear();
             ui.focus = Focus::List;
-            app.load_active_folder();
+            app.navigate_to_active_folder(ui);
         }
         Action::TogglePinCurrent => {
             if let Some(drive_id) = app.active_drive_id() {
@@ -675,7 +673,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::OpenActiveWebUrl => {
             if let Some(item) = app.active_item() {
                 if item.markup_kind() == Some(MarkupKind::Html)
-                    && app.text_previews.contains_key(&item.id)
+                    && app.text_preview_for(&item).is_some()
                 {
                     return dispatch(Action::ServeActiveHtml, app, ui);
                 }
@@ -690,7 +688,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::OpenLinkExtractor => {
             if let Some(item) = app.active_item() {
                 let share = app.created_share_links.get(&item.id).map(String::as_str);
-                let text = app.text_previews.get(&item.id).map(String::as_str);
+                let text = app.text_preview_for(&item);
                 let overlay = LinkExtractorOverlay::from_drive_item(&item, share, text);
                 ui.push_overlay(Overlay::links(overlay));
             }
@@ -760,7 +758,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 ui.toast("Selected item is not an HTML file", ToastKind::Info);
                 return false;
             }
-            if let Some(html) = app.text_previews.get(&item.id).cloned() {
+            if let Some(html) = app.text_preview_for(&item).map(str::to_string) {
                 ui.push_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
                     item.name,
                     html,
@@ -772,6 +770,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 let did = item.effective_drive_id().to_string();
                 let iid = item.effective_item_id().to_string();
                 let dl = item.download_url.clone();
+                let drive_for_msg = did.clone();
                 let item_id = item.id.clone();
                 let title = item.name.clone();
                 ui.toast(format!("Loading interactive HTML: {}...", item.name), ToastKind::Info);
@@ -783,6 +782,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         Ok(bytes) => {
                             let html = String::from_utf8_lossy(&bytes).into_owned();
                             let _ = tx.send(UiMsg::HtmlPreviewReady {
+                                drive_id: drive_for_msg,
                                 item_id,
                                 title,
                                 html,
@@ -790,7 +790,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         }
                         Err(err) => {
                             let _ = tx.send(UiMsg::PreviewFailed {
+                                drive_id: drive_for_msg,
                                 item_id,
+                                inflight_key: None,
                                 error: format!("{err:#}"),
                             });
                         }
@@ -807,7 +809,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 ui.toast("Selected item is not an HTML file", ToastKind::Info);
                 return false;
             }
-            if let Some(html) = app.text_previews.get(&item.id).cloned() {
+            if let Some(html) = app.text_preview_for(&item).map(str::to_string) {
                 return dispatch(
                     Action::ServeHtmlInBrowser {
                         title: item.name,
@@ -965,15 +967,17 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 };
                 app.folder_stack.clear();
                 app.current_items = vec![item.clone()];
-                app.active_selected_id = Some(item.id);
+                app.active_selected_id = Some(item.id.clone());
                 ui.list_scroll.selected_idx = Some(0);
+                ui.inspector_scroll.top();
                 ui.focus = Focus::Inspector;
+                app.sync_inspector_preview_for(Some(&item), ui);
                 app.ensure_inspector_loaded(ui);
             }
         }
         Action::RefreshAll => {
             app.sync_ctrl.request(SyncCommand::RefreshAll);
-            app.load_active_folder();
+            app.load_active_folder(ui);
             ui.toast("Refreshing SharePoint & OneDrive...", ToastKind::Info);
         }
 
@@ -1039,12 +1043,18 @@ fn select_list_index(idx: usize, app: &mut AppState, ui: &mut UiState) {
     if items.is_empty() {
         ui.list_scroll.selected_idx = None;
         app.active_selected_id = None;
+        app.clear_inspector_preview(ui);
         return;
     }
     let clamped = idx.min(items.len() - 1);
+    let selected = &items[clamped];
+    let changed = app.active_selected_id.as_deref() != Some(selected.id.as_str());
     ui.list_scroll.selected_idx = Some(clamped);
-    app.active_selected_id = Some(items[clamped].id.clone());
-    ui.inspector_scroll.top();
+    app.active_selected_id = Some(selected.id.clone());
+    if changed {
+        ui.inspector_scroll.top();
+    }
+    app.sync_inspector_preview_for(Some(selected), ui);
     app.ensure_inspector_loaded(ui);
 }
 
@@ -1104,7 +1114,7 @@ fn activate_nav_row(row_idx: usize, app: &mut AppState, ui: &mut UiState) {
                     app.folder_stack.push((iid, label));
                 }
                 ui.focus = Focus::List;
-                app.load_active_folder();
+                app.navigate_to_active_folder(ui);
             }
         }
     }

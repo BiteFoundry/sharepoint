@@ -573,19 +573,7 @@ fn build_demo_state() -> Result<(AppState, UiState)> {
         }],
     );
 
-    // Preload realistic text previews & version histories
-    app.text_previews.insert(
-        "od-file-roadmap".to_string(),
-        "# Q4 Platform Roadmap\n\n\
-         ## Key Milestones\n\
-         - [x] Ship SQLite WAL 4-reader pool\n\
-         - [x] Enable Kitty / Sixel HD previews\n\
-         - [ ] Roll out zero-downtime edge sync\n\n\
-         ## Links\n\
-         - [Architecture RFC](https://docs.acme.example/rfc-412)\n\
-         - [SLO Dashboard](https://metrics.acme.example/platform)"
-            .to_string(),
-    );
+    // Preload realistic version histories & share links (text previews are bound to the active selection)
     app.item_versions.insert(
         "od-file-roadmap".to_string(),
         vec![
@@ -604,21 +592,6 @@ fn build_demo_state() -> Result<(AppState, UiState)> {
         ],
     );
 
-    app.text_previews.insert(
-        "proj-file-deploy".to_string(),
-        "name: platform-v4-canary\n\
-         on:\n\
-           push:\n\
-             branches: [main]\n\
-         stages:\n\
-           - id: verify-wal\n\
-             timeout: 5m\n\
-             slo_p99_ms: 15\n\
-           - id: canary-us-east\n\
-             traffic_pct: 25\n\
-             rollback_on_5xx: true"
-            .to_string(),
-    );
     app.item_versions.insert(
         "proj-file-deploy".to_string(),
         vec![
@@ -637,19 +610,6 @@ fn build_demo_state() -> Result<(AppState, UiState)> {
         ],
     );
 
-    app.text_previews.insert(
-        "sp-file-rfc".to_string(),
-        "# API Gateway v2 RFC\n\n\
-         Owner: Platform Architecture\n\
-         Spec: [OpenAPI Contract](https://api.acme.example/v2/openapi)\n\
-         Telemetry: [Grafana SLOs](https://metrics.acme.example/gateway)\n\
-         Runbook: https://runbooks.acme.example/gateway-failover\n\n\
-         ## Summary\n\
-         - Streaming chunked uploads (> 4 MiB)\n\
-         - Per-tenant adaptive rate limiting\n\
-         - Sub-10ms local FTS5 metadata lookup"
-            .to_string(),
-    );
     app.created_share_links.insert(
         "sp-file-rfc".to_string(),
         "https://acme.example/:w:/s/eng/api-gateway-rfc-v2".to_string(),
@@ -759,6 +719,21 @@ fn main() -> Result<()> {
 
     // Frame 1: OneDrive 3-Pane Explorer (Sites/Drives | Files | Inspector Preview)
     select_item_by_id(&mut app, &mut ui, "od-file-roadmap");
+    if let Some(item) = app.active_item() {
+        app.set_text_preview(
+            item.effective_drive_id(),
+            &item.id,
+            "# Q4 Platform Roadmap\n\n\
+             ## Key Milestones\n\
+             - [x] Ship SQLite WAL 4-reader pool\n\
+             - [x] Enable Kitty / Sixel HD previews\n\
+             - [ ] Roll out zero-downtime edge sync\n\n\
+             ## Links\n\
+             - [Architecture RFC](https://docs.acme.example/rfc-412)\n\
+             - [SLO Dashboard](https://metrics.acme.example/platform)"
+                .to_string(),
+        );
+    }
     frames.push(capture_frame(
         &mut terminal,
         &mut app,
@@ -775,6 +750,24 @@ fn main() -> Result<()> {
     ];
     app.current_items = projects_sub_items();
     select_item_by_id(&mut app, &mut ui, "proj-file-deploy");
+    if let Some(item) = app.active_item() {
+        app.set_text_preview(
+            item.effective_drive_id(),
+            &item.id,
+            "name: platform-v4-canary\n\
+             on:\n\
+               push:\n\
+                 branches: [main]\n\
+             stages:\n\
+               - id: verify-wal\n\
+                 timeout: 5m\n\
+                 slo_p99_ms: 15\n\
+               - id: canary-us-east\n\
+                 traffic_pct: 25\n\
+                 rollback_on_5xx: true"
+                .to_string(),
+        );
+    }
     frames.push(capture_frame(
         &mut terminal,
         &mut app,
@@ -793,6 +786,22 @@ fn main() -> Result<()> {
     app.folder_stack.clear();
     app.current_items = sharepoint_eng_docs_items();
     select_item_by_id(&mut app, &mut ui, "sp-file-rfc");
+    if let Some(item) = app.active_item() {
+        app.set_text_preview(
+            item.effective_drive_id(),
+            &item.id,
+            "# API Gateway v2 RFC\n\n\
+             Owner: Platform Architecture\n\
+             Spec: [OpenAPI Contract](https://api.acme.example/v2/openapi)\n\
+             Telemetry: [Grafana SLOs](https://metrics.acme.example/gateway)\n\
+             Runbook: https://runbooks.acme.example/gateway-failover\n\n\
+             ## Summary\n\
+             - Streaming chunked uploads (> 4 MiB)\n\
+             - Per-tenant adaptive rate limiting\n\
+             - Sub-10ms local FTS5 metadata lookup"
+                .to_string(),
+        );
+    }
     frames.push(capture_frame(
         &mut terminal,
         &mut app,
@@ -805,7 +814,7 @@ fn main() -> Result<()> {
     // Frame 4: Open Link Extractor overlay (u)
     if let Some(item) = app.active_item() {
         let share_url = app.created_share_links.get(&item.id).map(String::as_str);
-        let preview = app.text_previews.get(&item.id).map(String::as_str);
+        let preview = app.text_preview_for(&item);
         let mut links_ov = LinkExtractorOverlay::from_drive_item(&item, share_url, preview);
         links_ov.selected = 2;
         ui.overlays.push(Overlay::links(links_ov));

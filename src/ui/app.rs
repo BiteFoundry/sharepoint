@@ -136,6 +136,7 @@ pub enum UiMsg {
         drives: Vec<DriveInfo>,
     },
     TextPreviewLoaded {
+        drive_id: String,
         item_id: String,
         content: String,
     },
@@ -144,7 +145,9 @@ pub enum UiMsg {
         versions: Vec<DriveItemVersion>,
     },
     PreviewFailed {
+        drive_id: String,
         item_id: String,
+        inflight_key: Option<String>,
         error: String,
     },
     ImageBytesFetched {
@@ -156,12 +159,14 @@ pub enum UiMsg {
         rendered: RenderedTerminalImage,
     },
     HtmlContentSniffed {
+        drive_id: String,
         item_id: String,
         title: String,
         html: String,
         cache_key: String,
     },
     HtmlPreviewReady {
+        drive_id: String,
         item_id: String,
         title: String,
         html: String,
@@ -317,7 +322,7 @@ pub struct AppState {
     pub loading_folder: bool,
     pub sync_busy: bool,
     pub sync_summary: String,
-    pub text_previews: HashMap<String, String>,
+    pub text_previews: Option<(String, String)>,
     pub item_versions: HashMap<String, Vec<DriveItemVersion>>,
     pub created_share_links: HashMap<String, String>,
     pub preview_errors: HashMap<String, String>,
@@ -366,7 +371,7 @@ impl AppState {
             loading_folder: false,
             sync_busy: false,
             sync_summary: "Ready".to_string(),
-            text_previews: HashMap::new(),
+            text_previews: None,
             item_versions: HashMap::new(),
             created_share_links: HashMap::new(),
             preview_errors: HashMap::new(),
@@ -424,14 +429,127 @@ impl AppState {
         items
     }
 
+    fn selected_item_ref(&self) -> Option<&DriveItem> {
+        let id = self.active_selected_id.as_deref()?;
+        self.current_items.iter().find(|item| item.id == id)
+    }
+
     pub fn active_item(&self) -> Option<DriveItem> {
-        let items = self.sorted_visible_items();
-        if let Some(ref id) = self.active_selected_id {
-            if let Some(found) = items.iter().find(|i| i.id == *id) {
-                return Some(found.clone());
+        if let Some(selected) = self.selected_item_ref() {
+            return Some(selected.clone());
+        }
+        self.sorted_visible_items().into_iter().next()
+    }
+
+    pub fn text_preview_key(drive_id: &str, item_id: &str) -> String {
+        format!("{drive_id}:{item_id}")
+    }
+
+    pub fn text_preview_inflight_key(drive_id: &str, item_id: &str) -> String {
+        format!("txt:{drive_id}:{item_id}")
+    }
+
+    pub fn text_preview_for(&self, item: &DriveItem) -> Option<&str> {
+        let (key, content) = self.text_previews.as_ref()?;
+        text_preview_key_matches(key, item.effective_drive_id(), &item.id)
+            .then_some(content.as_str())
+    }
+
+    pub fn text_preview_error_for(&self, item: &DriveItem) -> Option<&str> {
+        let key = Self::text_preview_inflight_key(item.effective_drive_id(), &item.id);
+        self.preview_errors.get(&key).map(String::as_str)
+    }
+
+    pub fn set_text_preview(&mut self, drive_id: &str, item_id: &str, content: String) {
+        self.text_previews = Some((Self::text_preview_key(drive_id, item_id), content));
+    }
+
+    pub fn clear_inspector_preview(&mut self, ui: &mut UiState) {
+        self.text_previews = None;
+        ui.markup_cache = None;
+        self.preview_errors.retain(|k, _| !k.starts_with("txt:"));
+    }
+
+    pub fn sync_inspector_preview_for(&mut self, selected: Option<&DriveItem>, ui: &mut UiState) {
+        let active_pair = selected
+            .filter(|item| !item.is_folder && item.is_text_previewable())
+            .map(|item| {
+                (
+                    Self::text_preview_key(item.effective_drive_id(), &item.id),
+                    Self::text_preview_inflight_key(item.effective_drive_id(), &item.id),
+                )
+            });
+        match active_pair {
+            Some((ref expected_key, ref expected_err_key)) => {
+                if self
+                    .text_previews
+                    .as_ref()
+                    .is_some_and(|(stored, _)| stored != expected_key)
+                {
+                    self.text_previews = None;
+                }
+                if ui
+                    .markup_cache
+                    .as_ref()
+                    .is_some_and(|cached| cached.key.item_id != *expected_key)
+                {
+                    ui.markup_cache = None;
+                }
+                self.preview_errors
+                    .retain(|k, _| !k.starts_with("txt:") || k == expected_err_key);
+            }
+            None => {
+                self.clear_inspector_preview(ui);
             }
         }
-        items.into_iter().next()
+    }
+
+    fn is_active_item(&self, drive_id: &str, item_id: &str) -> bool {
+        self.selected_item_ref()
+            .is_some_and(|item| item.effective_drive_id() == drive_id && item.id == item_id)
+    }
+
+    fn is_active_text_item(&self, drive_id: &str, item_id: &str) -> bool {
+        self.selected_item_ref().is_some_and(|item| {
+            !item.is_folder
+                && item.is_text_previewable()
+                && item.effective_drive_id() == drive_id
+                && item.id == item_id
+        })
+    }
+
+    fn reconcile_selection_after_items_update(&mut self, ui: &mut UiState) {
+        let items = self.sorted_visible_items();
+        let selected = if items.is_empty() {
+            ui.list_scroll.selected_idx = None;
+            self.active_selected_id = None;
+            None
+        } else if let Some(ref selected_id) = self.active_selected_id {
+            if let Some(pos) = items.iter().position(|item| item.id == *selected_id) {
+                ui.list_scroll.selected_idx = Some(pos);
+                items.get(pos)
+            } else {
+                ui.list_scroll.selected_idx = Some(0);
+                self.active_selected_id = Some(items[0].id.clone());
+                ui.inspector_scroll.top();
+                items.first()
+            }
+        } else {
+            ui.list_scroll.selected_idx = Some(0);
+            self.active_selected_id = Some(items[0].id.clone());
+            ui.inspector_scroll.top();
+            items.first()
+        };
+        self.sync_inspector_preview_for(selected, ui);
+    }
+
+    pub fn navigate_to_active_folder(&mut self, ui: &mut UiState) {
+        self.current_items.clear();
+        self.active_selected_id = None;
+        ui.list_scroll.selected_idx = None;
+        ui.inspector_scroll.top();
+        self.clear_inspector_preview(ui);
+        self.load_active_folder(ui);
     }
 
     pub fn inline_image_cache_key(&self, item: &DriveItem) -> String {
@@ -472,7 +590,7 @@ impl AppState {
         });
     }
 
-    pub fn load_active_folder(&mut self) {
+    pub fn load_active_folder(&mut self, ui: &mut UiState) {
         let tx = self.ui_tx.clone();
         let graph = self.graph.clone();
         let storage = self.storage.clone();
@@ -534,6 +652,7 @@ impl AppState {
         {
             if !cached.is_empty() {
                 self.current_items = cached;
+                self.reconcile_selection_after_items_update(ui);
             }
         }
 
@@ -561,7 +680,12 @@ impl AppState {
     }
 
     pub fn ensure_inspector_loaded(&mut self, ui: &UiState) {
-        let Some(item) = self.active_item() else {
+        let item = if let Some(selected) = self.selected_item_ref() {
+            selected.clone()
+        } else if let Some(fallback) = self.active_item() {
+            self.active_selected_id = Some(fallback.id.clone());
+            fallback
+        } else {
             return;
         };
         if item.is_folder {
@@ -589,14 +713,15 @@ impl AppState {
             }
         }
 
-        if item.is_text_previewable() && !self.text_previews.contains_key(&item_id) {
-            let tkey = format!("txt:{item_id}");
-            if self.inflight_previews.insert(tkey) {
+        if item.is_text_previewable() && self.text_preview_for(&item).is_none() {
+            let did = item.effective_drive_id().to_string();
+            let iid = item.effective_item_id().to_string();
+            let tkey = Self::text_preview_inflight_key(&did, &item_id);
+            if self.inflight_previews.insert(tkey.clone()) {
                 let graph = self.graph.clone();
                 let tx = self.ui_tx.clone();
-                let did = item.effective_drive_id().to_string();
-                let iid = item.effective_item_id().to_string();
                 let dl = item.download_url.clone();
+                let drive_for_msg = did.clone();
                 let id_for_msg = item_id.clone();
                 tokio::spawn(async move {
                     match graph
@@ -606,13 +731,16 @@ impl AppState {
                         Ok(bytes) => {
                             let content = String::from_utf8_lossy(&bytes).into_owned();
                             let _ = tx.send(UiMsg::TextPreviewLoaded {
+                                drive_id: drive_for_msg,
                                 item_id: id_for_msg,
                                 content,
                             });
                         }
                         Err(err) => {
                             let _ = tx.send(UiMsg::PreviewFailed {
+                                drive_id: drive_for_msg,
                                 item_id: id_for_msg,
+                                inflight_key: Some(tkey),
                                 error: format!("{err:#}"),
                             });
                         }
@@ -644,6 +772,7 @@ impl AppState {
             return;
         }
         let tx = self.ui_tx.clone();
+        let did = item.effective_drive_id().to_string();
         let item_id = item.id.clone();
         let item_name = item.name.clone();
         let item_mime = item.mime_type.clone();
@@ -653,6 +782,7 @@ impl AppState {
                 match sniff_content_kind(item_mime.as_deref(), Some(&item_name), Some(&raw)) {
                     ContentKind::Html => {
                         let _ = tx.send(UiMsg::HtmlContentSniffed {
+                            drive_id: did,
                             item_id,
                             title: item_name,
                             html: String::from_utf8_lossy(&raw).into_owned(),
@@ -662,14 +792,18 @@ impl AppState {
                     }
                     ContentKind::Svg => {
                         let _ = tx.send(UiMsg::PreviewFailed {
+                            drive_id: did,
                             item_id,
+                            inflight_key: Some(cache_key),
                             error: "SVG vector image (image/svg+xml) cannot be raster-decoded — press o to open in browser".into(),
                         });
                         return;
                     }
                     kind if kind != ContentKind::RasterImage => {
                         let _ = tx.send(UiMsg::PreviewFailed {
+                            drive_id: did,
                             item_id,
+                            inflight_key: Some(cache_key),
                             error: format!("Unsupported image response ({kind:?}); refusing raster decode"),
                         });
                         return;
@@ -685,7 +819,9 @@ impl AppState {
                     }
                     Err(err) => {
                         let _ = tx.send(UiMsg::PreviewFailed {
+                            drive_id: did,
                             item_id,
+                            inflight_key: Some(cache_key),
                             error: format!("{err:#}"),
                         });
                     }
@@ -695,7 +831,6 @@ impl AppState {
         }
 
         let graph = self.graph.clone();
-        let did = item.effective_drive_id().to_string();
         let iid = item.effective_item_id().to_string();
         let dl = item.download_url.clone();
         tokio::spawn(async move {
@@ -707,6 +842,7 @@ impl AppState {
                     let kind = sniff_content_kind(item_mime.as_deref(), Some(&item_name), Some(&bytes));
                     if kind == ContentKind::Html {
                         let _ = tx.send(UiMsg::HtmlContentSniffed {
+                            drive_id: did,
                             item_id,
                             title: item_name,
                             html: String::from_utf8_lossy(&bytes).into_owned(),
@@ -716,14 +852,18 @@ impl AppState {
                     }
                     if kind == ContentKind::Svg {
                         let _ = tx.send(UiMsg::PreviewFailed {
+                            drive_id: did,
                             item_id,
+                            inflight_key: Some(cache_key),
                             error: "SVG vector image (image/svg+xml) cannot be raster-decoded — press o to open in browser".into(),
                         });
                         return;
                     }
                     if !is_safe_raster_image(item_mime.as_deref(), Some(&item_name), Some(&bytes)) {
                         let _ = tx.send(UiMsg::PreviewFailed {
+                            drive_id: did,
                             item_id,
+                            inflight_key: Some(cache_key),
                             error: format!("Unsupported image response ({kind:?}); refusing raster decode"),
                         });
                         return;
@@ -734,6 +874,7 @@ impl AppState {
                         bytes: Arc::clone(&arc),
                     });
                     let decode_tx = tx.clone();
+                    let decode_did = did.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         match img_preview::decode_and_render_for_protocol(&arc, cols, rows, (18, 20, 26), caps) {
                             Ok(rendered) => {
@@ -744,7 +885,9 @@ impl AppState {
                             }
                             Err(err) => {
                                 let _ = decode_tx.send(UiMsg::PreviewFailed {
+                                    drive_id: decode_did,
                                     item_id,
+                                    inflight_key: Some(cache_key),
                                     error: format!("{err:#}"),
                                 });
                             }
@@ -754,7 +897,9 @@ impl AppState {
                 }
                 Err(err) => {
                     let _ = tx.send(UiMsg::PreviewFailed {
+                        drive_id: did,
                         item_id,
+                        inflight_key: Some(cache_key),
                         error: format!("{err:#}"),
                     });
                 }
@@ -834,7 +979,7 @@ impl AppState {
                 let first_load = self.my_drive.is_none();
                 self.my_drive = Some(drive);
                 if first_load && matches!(self.active_source, ActiveViewSource::OneDriveRoot) {
-                    self.load_active_folder();
+                    self.load_active_folder(ui);
                 }
             }
             CoreEvent::SitesUpdated(sites) => {
@@ -851,7 +996,7 @@ impl AppState {
                                     label: d.display_label(),
                                 };
                                 self.folder_stack.clear();
-                                self.load_active_folder();
+                                self.navigate_to_active_folder(ui);
                             }
                         }
                     }
@@ -870,7 +1015,7 @@ impl AppState {
                         label: d.display_label(),
                     };
                     self.folder_stack.clear();
-                    self.load_active_folder();
+                    self.navigate_to_active_folder(ui);
                 }
             }
             CoreEvent::FolderItemsUpdated {
@@ -883,6 +1028,7 @@ impl AppState {
                 {
                     self.current_items = items;
                     self.loading_folder = false;
+                    self.reconcile_selection_after_items_update(ui);
                     self.ensure_inspector_loaded(ui);
                 }
             }
@@ -890,12 +1036,14 @@ impl AppState {
                 if matches!(self.active_source, ActiveViewSource::Recent) {
                     self.current_items = items;
                     self.loading_folder = false;
+                    self.reconcile_selection_after_items_update(ui);
                 }
             }
             CoreEvent::SharedItemsUpdated(items) => {
                 if matches!(self.active_source, ActiveViewSource::SharedWithMe) {
                     self.current_items = items;
                     self.loading_folder = false;
+                    self.reconcile_selection_after_items_update(ui);
                 }
             }
             CoreEvent::SyncStateChanged { busy, summary } => {
@@ -946,7 +1094,7 @@ impl AppState {
                         }
                     }
                 }
-                self.load_active_folder();
+                self.load_active_folder(ui);
             }
             UiMsg::FolderLoaded {
                 drive_id,
@@ -958,8 +1106,11 @@ impl AppState {
                 {
                     self.current_items = items;
                     self.loading_folder = false;
-                    ui.list_scroll.selected_idx = Some(0);
-                    self.active_selected_id = self.sorted_visible_items().first().map(|i| i.id.clone());
+                    let sorted = self.sorted_visible_items();
+                    let first = sorted.first();
+                    ui.list_scroll.selected_idx = first.map(|_| 0);
+                    self.active_selected_id = first.map(|i| i.id.clone());
+                    self.sync_inspector_preview_for(first, ui);
                     self.ensure_inspector_loaded(ui);
                 }
             }
@@ -967,8 +1118,11 @@ impl AppState {
                 if matches!(self.active_source, ActiveViewSource::Recent) {
                     self.current_items = items;
                     self.loading_folder = false;
-                    ui.list_scroll.selected_idx = Some(0);
-                    self.active_selected_id = self.sorted_visible_items().first().map(|i| i.id.clone());
+                    let sorted = self.sorted_visible_items();
+                    let first = sorted.first();
+                    ui.list_scroll.selected_idx = first.map(|_| 0);
+                    self.active_selected_id = first.map(|i| i.id.clone());
+                    self.sync_inspector_preview_for(first, ui);
                     self.ensure_inspector_loaded(ui);
                 }
             }
@@ -976,26 +1130,53 @@ impl AppState {
                 if matches!(self.active_source, ActiveViewSource::SharedWithMe) {
                     self.current_items = items;
                     self.loading_folder = false;
-                    ui.list_scroll.selected_idx = Some(0);
-                    self.active_selected_id = self.sorted_visible_items().first().map(|i| i.id.clone());
+                    let sorted = self.sorted_visible_items();
+                    let first = sorted.first();
+                    ui.list_scroll.selected_idx = first.map(|_| 0);
+                    self.active_selected_id = first.map(|i| i.id.clone());
+                    self.sync_inspector_preview_for(first, ui);
                     self.ensure_inspector_loaded(ui);
                 }
             }
             UiMsg::SiteDrivesLoaded { site_id, drives } => {
                 self.site_drives.insert(site_id, drives);
             }
-            UiMsg::TextPreviewLoaded { item_id, content } => {
-                self.inflight_previews.remove(&format!("txt:{item_id}"));
-                self.preview_errors.remove(&item_id);
-                self.text_previews.insert(item_id, content);
+            UiMsg::TextPreviewLoaded {
+                drive_id,
+                item_id,
+                content,
+            } => {
+                let err_key = Self::text_preview_inflight_key(&drive_id, &item_id);
+                self.inflight_previews.remove(&err_key);
+                if self.is_active_text_item(&drive_id, &item_id) {
+                    self.preview_errors.remove(&err_key);
+                    self.set_text_preview(&drive_id, &item_id, content);
+                }
             }
             UiMsg::VersionsLoaded { item_id, versions } => {
                 self.inflight_previews.remove(&format!("ver:{item_id}"));
                 self.item_versions.insert(item_id, versions);
             }
-            UiMsg::PreviewFailed { item_id, error } => {
-                self.inflight_previews.retain(|k| !k.contains(&item_id));
-                self.preview_errors.insert(item_id, error);
+            UiMsg::PreviewFailed {
+                drive_id,
+                item_id,
+                inflight_key,
+                error,
+            } => {
+                let is_text_req = inflight_key.as_deref().is_none_or(|k| k.starts_with("txt:"));
+                if let Some(key) = inflight_key {
+                    self.inflight_previews.remove(&key);
+                }
+                if is_text_req {
+                    if self.is_active_text_item(&drive_id, &item_id) {
+                        self.preview_errors.insert(
+                            Self::text_preview_inflight_key(&drive_id, &item_id),
+                            error,
+                        );
+                    }
+                } else {
+                    self.preview_errors.insert(item_id, error);
+                }
             }
             UiMsg::ImageBytesFetched { item_id, bytes } => {
                 if self.raw_image_bytes.len() >= 8 {
@@ -1014,6 +1195,7 @@ impl AppState {
                 self.rendered_images.insert(cache_key, rendered);
             }
             UiMsg::HtmlContentSniffed {
+                drive_id,
                 item_id,
                 title,
                 html,
@@ -1021,7 +1203,9 @@ impl AppState {
             } => {
                 self.inflight_previews.remove(&cache_key);
                 self.preview_errors.remove(&item_id);
-                self.text_previews.insert(item_id.clone(), html.clone());
+                if self.is_active_item(&drive_id, &item_id) {
+                    self.set_text_preview(&drive_id, &item_id, html.clone());
+                }
                 if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
                     ui.pop_overlay();
                 }
@@ -1042,13 +1226,16 @@ impl AppState {
                 );
             }
             UiMsg::HtmlPreviewReady {
+                drive_id,
                 item_id,
                 title,
                 html,
             } => {
-                self.inflight_previews.remove(&format!("txt:{item_id}"));
-                self.preview_errors.remove(&item_id);
-                self.text_previews.insert(item_id.clone(), html.clone());
+                if self.is_active_text_item(&drive_id, &item_id) {
+                    self.preview_errors
+                        .remove(&Self::text_preview_inflight_key(&drive_id, &item_id));
+                    self.set_text_preview(&drive_id, &item_id, html.clone());
+                }
                 ui.push_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
                     title,
                     html,
@@ -1075,19 +1262,25 @@ impl AppState {
                 if ui.notify {
                     notification::show("SharePoint Upload Complete", &msg);
                 }
-                self.load_active_folder();
+                self.load_active_folder(ui);
             }
             UiMsg::FolderCreated(folder) => {
                 ui.toast(format!("Created folder '{}'", folder.name), ToastKind::Success);
-                self.load_active_folder();
+                self.load_active_folder(ui);
             }
             UiMsg::ItemRenamed(item) => {
                 ui.toast(format!("Renamed to '{}'", item.name), ToastKind::Success);
-                self.load_active_folder();
+                if self.active_selected_id.as_deref() == Some(item.id.as_str()) {
+                    ui.markup_cache = None;
+                }
+                self.load_active_folder(ui);
             }
-            UiMsg::ItemDeleted { name, .. } => {
+            UiMsg::ItemDeleted { item_id, name, .. } => {
                 ui.toast(format!("Deleted '{name}'"), ToastKind::Success);
-                self.load_active_folder();
+                if self.active_selected_id.as_deref() == Some(item_id.as_str()) {
+                    self.clear_inspector_preview(ui);
+                }
+                self.load_active_folder(ui);
             }
             UiMsg::ShareLinkCreated { item_id, link } => {
                 let copied = copy_text_to_clipboard(&link.web_url).is_ok();
@@ -1135,6 +1328,12 @@ impl AppState {
     }
 }
 
+fn text_preview_key_matches(key: &str, drive_id: &str, item_id: &str) -> bool {
+    key.strip_prefix(drive_id)
+        .and_then(|rest| rest.strip_prefix(':'))
+        .is_some_and(|rest| rest == item_id)
+}
+
 pub fn copy_text_to_clipboard(text: &str) -> anyhow::Result<()> {
     let mut cb = arboard::Clipboard::new()?;
     cb.set_text(text.to_string())?;
@@ -1154,4 +1353,563 @@ fn read_clipboard_png_bytes() -> anyhow::Result<Vec<u8>> {
     let dyn_img = image::DynamicImage::ImageRgba8(rgba);
     dyn_img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::{
+        extract::{Path, State},
+        http::header,
+        response::IntoResponse,
+        routing::get,
+        Router,
+    };
+    use ratatui::{backend::TestBackend, Terminal};
+    use tokio::{
+        net::TcpListener,
+        sync::{mpsc, watch, Notify},
+    };
+
+    use super::*;
+    use crate::{
+        auth::{AuthManager, StoredTokens},
+        config::{AppConfig, Persona},
+        graph::GraphClient,
+        models::DriveItem,
+        storage::Storage,
+        sync::{FocusTarget, SyncCommand, SyncController},
+        ui::{
+            action::{dispatch, Action},
+            drive_view::draw_inspector,
+            hitmap::HitMap,
+        },
+    };
+
+    fn test_app_and_ui_with_base_url(
+        base_url: Option<&str>,
+    ) -> (AppState, UiState, mpsc::UnboundedReceiver<UiMsg>) {
+        let mut cfg = AppConfig::default();
+        let auth = if let Some(url) = base_url {
+            cfg.graph_base_url = url.to_string();
+            let tokens = StoredTokens {
+                access_token: "synthetic-token".into(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: cfg.client_id.clone(),
+                tenant_id: cfg.tenant_id.clone(),
+                user_id: Some("user-1".into()),
+                user_display_name: Some("Test User".into()),
+                user_email: Some("test@example.com".into()),
+                auth_mode: "access_token".into(),
+            };
+            AuthManager::from_tokens(cfg.clone(), tokens)
+        } else {
+            AuthManager::empty_for_test(cfg.clone())
+        };
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).expect("graph");
+        let storage = Storage::open_in_memory().expect("storage");
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, _nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiMsg>();
+        let ui = UiState::from_config(&cfg);
+        let app = AppState::new(cfg, Persona::SharePoint, auth, graph, storage, sync_ctrl, ui_tx);
+        (app, ui, ui_rx)
+    }
+
+    fn make_folder(drive_id: &str, id: &str, name: &str) -> DriveItem {
+        DriveItem {
+            id: id.into(),
+            drive_id: drive_id.into(),
+            name: name.into(),
+            is_folder: true,
+            child_count: Some(0),
+            ..Default::default()
+        }
+    }
+
+    fn make_text_file(drive_id: &str, id: &str, name: &str, mime: &str) -> DriveItem {
+        DriveItem {
+            id: id.into(),
+            drive_id: drive_id.into(),
+            name: name.into(),
+            size: 256,
+            mime_type: Some(mime.into()),
+            ..Default::default()
+        }
+    }
+
+    fn draw_inspector_frame(app: &AppState, ui: &mut UiState) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(90, 24)).expect("terminal");
+        let mut hitmap = HitMap::new();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_inspector(frame, area, app, ui, &mut hitmap);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        let mut lines = Vec::with_capacity(24);
+        for y in 0..24 {
+            let mut row = String::new();
+            for x in 0..90 {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            lines.push(row);
+        }
+        lines.join("\n")
+    }
+
+    #[tokio::test]
+    async fn text_preview_and_markup_cache_bound_across_96_files_and_folder_return() {
+        let (mut app, mut ui, _rx) = test_app_and_ui_with_base_url(None);
+        app.active_source = ActiveViewSource::Drive {
+            drive_id: "drv-1".into(),
+            label: "Docs".into(),
+        };
+
+        let mut items = Vec::with_capacity(97);
+        items.push(make_folder("drv-1", "fld-0", "00-Archive"));
+        for idx in 1..=96 {
+            items.push(make_text_file(
+                "drv-1",
+                &format!("file-{idx:02}"),
+                &format!("note-{idx:02}.md"),
+                "text/markdown",
+            ));
+        }
+        app.current_items = items;
+        app.active_selected_id = Some("fld-0".into());
+        ui.list_scroll.selected_idx = Some(0);
+        ui.focus = Focus::List;
+
+        for idx in 1..=96 {
+            dispatch(Action::MoveDown, &mut app, &mut ui);
+            let id = format!("file-{idx:02}");
+            let expected_key = AppState::text_preview_key("drv-1", &id);
+            assert_eq!(app.active_selected_id.as_deref(), Some(id.as_str()));
+            assert!(
+                app.text_previews.is_none(),
+                "moving to {id} must drop prior file preview"
+            );
+            assert!(
+                ui.markup_cache.is_none(),
+                "moving to {id} must drop prior markup cache"
+            );
+
+            app.apply_ui_msg(
+                UiMsg::TextPreviewLoaded {
+                    drive_id: "drv-1".into(),
+                    item_id: id.clone(),
+                    content: format!("# Document {idx:02}\n\nBody marker {idx:02}.\n"),
+                },
+                &mut ui,
+            );
+
+            assert_eq!(
+                app.text_previews.as_ref().map(|(k, _)| k.as_str()),
+                Some(expected_key.as_str())
+            );
+            let screen = draw_inspector_frame(&app, &mut ui);
+            assert!(screen.contains(&format!("Document {idx:02}")), "{screen}");
+            assert_eq!(
+                ui.markup_cache.as_ref().map(|c| c.key.item_id.as_str()),
+                Some(expected_key.as_str())
+            );
+        }
+
+        // Toggling Rendered <-> Raw on the active file preserves the loaded body.
+        ui.render_markup = false;
+        let raw_screen = draw_inspector_frame(&app, &mut ui);
+        assert!(raw_screen.contains("# Document 96"), "{raw_screen}");
+        assert!(app.text_previews.is_some());
+        ui.render_markup = true;
+        let rendered_screen = draw_inspector_frame(&app, &mut ui);
+        assert!(rendered_screen.contains("Document 96"), "{rendered_screen}");
+
+        // Returning to the folder row via Home (`Action::ScrollTop`) frees both caches.
+        dispatch(Action::ScrollTop, &mut app, &mut ui);
+        assert_eq!(app.active_selected_id.as_deref(), Some("fld-0"));
+        assert!(app.text_previews.is_none());
+        assert!(ui.markup_cache.is_none());
+    }
+
+    #[tokio::test]
+    async fn folder_drive_and_sync_transitions_clear_preview_and_reject_stale_responses() {
+        let (mut app, mut ui, _rx) = test_app_and_ui_with_base_url(None);
+        app.active_source = ActiveViewSource::Drive {
+            drive_id: "drv-1".into(),
+            label: "Drive One".into(),
+        };
+        let sub = make_folder("drv-1", "fld-sub", "Subfolder");
+        let doc = make_text_file("drv-1", "shared-id", "spec.md", "text/markdown");
+        app.current_items = vec![sub.clone(), doc.clone()];
+        app.active_selected_id = Some(doc.id.clone());
+        ui.list_scroll.selected_idx = Some(1);
+        ui.focus = Focus::List;
+
+        app.set_text_preview("drv-1", "shared-id", "# Drive One Spec\n".into());
+        let _ = draw_inspector_frame(&app, &mut ui);
+        assert!(app.text_previews.is_some());
+        assert!(ui.markup_cache.is_some());
+
+        // Switching drive clears preview & markup cache immediately even before FolderLoaded arrives.
+        let stale_inflight = AppState::text_preview_inflight_key("drv-1", "shared-id");
+        app.inflight_previews.insert(stale_inflight.clone());
+        dispatch(
+            Action::SelectDrive {
+                drive_id: "drv-2".into(),
+                label: "Drive Two".into(),
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(app.text_previews.is_none());
+        assert!(ui.markup_cache.is_none());
+
+        // Even if Drive Two also has an item with the same `item_id`, Drive One's late
+        // PreviewFailed and TextPreviewLoaded must not clear Drive Two's pending request/error.
+        let doc_d2 = make_text_file("drv-2", "shared-id", "spec.md", "text/markdown");
+        let d2_inflight = AppState::text_preview_inflight_key("drv-2", "shared-id");
+        app.apply_ui_msg(
+            UiMsg::FolderLoaded {
+                drive_id: "drv-2".into(),
+                parent_id: None,
+                items: vec![doc_d2.clone()],
+            },
+            &mut ui,
+        );
+        assert!(app.inflight_previews.contains(&d2_inflight));
+
+        // Drive One fails late -> removes only drv-1's inflight marker, preserves drv-2's pending request
+        // and does not attach drv-1's error to drv-2.
+        app.apply_ui_msg(
+            UiMsg::PreviewFailed {
+                drive_id: "drv-1".into(),
+                item_id: "shared-id".into(),
+                inflight_key: Some(stale_inflight.clone()),
+                error: "drv-1 timeout".into(),
+            },
+            &mut ui,
+        );
+        assert!(!app.inflight_previews.contains(&stale_inflight));
+        assert!(app.inflight_previews.contains(&d2_inflight));
+        assert_eq!(app.text_preview_error_for(&doc_d2), None);
+
+        // Drive Two fails -> records drv-2 error; another stale drv-1 failure or success must keep it intact.
+        app.apply_ui_msg(
+            UiMsg::PreviewFailed {
+                drive_id: "drv-2".into(),
+                item_id: "shared-id".into(),
+                inflight_key: Some(d2_inflight.clone()),
+                error: "drv-2 403".into(),
+            },
+            &mut ui,
+        );
+        assert_eq!(app.text_preview_error_for(&doc_d2), Some("drv-2 403"));
+
+        app.inflight_previews.insert(stale_inflight.clone());
+        app.apply_ui_msg(
+            UiMsg::TextPreviewLoaded {
+                drive_id: "drv-1".into(),
+                item_id: "shared-id".into(),
+                content: "# Stale Drive One Body\n".into(),
+            },
+            &mut ui,
+        );
+        assert!(!app.inflight_previews.contains(&stale_inflight));
+        assert!(
+            app.text_previews.is_none(),
+            "late response from drv-1 must not populate drv-2 item with same id"
+        );
+        assert_eq!(
+            app.text_preview_error_for(&doc_d2),
+            Some("drv-2 403"),
+            "late response from drv-1 must not clear drv-2 text error"
+        );
+
+        // Populate Drive Two's preview, then enter a folder -> cleared immediately.
+        app.apply_ui_msg(
+            UiMsg::TextPreviewLoaded {
+                drive_id: "drv-2".into(),
+                item_id: "shared-id".into(),
+                content: "# Drive Two Spec\n".into(),
+            },
+            &mut ui,
+        );
+        let _ = draw_inspector_frame(&app, &mut ui);
+        assert!(app.text_previews.is_some());
+        assert!(ui.markup_cache.is_some());
+
+        let sub_d2 = make_folder("drv-2", "fld-2", "Child");
+        app.current_items = vec![sub_d2, doc_d2.clone()];
+        app.active_selected_id = Some("fld-2".into());
+        ui.list_scroll.selected_idx = Some(0);
+        dispatch(Action::Activate, &mut app, &mut ui);
+        assert!(app.text_previews.is_none());
+        assert!(ui.markup_cache.is_none());
+
+        // Background sync removing the active file also clears its preview and markup cache.
+        app.folder_stack.clear();
+        app.current_items = vec![doc_d2.clone()];
+        app.active_selected_id = Some(doc_d2.id.clone());
+        app.set_text_preview("drv-2", "shared-id", "# Active\n".into());
+        let _ = draw_inspector_frame(&app, &mut ui);
+        assert!(app.text_previews.is_some());
+        assert!(ui.markup_cache.is_some());
+
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "drv-2".into(),
+                parent_id: None,
+                items: vec![make_folder("drv-2", "fld-only", "OnlyFolder")],
+            },
+            &mut ui,
+        );
+        assert_eq!(app.active_selected_id.as_deref(), Some("fld-only"));
+        assert!(app.text_previews.is_none());
+        assert!(ui.markup_cache.is_none());
+    }
+
+    #[tokio::test]
+    async fn out_of_order_responses_pending_dedup_and_revisit_refetch() {
+        #[derive(Clone)]
+        struct DelayServer {
+            a_hits: Arc<AtomicUsize>,
+            b_hits: Arc<AtomicUsize>,
+            release_a: Arc<Notify>,
+            a_started: Arc<Notify>,
+        }
+
+        let state = DelayServer {
+            a_hits: Arc::new(AtomicUsize::new(0)),
+            b_hits: Arc::new(AtomicUsize::new(0)),
+            release_a: Arc::new(Notify::new()),
+            a_started: Arc::new(Notify::new()),
+        };
+
+        let router = Router::new()
+            .route(
+                "/v1.0/drives/{drive_id}/items/{item_id}/content",
+                get(
+                    |State(st): State<DelayServer>, Path((_d, item_id)): Path<(String, String)>| async move {
+                        if item_id == "file-1" {
+                            let hit = st.a_hits.fetch_add(1, Ordering::SeqCst);
+                            st.a_started.notify_one();
+                            if hit == 0 {
+                                st.release_a.notified().await;
+                            }
+                            (
+                                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                                format!("BODY_A_HIT_{}", hit + 1),
+                            )
+                                .into_response()
+                        } else {
+                            let hit = st.b_hits.fetch_add(1, Ordering::SeqCst);
+                            (
+                                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                                format!("BODY_B_HIT_{}", hit + 1),
+                            )
+                                .into_response()
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1.0/drives/{drive_id}/items/{item_id}/versions",
+                get(|| async { axum::Json(serde_json::json!({ "value": [] })) }),
+            )
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let base_url = format!("http://{addr}/v1.0");
+        let (mut app, mut ui, mut rx) = test_app_and_ui_with_base_url(Some(&base_url));
+        let item_a = make_text_file("drv-1", "file-1", "a.txt", "text/plain");
+        let item_b = make_text_file("drv-1", "file-10", "b.txt", "text/plain");
+        app.current_items = vec![item_a.clone(), item_b.clone()];
+        app.active_selected_id = Some(item_a.id.clone());
+        ui.list_scroll.selected_idx = Some(0);
+        ui.focus = Focus::List;
+
+        // 1. Start loading A (held open on server), then move A -> B -> A while A is pending.
+        app.ensure_inspector_loaded(&ui);
+        state.a_started.notified().await;
+        assert_eq!(state.a_hits.load(Ordering::SeqCst), 1);
+
+        dispatch(Action::MoveDown, &mut app, &mut ui);
+        assert_eq!(app.active_selected_id.as_deref(), Some("file-10"));
+        // Pending A must remain tracked so moving back to A does not fire a duplicate GET.
+        assert!(app
+            .inflight_previews
+            .contains(&AppState::text_preview_inflight_key("drv-1", "file-1")));
+
+        dispatch(Action::MoveUp, &mut app, &mut ui);
+        assert_eq!(app.active_selected_id.as_deref(), Some("file-1"));
+        assert_eq!(
+            state.a_hits.load(Ordering::SeqCst),
+            1,
+            "returning to A while A is still pending must reuse the pending request"
+        );
+
+        // Drain B's response first (now stale because A is selected).
+        let mut saw_b = false;
+        while !saw_b {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected B response")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::TextPreviewLoaded { item_id, .. } if item_id == "file-10") {
+                saw_b = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        assert!(
+            app.text_previews.is_none(),
+            "late B response must be discarded while A is selected"
+        );
+        assert!(!app
+            .inflight_previews
+            .contains(&AppState::text_preview_inflight_key("drv-1", "file-10")));
+
+        // Release A -> A populates inspector.
+        state.release_a.notify_one();
+        let mut saw_a = false;
+        while !saw_a {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected A response")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::TextPreviewLoaded { item_id, .. } if item_id == "file-1") {
+                saw_a = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        assert_eq!(app.text_preview_for(&item_a), Some("BODY_A_HIT_1"));
+
+        // 2. Move A -> B (evicts A, fetches B) -> A (evicts B, re-fetches A).
+        dispatch(Action::MoveDown, &mut app, &mut ui);
+        assert!(app.text_previews.is_none());
+        let mut saw_b2 = false;
+        while !saw_b2 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected B2 response")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::TextPreviewLoaded { item_id, .. } if item_id == "file-10") {
+                saw_b2 = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        assert_eq!(app.text_preview_for(&item_b), Some("BODY_B_HIT_2"));
+
+        dispatch(Action::MoveUp, &mut app, &mut ui);
+        assert!(app.text_previews.is_none());
+        let mut saw_a2 = false;
+        while !saw_a2 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected A2 response")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::TextPreviewLoaded { item_id, .. } if item_id == "file-1") {
+                saw_a2 = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        assert_eq!(state.a_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(app.text_preview_for(&item_a), Some("BODY_A_HIT_2"));
+
+        // 3. Out-of-order late A arriving while B is selected must keep B displayed.
+        dispatch(Action::MoveDown, &mut app, &mut ui);
+        let mut saw_b3 = false;
+        while !saw_b3 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected B3 response")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::TextPreviewLoaded { item_id, .. } if item_id == "file-10") {
+                saw_b3 = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        app.apply_ui_msg(
+            UiMsg::TextPreviewLoaded {
+                drive_id: "drv-1".into(),
+                item_id: "file-1".into(),
+                content: "LATE_A_MUST_NOT_REPLACE_B".into(),
+            },
+            &mut ui,
+        );
+        assert_eq!(app.text_preview_for(&item_b), Some("BODY_B_HIT_3"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_html_overlay_and_browser_serve_use_requested_file_after_selection_change() {
+        let (mut app, mut ui, mut rx) = test_app_and_ui_with_base_url(None);
+        let html_item = make_text_file("drv-1", "html-1", "report.html", "text/html");
+        let md_item = make_text_file("drv-1", "md-1", "notes.md", "text/markdown");
+        app.current_items = vec![html_item.clone(), md_item.clone()];
+        app.active_selected_id = Some(md_item.id.clone());
+        ui.list_scroll.selected_idx = Some(1);
+        app.set_text_preview("drv-1", "md-1", "# Active Notes\n".into());
+        let _ = draw_inspector_frame(&app, &mut ui);
+
+        // Simulate an in-flight auto-preview for html-1 plus an explicitly requested HtmlPreviewReady
+        // arriving after selection moved to md-1.
+        let html_inflight = AppState::text_preview_inflight_key("drv-1", "html-1");
+        app.inflight_previews.insert(html_inflight.clone());
+        let requested_html = "<html><body><h1>Requested Report</h1></body></html>".to_string();
+        app.apply_ui_msg(
+            UiMsg::HtmlPreviewReady {
+                drive_id: "drv-1".into(),
+                item_id: "html-1".into(),
+                title: "report.html".into(),
+                html: requested_html.clone(),
+            },
+            &mut ui,
+        );
+
+        // Inspector caches stay bound to current selection (md-1), and pending auto-preview marker stays intact.
+        assert_eq!(app.text_preview_for(&md_item), Some("# Active Notes\n"));
+        assert!(app.text_preview_for(&html_item).is_none());
+        assert_eq!(
+            ui.markup_cache.as_ref().map(|c| c.key.item_id.as_str()),
+            Some("drv-1:md-1")
+        );
+        assert!(app.inflight_previews.contains(&html_inflight));
+
+        // Explicit HTML overlay still opens with report.html's body, and pressing `o` serves report.html.
+        match ui.overlays.last() {
+            Some(Overlay::HtmlPreview(ov)) => {
+                assert_eq!(ov.title, "report.html");
+                assert_eq!(ov.session.raw_html(), requested_html);
+            }
+            other => panic!("expected HtmlPreview overlay, got {other:?}"),
+        }
+
+        dispatch(Action::Input('o'), &mut app, &mut ui);
+        let served = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("expected UiMsg::HtmlServed from overlay serve")
+            .expect("channel open");
+        let url = match served {
+            UiMsg::HtmlServed { url } => url,
+            _ => panic!("expected UiMsg::HtmlServed"),
+        };
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        let body = reqwest::get(&url).await.unwrap().text().await.unwrap();
+        assert!(body.contains("Requested Report"), "{body}");
+        app.html_server.shutdown();
+    }
 }

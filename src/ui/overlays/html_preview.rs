@@ -183,7 +183,11 @@ impl HtmlPreviewOverlay {
     pub fn handle(&mut self, action: &Action, ui: &UiState) -> OverlayOutcome {
         if self.session.editing_input.is_some() {
             return match action {
-                Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
+                Action::Quit
+                | Action::QuitConfirm
+                | Action::ServeHtmlInBrowser { .. }
+                | Action::OpenUrl(_)
+                | Action::ShowToast(_) => OverlayOutcome::NotHandled,
                 Action::CloseOverlay | Action::Activate | Action::OverlaySubmit => {
                     let eff = self.session.finish_editing();
                     self.apply_effects(eff)
@@ -230,7 +234,11 @@ impl HtmlPreviewOverlay {
 
         match action {
             Action::CloseOverlay | Action::Input('q') => OverlayOutcome::Close,
-            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
+            Action::Quit
+            | Action::QuitConfirm
+            | Action::ServeHtmlInBrowser { .. }
+            | Action::OpenUrl(_)
+            | Action::ShowToast(_) => OverlayOutcome::NotHandled,
             Action::Tab => {
                 self.session.focus_next_control();
                 self.ensure_focused_visible(ui);
