@@ -21,6 +21,7 @@ pub enum ButtonId {
     RenameItem,
     DeleteItem,
     ImagePreview,
+    PreviewRenderToggle,
     LinksModal,
     OpenInBrowser,
     // Narrow responsive bar pills

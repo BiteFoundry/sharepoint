@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
 use image::{imageops::FilterType, DynamicImage, ImageFormat, Rgba};
 use ratatui::{
+    layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
 };
@@ -125,9 +126,63 @@ impl RenderedTerminalImage {
     }
 }
 
+/// Tracks an active terminal pixel graphic placement (Kitty / iTerm2 / Sixel) painted onto the screen
+/// so frame transitions can deterministically erase stale pixels before Ratatui redraws.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivePixelGraphic {
+    pub cache_key: String,
+    pub rect: Rect,
+    pub protocol: TerminalImageProtocol,
+    pub cols: u16,
+    pub rows: u16,
+    pub payload_len: usize,
+}
+
 /// Returns the Kitty graphics delete sequence for the fixed TUI preview placement (`q=2` suppresses terminal responses).
 pub fn kitty_delete_preview_sequence() -> &'static str {
     "\x1b_Ga=d,d=i,i=4242,q=2\x1b\\"
+}
+
+/// Deletes all visible Kitty graphics placements and frees unused image data (`d=A`, `q=2` quiet).
+pub fn kitty_delete_all_sequence() -> &'static str {
+    "\x1b_Ga=d,d=A,q=2\x1b\\"
+}
+
+/// Builds an ANSI sequence (`\x1b[0m` + row cursor moves + space runs) that overwrites `rect`
+/// (expanded by +2 cols / +2 rows and clamped to `term_cols x term_rows`) so Sixel and iTerm2
+/// cell-bound pixel tiles are deterministically erased before Ratatui redraws.
+pub fn erase_pixel_rect_sequence(
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    term_cols: u16,
+    term_rows: u16,
+) -> String {
+    if width == 0 || height == 0 || x >= term_cols || y >= term_rows {
+        return String::new();
+    }
+    let x_end = x.saturating_add(width).saturating_add(2).min(term_cols);
+    let y_end = y.saturating_add(height).saturating_add(2).min(term_rows);
+    if x >= x_end || y >= y_end {
+        return String::new();
+    }
+    let span_w = (x_end - x) as usize;
+    let rows = (y_end - y) as usize;
+    let spaces = " ".repeat(span_w);
+    let mut out = String::with_capacity(4 + rows * (12 + span_w));
+    out.push_str("\x1b[0m");
+    for row in y..y_end {
+        let _ = write!(out, "\x1b[{};{}H{spaces}", row + 1, x + 1);
+    }
+    out
+}
+
+/// Floors the maximum vertical pixel budget for Sixel encoding to a multiple of 6
+/// (`<= rows * cell_px_h`) so the final 6-pixel band never overhangs into the row below `rect`.
+pub fn compute_sixel_safe_pixel_height(rows: u16, cell_px_h: u16) -> u32 {
+    let budget = (rows as u32).saturating_mul(cell_px_h as u32);
+    (budget / 6) * 6
 }
 
 /// Resolves terminal graphics protocol and cell pixel dimensions without writing queries to stdin/stdout.
@@ -408,6 +463,18 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
     out
 }
 
+#[cfg(any(windows, test))]
+const WIN_ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+#[cfg(any(windows, test))]
+const WIN_ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+
+/// Restores Windows console input mode while always setting `ENABLE_EXTENDED_FLAGS` (`0x0080`)
+/// and clearing `ENABLE_QUICK_EDIT_MODE` (`0x0040`) so mouse capture is never clobbered by QuickEdit.
+#[cfg(any(windows, test))]
+fn restore_windows_console_mode_flags(prev_mode: u32) -> u32 {
+    (prev_mode & !WIN_ENABLE_QUICK_EDIT_MODE) | WIN_ENABLE_EXTENDED_FLAGS
+}
+
 #[cfg(windows)]
 fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
     const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // -10i32 as u32
@@ -448,6 +515,12 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
         fn SetConsoleMode(h_console_handle: isize, dw_mode: u32) -> i32;
         fn WaitForSingleObject(h_handle: isize, dw_milliseconds: u32) -> u32;
         fn GetNumberOfConsoleInputEvents(h_console_input: isize, lpc_number_of_events: *mut u32) -> i32;
+        fn PeekConsoleInputW(
+            h_console_input: isize,
+            lp_buffer: *mut InputRecord,
+            n_length: u32,
+            lp_number_of_events_read: *mut u32,
+        ) -> i32;
         fn ReadConsoleInputW(
             h_console_input: isize,
             lp_buffer: *mut InputRecord,
@@ -463,7 +536,10 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
     impl Drop for ModeRestore {
         fn drop(&mut self) {
             unsafe {
-                SetConsoleMode(self.handle, self.prev_mode);
+                SetConsoleMode(
+                    self.handle,
+                    restore_windows_console_mode_flags(self.prev_mode),
+                );
             }
         }
     }
@@ -478,8 +554,9 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
         return Vec::new();
     }
 
-    let _restore = if (prev_mode & ENABLE_VIRTUAL_TERMINAL_INPUT) == 0 {
-        let _ = unsafe { SetConsoleMode(handle, prev_mode | ENABLE_VIRTUAL_TERMINAL_INPUT) };
+    let probe_mode = restore_windows_console_mode_flags(prev_mode) | ENABLE_VIRTUAL_TERMINAL_INPUT;
+    let _restore = if prev_mode != probe_mode {
+        let _ = unsafe { SetConsoleMode(handle, probe_mode) };
         Some(ModeRestore { handle, prev_mode })
     } else {
         None
@@ -526,6 +603,46 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
         }
         if da1_reply_complete(&out) {
             break;
+        }
+    }
+
+    // Non-blocking drain of any trailing KEY_EVENT bytes from the probe burst so nothing leaks into EventStream.
+    for _ in 0..8 {
+        if unsafe { WaitForSingleObject(handle, 0) } != WAIT_OBJECT_0 {
+            break;
+        }
+        let mut avail = 0u32;
+        if unsafe { GetNumberOfConsoleInputEvents(handle, &mut avail) } == 0 || avail == 0 {
+            break;
+        }
+        let to_peek = (avail as usize).min(records.len()) as u32;
+        let mut peeked = 0u32;
+        if unsafe { PeekConsoleInputW(handle, records.as_mut_ptr(), to_peek, &mut peeked) } == 0
+            || peeked == 0
+        {
+            break;
+        }
+        let key_prefix = records[..peeked as usize]
+            .iter()
+            .take_while(|rec| rec.event_type == KEY_EVENT)
+            .count() as u32;
+        if key_prefix == 0 {
+            break;
+        }
+        let mut read_count = 0u32;
+        if unsafe { ReadConsoleInputW(handle, records.as_mut_ptr(), key_prefix, &mut read_count) }
+            == 0
+            || read_count == 0
+        {
+            break;
+        }
+        for rec in &records[..read_count as usize] {
+            if rec.event_type == KEY_EVENT {
+                let ke = unsafe { rec.event.key_event };
+                if ke.b_key_down != 0 && ke.u_char != 0 && ke.u_char <= 0x7f && out.len() < 4096 {
+                    out.push(ke.u_char as u8);
+                }
+            }
         }
     }
 
@@ -799,8 +916,14 @@ pub fn decode_and_render_for_protocol(
         bail!("Image dimensions are 0x0");
     }
 
-    let (target_px_w, target_px_h, occ_cols, occ_rows) =
-        compute_pixel_fit(width_px, height_px, max_cols, max_rows, caps.cell_px);
+    let (target_px_w, target_px_h, occ_cols, occ_rows) = compute_pixel_fit_for_protocol(
+        width_px,
+        height_px,
+        max_cols,
+        max_rows,
+        caps.cell_px,
+        caps.protocol,
+    );
 
     let payload = match caps.protocol {
         TerminalImageProtocol::Kitty => {
@@ -924,20 +1047,43 @@ fn compute_target_dims(width_px: u32, height_px: u32, max_cols: u16, max_rows: u
     (target_w, target_h)
 }
 
-fn compute_pixel_fit(
+fn compute_pixel_fit_for_protocol(
     width_px: u32,
     height_px: u32,
     max_cols: u16,
     max_rows: u16,
     cell_px: (u16, u16),
+    protocol: TerminalImageProtocol,
 ) -> (u32, u32, u16, u16) {
     let cell_w = cell_px.0.max(1);
     let cell_h = cell_px.1.max(1);
     let clamped_cols = max_cols.max(4);
-    let clamped_rows = max_rows.max(2);
+    let clamped_rows = if protocol == TerminalImageProtocol::Sixel {
+        max_rows.max(1)
+    } else {
+        max_rows.max(2)
+    };
+
+    let raw_max_h = (clamped_rows as u32 * cell_h as u32)
+        .min(MAX_PIXEL_HEIGHT)
+        .max(1);
+    let max_target_h = if protocol == TerminalImageProtocol::Sixel {
+        let sixel_safe_h = compute_sixel_safe_pixel_height(clamped_rows, cell_h);
+        if sixel_safe_h >= 6 {
+            sixel_safe_h.min(raw_max_h)
+        } else {
+            raw_max_h
+        }
+    } else {
+        raw_max_h
+    };
 
     let box_px_w = clamped_cols as f64 * cell_w as f64;
-    let box_px_h = clamped_rows as f64 * cell_h as f64;
+    let box_px_h = if protocol == TerminalImageProtocol::Sixel {
+        max_target_h as f64
+    } else {
+        clamped_rows as f64 * cell_h as f64
+    };
     let scale = (box_px_w / width_px as f64)
         .min(box_px_h / height_px as f64)
         .min(2.0);
@@ -945,15 +1091,17 @@ fn compute_pixel_fit(
     let max_target_w = (clamped_cols as u32 * cell_w as u32)
         .min(MAX_PIXEL_WIDTH)
         .max(1);
-    let max_target_h = (clamped_rows as u32 * cell_h as u32)
-        .min(MAX_PIXEL_HEIGHT)
-        .max(1);
 
     let target_px_w = ((width_px as f64 * scale).round() as u32).clamp(1, max_target_w);
     let target_px_h = ((height_px as f64 * scale).round() as u32).clamp(1, max_target_h);
 
     let occ_cols = (target_px_w.div_ceil(cell_w as u32)).clamp(1, max_cols.max(1) as u32) as u16;
-    let occ_rows = (target_px_h.div_ceil(cell_h as u32)).clamp(1, max_rows.max(1) as u32) as u16;
+    let occ_rows = if protocol == TerminalImageProtocol::Sixel {
+        let band_px_h = target_px_h.div_ceil(6) * 6;
+        (band_px_h.div_ceil(cell_h as u32)).clamp(1, max_rows.max(1) as u32) as u16
+    } else {
+        (target_px_h.div_ceil(cell_h as u32)).clamp(1, max_rows.max(1) as u32) as u16
+    };
 
     (target_px_w, target_px_h, occ_cols, occ_rows)
 }
@@ -1987,5 +2135,85 @@ mod tests {
             assert!(s.starts_with("\x1bP0;1;q\"1;1;"));
             assert!(s.ends_with("\x1b\\"));
         }
+    }
+
+    #[test]
+    fn test_kitty_delete_all_sequence() {
+        assert_eq!(kitty_delete_all_sequence(), "\x1b_Ga=d,d=A,q=2\x1b\\");
+    }
+
+    #[test]
+    fn test_erase_pixel_rect_sequence_bounds_and_padding() {
+        // Interior rect expands by +2 cols / +2 rows with 1-based CSI row;colH and leading SGR reset
+        let seq = erase_pixel_rect_sequence(4, 2, 5, 3, 80, 24);
+        assert!(seq.starts_with("\x1b[0m"));
+        let expected_spaces = " ".repeat(7); // 5 + 2
+        for row in 2..7u16 {
+            let needle = format!("\x1b[{};5H{expected_spaces}", row + 1);
+            assert!(seq.contains(&needle), "missing row {row}: {seq:?}");
+        }
+        assert!(!seq.contains("\x1b[8;5H"), "should not exceed y + height + 2");
+
+        // Clamping against (term_cols, term_rows) prevents out-of-bounds cursor moves
+        let clamped = erase_pixel_rect_sequence(78, 22, 5, 5, 80, 24);
+        assert!(clamped.starts_with("\x1b[0m"));
+        assert!(clamped.contains("\x1b[23;79H  "));
+        assert!(clamped.contains("\x1b[24;79H  "));
+        assert!(!clamped.contains("\x1b[25;"));
+
+        // Zero-sized or out-of-bounds rects return empty string
+        assert_eq!(erase_pixel_rect_sequence(0, 0, 0, 5, 80, 24), "");
+        assert_eq!(erase_pixel_rect_sequence(0, 0, 5, 0, 80, 24), "");
+        assert_eq!(erase_pixel_rect_sequence(80, 5, 4, 4, 80, 24), "");
+        assert_eq!(erase_pixel_rect_sequence(5, 24, 4, 4, 80, 24), "");
+    }
+
+    #[test]
+    fn test_sixel_six_pixel_band_never_exceeds_max_rows() {
+        assert_eq!(compute_sixel_safe_pixel_height(8, 20), 156); // 160 -> 26 * 6
+        assert_eq!(compute_sixel_safe_pixel_height(4, 19), 72); // 76 -> 12 * 6
+        assert_eq!(compute_sixel_safe_pixel_height(6, 16), 96); // exact multiple of 6
+
+        for cell_px in [(9u16, 19u16), (10, 20), (8, 16), (11, 23)] {
+            for max_rows in 4..=25u16 {
+                for (img_w, img_h) in [(200u32, 600u32), (800, 800), (600, 200), (137, 251)] {
+                    let (_tw, th, occ_cols, occ_rows) = compute_pixel_fit_for_protocol(
+                        img_w,
+                        img_h,
+                        40,
+                        max_rows,
+                        cell_px,
+                        TerminalImageProtocol::Sixel,
+                    );
+                    let band_px_h = th.div_ceil(6) * 6;
+                    let budget_px_h = max_rows as u32 * cell_px.1 as u32;
+                    assert!(
+                        band_px_h <= budget_px_h,
+                        "Sixel 6px band height {band_px_h} exceeded budget {budget_px_h} (cell={cell_px:?}, max_rows={max_rows}, img={img_w}x{img_h})"
+                    );
+                    assert!(occ_cols <= 40);
+                    assert!(occ_rows <= max_rows);
+                    assert!(
+                        (occ_rows as u32) * (cell_px.1 as u32) >= band_px_h,
+                        "occ_rows {occ_rows} * cell_h {} < band_px_h {band_px_h}",
+                        cell_px.1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_windows_restore_console_mode_flags_clears_quick_edit() {
+        let with_quick_edit = 0x0017 | WIN_ENABLE_QUICK_EDIT_MODE;
+        let restored = restore_windows_console_mode_flags(with_quick_edit);
+        assert_eq!(restored & WIN_ENABLE_QUICK_EDIT_MODE, 0);
+        assert_ne!(restored & WIN_ENABLE_EXTENDED_FLAGS, 0);
+        assert_eq!(restored & 0x0017, 0x0017);
+
+        let without_quick_edit = 0x0018;
+        let restored2 = restore_windows_console_mode_flags(without_quick_edit);
+        assert_eq!(restored2 & WIN_ENABLE_QUICK_EDIT_MODE, 0);
+        assert_ne!(restored2 & WIN_ENABLE_EXTENDED_FLAGS, 0);
     }
 }

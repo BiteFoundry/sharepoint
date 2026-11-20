@@ -271,6 +271,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         "Preview & Links",
         &[
             ("v / Alt+v", "HD terminal image preview overlay"),
+            ("m", "Toggle Rendered / Raw preview (.md / .html)"),
             ("u", "Link Extractor (web URL, share link, file URLs)"),
             ("h", "Toggle inline href URLs in inspector"),
             ("p", "Pin / Unpin current folder or site"),

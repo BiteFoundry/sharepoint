@@ -71,6 +71,7 @@ impl Keymap {
             map.bind(Some(focus), Char('S'), M::SHIFT, Action::CycleSortMode);
             map.bind(Some(focus), Char('u'), M::NONE, Action::OpenLinkExtractor);
             map.bind(Some(focus), Char('h'), M::NONE, Action::ToggleShowLinkUrls);
+            map.bind(Some(focus), Char('m'), M::NONE, Action::TogglePreviewRenderMode);
             map.bind(Some(focus), Char('o'), M::NONE, Action::OpenActiveWebUrl);
             map.bind(Some(focus), Char('p'), M::NONE, Action::TogglePinCurrent);
             map.bind(Some(focus), Char('.'), M::NONE, Action::OpenContextMenuHere);
@@ -243,6 +244,42 @@ mod tests {
         assert_eq!(
             map.resolve(Focus::List, key(KeyCode::Char('p'), KeyModifiers::CONTROL)),
             Some(Action::OpenOverlay(OverlayKind::CommandPalette))
+        );
+        assert_eq!(
+            map.resolve(Focus::List, key(KeyCode::Char('m'), KeyModifiers::NONE)),
+            Some(Action::TogglePreviewRenderMode)
+        );
+        assert_eq!(
+            map.resolve(Focus::Inspector, key(KeyCode::Char('m'), KeyModifiers::NONE)),
+            Some(Action::TogglePreviewRenderMode)
+        );
+    }
+
+    #[test]
+    fn m_key_does_not_hijack_text_input_overlays() {
+        let map = Keymap::default_sharepoint();
+        let m_key = key(KeyCode::Char('m'), KeyModifiers::NONE);
+
+        // In List / Inspector browse modes, `m` toggles rendered vs raw preview
+        assert_eq!(
+            crate::ui::event::key_to_action(m_key, Focus::List, &map, false),
+            Some(Action::TogglePreviewRenderMode)
+        );
+        assert_eq!(
+            crate::ui::event::key_to_action(m_key, Focus::Inspector, &map, false),
+            Some(Action::TogglePreviewRenderMode)
+        );
+
+        // When a text-input overlay (Search, CommandPalette, QuickInput) is active,
+        // `m` must be delivered as character input, never hijacked by TogglePreviewRenderMode.
+        assert_eq!(
+            crate::ui::event::key_to_action(m_key, Focus::Overlay, &map, true),
+            Some(Action::Input('m'))
+        );
+        // Even in non-text overlays, Focus::Overlay does not resolve List/Inspector `m`
+        assert_eq!(
+            map.resolve(Focus::Overlay, m_key),
+            None
         );
     }
 }

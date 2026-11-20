@@ -6,6 +6,7 @@ pub mod drive_view;
 pub mod event;
 pub mod hitmap;
 pub mod keymap;
+pub mod markup;
 pub mod nav_pane;
 pub mod notification;
 pub mod overlays;

@@ -94,6 +94,26 @@ impl DriveInfo {
     }
 }
 
+/// Markup document format eligible for rich terminal rendering in the TUI inspector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MarkupKind {
+    Markdown,
+    Html,
+}
+
+impl MarkupKind {
+    pub fn detect(item: &DriveItem) -> Option<Self> {
+        item.markup_kind()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Markdown => "Markdown",
+            Self::Html => "HTML",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriveItem {
     pub id: String,
@@ -167,9 +187,39 @@ impl DriveItem {
         )
     }
 
+    pub fn markup_kind(&self) -> Option<MarkupKind> {
+        if self.is_folder {
+            return None;
+        }
+        if let Some(ext) = self.extension() {
+            match ext.as_str() {
+                "md" | "markdown" | "mdown" | "mkd" | "mdx" => return Some(MarkupKind::Markdown),
+                "html" | "htm" | "xhtml" => return Some(MarkupKind::Html),
+                _ => {}
+            }
+        }
+        if let Some(mime) = self.mime_type.as_deref() {
+            let essence = mime
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            match essence.as_str() {
+                "text/markdown" | "text/x-markdown" => return Some(MarkupKind::Markdown),
+                "text/html" | "application/xhtml+xml" => return Some(MarkupKind::Html),
+                _ => {}
+            }
+        }
+        None
+    }
+
     pub fn is_text_previewable(&self) -> bool {
         if self.is_folder || self.is_image() {
             return false;
+        }
+        if self.markup_kind().is_some() {
+            return true;
         }
         if let Some(mime) = self.mime_type.as_deref() {
             let lower = mime.to_ascii_lowercase();
@@ -193,6 +243,9 @@ impl DriveItem {
                 "txt"
                     | "md"
                     | "markdown"
+                    | "mdown"
+                    | "mkd"
+                    | "mdx"
                     | "json"
                     | "jsonl"
                     | "yaml"
@@ -206,6 +259,7 @@ impl DriveItem {
                     | "xml"
                     | "html"
                     | "htm"
+                    | "xhtml"
                     | "css"
                     | "scss"
                     | "rs"
@@ -251,7 +305,7 @@ impl DriveItem {
         }
         match self.extension().as_deref() {
             Some("pdf") => "PDF",
-            Some("md" | "markdown") => "MD",
+            Some("md" | "markdown" | "mdown" | "mkd" | "mdx") => "MD",
             Some("doc" | "docx" | "rtf" | "odt") => "DOC",
             Some("xls" | "xlsx" | "ods") => "XLS",
             Some("ppt" | "pptx" | "odp") => "PPT",
@@ -262,7 +316,7 @@ impl DriveItem {
             Some("mp3" | "wav" | "flac" | "ogg" | "m4a") => "AUD",
             Some(
                 "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp" | "cs"
-                | "sh" | "ps1" | "sql" | "html" | "css",
+                | "sh" | "ps1" | "sql" | "html" | "htm" | "xhtml" | "css",
             ) => "CODE",
             Some("txt" | "log") => "TXT",
             _ => "FILE",

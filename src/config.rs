@@ -225,6 +225,8 @@ pub struct AppConfig {
     pub show_nav_rail: bool,
     /// Render inline image previews directly inside the right inspector pane.
     pub inline_images: bool,
+    /// Render Markdown (.md) and HTML (.html/.htm/.xhtml) files with rich terminal formatting in TUI inspector (toggle with m).
+    pub render_markup: bool,
     /// Preferred terminal image rendering protocol (`auto`, `kitty`, `iterm2`, `sixel`, `halfblock`).
     pub image_protocol: ImageProtocolPreference,
     /// Custom download directory. Empty defaults to `Downloads/sharepoint`.
@@ -288,6 +290,12 @@ impl Default for AppConfig {
             notify: true,
             show_nav_rail: true,
             inline_images: true,
+            render_markup: first_non_empty_env(&[
+                "SHAREPOINT_RENDER_MARKUP",
+                "ONEDRIVE_RENDER_MARKUP",
+            ])
+            .and_then(|s| parse_env_bool(&s))
+            .unwrap_or(true),
             image_protocol: first_non_empty_env(&[
                 "SHAREPOINT_IMAGE_PROTOCOL",
                 "ONEDRIVE_IMAGE_PROTOCOL",
@@ -414,6 +422,13 @@ impl AppConfig {
         ]) {
             if let Some(parsed) = ImageProtocolPreference::parse_str(&proto) {
                 cfg.image_protocol = parsed;
+            }
+        }
+        if let Some(rm) =
+            first_non_empty_env(&["SHAREPOINT_RENDER_MARKUP", "ONEDRIVE_RENDER_MARKUP"])
+        {
+            if let Some(parsed) = parse_env_bool(&rm) {
+                cfg.render_markup = parsed;
             }
         }
         cfg
@@ -710,6 +725,7 @@ impl EnvVarGuard {
             ("SHAREPOINT_CLI_CACHE_SECS", None),
             ("SHAREPOINT_AUTO_DAEMON", None),
             ("SHAREPOINT_IMAGE_PROTOCOL", None),
+            ("SHAREPOINT_RENDER_MARKUP", None),
             ("SHAREPOINT_ACCESS_TOKEN", None),
             ("SHAREPOINT_DISABLE_KEYRING", None),
             ("SHAREPOINT_NO_BROWSER", None),
@@ -727,6 +743,7 @@ impl EnvVarGuard {
             ("ONEDRIVE_CLI_CACHE_SECS", None),
             ("ONEDRIVE_AUTO_DAEMON", None),
             ("ONEDRIVE_IMAGE_PROTOCOL", None),
+            ("ONEDRIVE_RENDER_MARKUP", None),
             ("ONEDRIVE_ACCESS_TOKEN", None),
             ("TEAMS_CONFIG_DIR", None),
             ("TEAMS_DATA_DIR", None),
@@ -798,5 +815,26 @@ mod tests {
         assert_eq!(loaded.theme, ThemePreset::Light);
         assert_eq!(loaded.density, DensityMode::Compact);
         assert_eq!(loaded.pinned_sites, vec!["site-1".to_string()]);
+    }
+
+    #[test]
+    fn test_config_render_markup_default_and_roundtrip() {
+        let dir = tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.toml");
+        // Legacy config missing `render_markup` must default to `true`.
+        fs::write(&legacy_path, "notify = false\ninline_images = true\n").unwrap();
+        let legacy = AppConfig::load_from(&legacy_path).unwrap();
+        assert!(!legacy.notify);
+        assert!(legacy.render_markup);
+
+        // Explicit `false` round-trips cleanly.
+        let path = dir.path().join("config.toml");
+        let mut cfg = AppConfig::default();
+        assert!(cfg.render_markup);
+        cfg.render_markup = false;
+        cfg.save_to(&path).unwrap();
+
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert!(!loaded.render_markup);
     }
 }

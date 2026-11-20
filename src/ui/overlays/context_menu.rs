@@ -60,6 +60,13 @@ impl ContextMenu {
                     if item.is_image() {
                         list.push(MenuItem::new("HD Image Preview", Some("v"), Action::OpenImagePreview));
                     }
+                    if item.markup_kind().is_some() {
+                        list.push(MenuItem::new(
+                            "Toggle Rendered / Raw Preview",
+                            Some("m"),
+                            Action::TogglePreviewRenderMode,
+                        ));
+                    }
                     list.push(MenuItem::new("Create & Copy Share Link", Some("s"), Action::CreateAndCopyShareLink));
                     list.push(MenuItem::new("Extract Links", Some("u"), Action::OpenLinkExtractor));
                     list.push(MenuItem::new("Open in Browser", Some("o"), Action::OpenActiveWebUrl));

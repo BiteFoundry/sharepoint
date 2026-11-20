@@ -87,6 +87,7 @@ pub enum Action {
     // Links & image preview
     OpenLinkExtractor,
     ToggleShowLinkUrls,
+    TogglePreviewRenderMode,
     OpenUrl(String),
     CopyUrlToClipboard(String),
     ToggleInlineImages,
@@ -666,6 +667,17 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 ToastKind::Info,
             );
         }
+        Action::TogglePreviewRenderMode => {
+            ui.render_markup = !ui.render_markup;
+            app.save_ui_prefs(ui);
+            ui.toast(
+                format!(
+                    "Preview mode: {}",
+                    if ui.render_markup { "Rendered" } else { "Raw" }
+                ),
+                ToastKind::Info,
+            );
+        }
         Action::OpenUrl(url) => match open::that(&url) {
             Ok(()) => ui.toast(format!("Opened {url}"), ToastKind::Info),
             Err(err) => ui.toast(format!("Failed to open browser: {err}"), ToastKind::Error),
@@ -1010,6 +1022,9 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
         }
         Some(HitTarget::Button(btn)) => match btn {
             ButtonId::SortToggle => return dispatch(Action::CycleSortMode, app, ui),
+            ButtonId::PreviewRenderToggle => {
+                return dispatch(Action::TogglePreviewRenderMode, app, ui)
+            }
             ButtonId::Help => return dispatch(Action::OpenOverlay(OverlayKind::Help), app, ui),
             ButtonId::Settings => {
                 return dispatch(Action::OpenOverlay(OverlayKind::Settings), app, ui)

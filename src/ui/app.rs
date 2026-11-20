@@ -22,6 +22,7 @@ use crate::sync::{FocusTarget, SyncController};
 
 use super::hitmap::HitMap;
 use super::keymap::Keymap;
+use super::markup::CachedMarkupPreview;
 use super::notification;
 use super::overlays::Overlay;
 use super::theme::Theme;
@@ -191,7 +192,9 @@ pub struct UiState {
     pub density: DensityMode,
     pub show_nav_rail: bool,
     pub inline_images: bool,
+    pub render_markup: bool,
     pub show_link_urls: bool,
+    pub markup_cache: Option<CachedMarkupPreview>,
     pub notify: bool,
     pub nav_selected: usize,
     pub nav_area: Rect,
@@ -226,7 +229,9 @@ impl UiState {
             density: cfg.density,
             show_nav_rail: cfg.show_nav_rail,
             inline_images: cfg.inline_images,
+            render_markup: cfg.render_markup,
             show_link_urls: false,
+            markup_cache: None,
             notify: cfg.notify,
             nav_selected: 0,
             nav_area: Rect::default(),
@@ -996,6 +1001,7 @@ impl AppState {
         self.config.notify = ui.notify;
         self.config.show_nav_rail = ui.show_nav_rail;
         self.config.inline_images = ui.inline_images;
+        self.config.render_markup = ui.render_markup;
         self.config.density = ui.density;
         self.config.theme = ui.theme_preset;
         self.config.image_protocol = match ui.graphics_caps.protocol {

@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-const ITEMS: usize = 10;
+const ITEMS: usize = 11;
 
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {
@@ -38,6 +38,7 @@ impl SettingsState {
             ("Notifications", toggle(ui.notify)),
             ("Left sidebar", toggle(ui.show_nav_rail)),
             ("Inline image previews", toggle(ui.inline_images)),
+            ("Rendered MD/HTML preview", toggle(ui.render_markup)),
             ("Image protocol", ui.graphics_caps.protocol.label().to_string()),
             ("List density", ui.density.label().to_string()),
             ("Color theme", ui.theme_preset.label().to_string()),
@@ -65,12 +66,13 @@ impl SettingsState {
                 0 => OverlayOutcome::Dispatch(Action::ToggleNotify),
                 1 => OverlayOutcome::Dispatch(Action::ToggleNavRail),
                 2 => OverlayOutcome::Dispatch(Action::ToggleInlineImages),
-                3 => OverlayOutcome::Dispatch(Action::CycleImageProtocol),
-                4 => OverlayOutcome::Dispatch(Action::ToggleDensity),
-                5 => OverlayOutcome::Dispatch(Action::CycleTheme),
-                6 => OverlayOutcome::Dispatch(Action::ShowDownloadDir),
-                7 => OverlayOutcome::CloseAndDispatch(Action::OpenOverlay(OverlayKind::Help)),
-                8 => OverlayOutcome::Dispatch(Action::ShowToast(format!(
+                3 => OverlayOutcome::Dispatch(Action::TogglePreviewRenderMode),
+                4 => OverlayOutcome::Dispatch(Action::CycleImageProtocol),
+                5 => OverlayOutcome::Dispatch(Action::ToggleDensity),
+                6 => OverlayOutcome::Dispatch(Action::CycleTheme),
+                7 => OverlayOutcome::Dispatch(Action::ShowDownloadDir),
+                8 => OverlayOutcome::CloseAndDispatch(Action::OpenOverlay(OverlayKind::Help)),
+                9 => OverlayOutcome::Dispatch(Action::ShowToast(format!(
                     "Graph URL: {} (edit in config.toml)",
                     app.config.graph_base_url
                 ))),
@@ -124,11 +126,11 @@ impl SettingsState {
             } else {
                 Style::default()
             };
-            let used = unicode_width::UnicodeWidthStr::width(*label) + 6;
+            let used = unicode_width::UnicodeWidthStr::width(*label).max(25) + 3;
             let value =
                 crate::ui::truncate_width(value, (inner.width as usize).saturating_sub(used + 2));
             let line = Line::from(vec![
-                Span::styled(format!(" {:<22}", label), style),
+                Span::styled(format!(" {:<25}", label), style),
                 Span::styled(value, theme.muted_style()),
             ]);
             frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));

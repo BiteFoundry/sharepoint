@@ -260,7 +260,8 @@ pub fn extract_links_from_drive_item(
         acc.push("Open in SharePoint / OneDrive Web", url);
     }
     if let Some(text) = preview_text {
-        let is_html = matches!(item.extension().as_deref(), Some("html" | "htm"));
+        let is_html = matches!(item.extension().as_deref(), Some("html" | "htm" | "xhtml"))
+            || matches!(item.markup_kind(), Some(crate::models::MarkupKind::Html));
         if is_html {
             extract_into_acc(&mut acc, text, "");
         } else {
