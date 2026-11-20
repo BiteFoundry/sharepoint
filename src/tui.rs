@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+#[cfg(not(windows))]
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as CrosstermEvent, EventStream, KeyEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -41,6 +42,130 @@ use crate::ui::{
 };
 
 static KITTY_USED_GLOBAL: AtomicBool = AtomicBool::new(false);
+
+/// VT DECSET sequences for X10 + button-motion + SGR mouse reporting.
+/// `crossterm 0.28` skips ANSI mouse codes on Windows, so writing these explicitly
+/// ensures ConPTY / Windows Terminal / xterm.js report mouse wheel events cleanly.
+pub(crate) const VT_ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+pub(crate) const VT_DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+pub(crate) fn write_vt_mouse_enable(w: &mut impl io::Write) -> io::Result<()> {
+    w.write_all(VT_ENABLE_MOUSE.as_bytes())?;
+    w.flush()
+}
+
+pub(crate) fn write_vt_mouse_disable(w: &mut impl io::Write) -> io::Result<()> {
+    w.write_all(VT_DISABLE_MOUSE.as_bytes())?;
+    w.flush()
+}
+
+#[cfg(windows)]
+mod win_console {
+    use std::ptr::null_mut;
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+
+    const ENABLE_WINDOW_INPUT: u32 = 0x0008;
+    const ENABLE_MOUSE_INPUT: u32 = 0x0010;
+    pub const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+
+    /// Raw-mode + ConPTY mouse capture console input mode (`0x0098`):
+    /// enables `ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS`,
+    /// explicitly clearing `ENABLE_QUICK_EDIT_MODE`, `ENABLE_VIRTUAL_TERMINAL_INPUT`,
+    /// `ENABLE_LINE_INPUT`, `ENABLE_ECHO_INPUT`, and `ENABLE_PROCESSED_INPUT`.
+    pub const TUI_MOUSE_CAPTURE_MODE: u32 =
+        ENABLE_WINDOW_INPUT | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut std::ffi::c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: isize,
+        ) -> isize;
+        fn CloseHandle(h_object: isize) -> i32;
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn GetConsoleMode(h_console_handle: isize, lp_mode: *mut u32) -> i32;
+        fn SetConsoleMode(h_console_handle: isize, dw_mode: u32) -> i32;
+    }
+
+    fn with_conin_handle<T>(f: impl FnOnce(isize) -> Option<T>) -> Option<T> {
+        const CONIN_WIDE: [u16; 7] = [
+            b'C' as u16,
+            b'O' as u16,
+            b'N' as u16,
+            b'I' as u16,
+            b'N' as u16,
+            b'$' as u16,
+            0,
+        ];
+        let conin = unsafe {
+            CreateFileW(
+                CONIN_WIDE.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null_mut(),
+                OPEN_EXISTING,
+                0,
+                0,
+            )
+        };
+        if conin != 0 && conin != INVALID_HANDLE_VALUE {
+            let res = f(conin);
+            unsafe {
+                CloseHandle(conin);
+            }
+            return res;
+        }
+        let std_in = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if std_in != 0 && std_in != INVALID_HANDLE_VALUE {
+            f(std_in)
+        } else {
+            None
+        }
+    }
+
+    pub fn snapshot_console_mode() -> Option<u32> {
+        with_conin_handle(|h| {
+            let mut mode = 0u32;
+            if unsafe { GetConsoleMode(h, &mut mode) } != 0 {
+                Some(mode)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn enforce_windows_mouse_capture() {
+        let _ = with_conin_handle(|h| {
+            unsafe {
+                SetConsoleMode(h, TUI_MOUSE_CAPTURE_MODE);
+            }
+            Some(())
+        });
+    }
+
+    pub fn restore_console_mode(orig_mode: Option<u32>) {
+        if let Some(mode) = orig_mode {
+            let _ = with_conin_handle(|h| {
+                unsafe {
+                    SetConsoleMode(h, mode | ENABLE_EXTENDED_FLAGS);
+                }
+                Some(())
+            });
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PixelReconcilePlan {
@@ -199,12 +324,17 @@ struct TerminalGuard {
     kitty_used: bool,
     pixel_tracker: PixelLayerTracker,
     last_inspector_area: Rect,
+    #[cfg(windows)]
+    orig_conin_mode: Option<u32>,
 }
 
 impl TerminalGuard {
     fn enter(
         image_pref: ImageProtocolPreference,
     ) -> Result<(Self, Terminal<CrosstermBackend<Stdout>>, TerminalGraphicsCaps)> {
+        #[cfg(windows)]
+        let orig_conin_mode = win_console::snapshot_console_mode();
+
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         // Probe graphics & cell pixel size while raw mode is active and BEFORE
@@ -212,12 +342,18 @@ impl TerminalGuard {
         // movement or console-mode swaps never race with CSI/DA1/Kitty replies.
         let probed_caps = img_preview::probe_terminal_graphics_caps(image_pref);
 
+        #[cfg(not(windows))]
         execute!(
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableBracketedPaste
         )?;
+        #[cfg(windows)]
+        {
+            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            write_vt_mouse_enable(&mut stdout)?;
+        }
         let keyboard_enhanced = if supports_keyboard_enhancement().unwrap_or(false) {
             execute!(
                 stdout,
@@ -231,6 +367,12 @@ impl TerminalGuard {
             false
         };
 
+        #[cfg(windows)]
+        {
+            win_console::enforce_windows_mouse_capture();
+            let _ = write_vt_mouse_enable(&mut stdout);
+        }
+
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         terminal.hide_cursor()?;
@@ -242,6 +384,8 @@ impl TerminalGuard {
                 kitty_used: false,
                 pixel_tracker: PixelLayerTracker::default(),
                 last_inspector_area: Rect::default(),
+                #[cfg(windows)]
+                orig_conin_mode,
             },
             terminal,
             probed_caps,
@@ -258,13 +402,21 @@ impl TerminalGuard {
         if self.keyboard_enhanced {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
+        #[cfg(not(windows))]
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        #[cfg(windows)]
+        {
+            let _ = write_vt_mouse_disable(&mut stdout);
+            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        }
         let _ = disable_raw_mode();
+        #[cfg(windows)]
+        win_console::restore_console_mode(self.orig_conin_mode);
     }
 }
 
@@ -274,7 +426,9 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn install_panic_hook(keyboard_enhanced: bool) {
+fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
+    #[cfg(not(windows))]
+    let _ = orig_conin_mode;
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut stdout = io::stdout();
@@ -286,13 +440,21 @@ fn install_panic_hook(keyboard_enhanced: bool) {
         if keyboard_enhanced {
             let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         }
+        #[cfg(not(windows))]
         let _ = execute!(
             stdout,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        #[cfg(windows)]
+        {
+            let _ = write_vt_mouse_disable(&mut stdout);
+            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        }
         let _ = disable_raw_mode();
+        #[cfg(windows)]
+        win_console::restore_console_mode(orig_conin_mode);
         prev(info);
     }));
 }
@@ -305,7 +467,11 @@ pub async fn run_tui(
     persona: Persona,
 ) -> Result<()> {
     let (mut guard, mut terminal, probed_caps) = TerminalGuard::enter(config.image_protocol)?;
-    install_panic_hook(guard.keyboard_enhanced);
+    #[cfg(windows)]
+    let orig_conin_mode = guard.orig_conin_mode;
+    #[cfg(not(windows))]
+    let orig_conin_mode = None;
+    install_panic_hook(guard.keyboard_enhanced, orig_conin_mode);
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
     let user_id = graph.my_user_id().map(str::to_string);
@@ -769,5 +935,31 @@ mod tests {
             26,
         );
         assert_eq!(too_small, Err(None));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_mouse_capture_mode_bits() {
+        // 0x0098 = ENABLE_WINDOW_INPUT (0x0008) | ENABLE_MOUSE_INPUT (0x0010) | ENABLE_EXTENDED_FLAGS (0x0080)
+        assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE, 0x0098);
+        assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0040, 0); // QuickEdit cleared
+        assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0200, 0); // VTInput cleared
+    }
+
+    #[test]
+    fn test_vt_mouse_enable_and_disable_ansi_sequences() {
+        let mut enable_buf = Vec::new();
+        write_vt_mouse_enable(&mut enable_buf).unwrap();
+        assert_eq!(
+            String::from_utf8(enable_buf).unwrap(),
+            "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+        );
+
+        let mut disable_buf = Vec::new();
+        write_vt_mouse_disable(&mut disable_buf).unwrap();
+        assert_eq!(
+            String::from_utf8(disable_buf).unwrap(),
+            "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
+        );
     }
 }

@@ -348,11 +348,32 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::MouseScroll { delta, column, row } => {
             let pos = ratatui::layout::Position::new(column, row);
             if ui.inspector_scroll.area.contains(pos) {
-                let vh = ui.inspector_scroll.area.height.saturating_sub(2) as usize;
+                let vh = ui.inspector_scroll.area.height.saturating_sub(1) as usize;
                 if delta < 0 {
                     ui.inspector_scroll.scroll_up((-delta) as usize);
                 } else {
                     ui.inspector_scroll.scroll_down(delta as usize, vh);
+                }
+            } else if ui.list_scroll.area.contains(pos) {
+                let len = app.current_items.len();
+                if len > 0 {
+                    let cur = ui.list_scroll.selected_idx.unwrap_or(0).min(len - 1);
+                    let next = if delta < 0 {
+                        cur.saturating_sub(1)
+                    } else {
+                        (cur + 1).min(len - 1)
+                    };
+                    select_list_index(next, app, ui);
+                }
+            } else if ui.nav_area.contains(pos) {
+                let rows = build_nav_rows(app, ui);
+                if !rows.is_empty() {
+                    let cur = ui.nav_selected.min(rows.len() - 1);
+                    ui.nav_selected = if delta < 0 {
+                        cur.saturating_sub(1)
+                    } else {
+                        (cur + 1).min(rows.len() - 1)
+                    };
                 }
             } else if delta < 0 {
                 return dispatch(Action::MoveUp, app, ui);
