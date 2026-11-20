@@ -521,12 +521,34 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 .to_string();
             ui.toast(format!("Uploading {fname}..."), ToastKind::Info);
             tokio::spawn(async move {
+                let opts = crate::cli::resolve_upload_options_for_local_file(
+                    &storage,
+                    &drive_id,
+                    parent_id.as_deref(),
+                    None,
+                    None,
+                    &local_path,
+                    None,
+                    None,
+                );
                 match graph
-                    .upload_local_file(&drive_id, parent_id.as_deref(), None, &local_path)
+                    .upload_local_file_with_options(
+                        &drive_id,
+                        parent_id.as_deref(),
+                        None,
+                        &local_path,
+                        &opts,
+                    )
                     .await
                 {
                     Ok(item) => {
                         let _ = storage.upsert_drive_items(std::slice::from_ref(&item));
+                        crate::cli::refresh_download_baseline_after_upload(
+                            &storage,
+                            &local_path,
+                            &item,
+                            &opts,
+                        );
                         let _ = tx.send(UiMsg::ItemUploaded(item));
                     }
                     Err(err) => {
@@ -759,11 +781,10 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 return false;
             }
             if let Some(html) = app.text_preview_for(&item).map(str::to_string) {
-                ui.push_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
-                    item.name,
-                    html,
-                    Some(item.id),
-                )));
+                ui.push_overlay(Overlay::HtmlPreview(
+                    HtmlPreviewOverlay::new(item.name.clone(), html, Some(item.id.clone()))
+                        .with_source(item.effective_drive_id(), item.content_revision()),
+                ));
             } else {
                 let graph = app.graph.clone();
                 let tx = app.ui_tx.clone();
@@ -976,6 +997,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
         }
         Action::RefreshAll => {
+            app.invalidate_active_item_caches(ui);
             app.sync_ctrl.request(SyncCommand::RefreshAll);
             app.load_active_folder(ui);
             ui.toast("Refreshing SharePoint & OneDrive...", ToastKind::Info);
@@ -1122,8 +1144,10 @@ fn activate_nav_row(row_idx: usize, app: &mut AppState, ui: &mut UiState) {
 
 fn spawn_download_item(app: &AppState, item: &crate::models::DriveItem) {
     let graph = app.graph.clone();
+    let storage = app.storage.clone();
     let tx = app.ui_tx.clone();
     let dest_dir = app.download_dir.clone();
+    let item_clone = item.clone();
     let did = item.effective_drive_id().to_string();
     let iid = item.effective_item_id().to_string();
     let name = item.name.clone();
@@ -1134,7 +1158,8 @@ fn spawn_download_item(app: &AppState, item: &crate::models::DriveItem) {
             .download_item_to_file(&did, &iid, Some(&name), mime.as_deref(), dl_url.as_deref(), &dest_dir)
             .await
         {
-            Ok(dl) => {
+            Ok(mut dl) => {
+                crate::cli::record_download_baseline(&storage, &item_clone, &mut dl);
                 let _ = tx.send(UiMsg::ItemDownloaded(dl));
             }
             Err(err) => {

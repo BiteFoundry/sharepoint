@@ -31,7 +31,9 @@ use crate::ui::{
 };
 
 pub struct HtmlPreviewOverlay {
+    pub drive_id: Option<String>,
     pub item_id: Option<String>,
+    pub revision: Option<String>,
     pub title: String,
     pub session: HtmlViewSession,
     pub viewport: Rect,
@@ -41,7 +43,9 @@ pub struct HtmlPreviewOverlay {
 impl fmt::Debug for HtmlPreviewOverlay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HtmlPreviewOverlay")
+            .field("drive_id", &self.drive_id)
             .field("item_id", &self.item_id)
+            .field("revision", &self.revision)
             .field("title", &self.title)
             .field("raw_mode", &self.session.raw_mode)
             .field("scroll_y", &self.session.scroll_y)
@@ -57,11 +61,36 @@ impl HtmlPreviewOverlay {
         let title_str = title.into();
         let session = HtmlViewSession::new(Some(title_str.clone()), raw_html);
         Self {
+            drive_id: None,
             item_id,
+            revision: None,
             title: title_str,
             session,
             viewport: Rect::default(),
             max_scroll_y: 0,
+        }
+    }
+
+    pub fn with_source(mut self, drive_id: impl Into<String>, revision: impl Into<String>) -> Self {
+        self.drive_id = Some(drive_id.into());
+        self.revision = Some(revision.into());
+        self
+    }
+
+    pub fn replace_html(
+        &mut self,
+        title: impl Into<String>,
+        raw_html: String,
+        revision: Option<String>,
+    ) {
+        let raw_mode = self.session.raw_mode;
+        let title_str = title.into();
+        let mut session = HtmlViewSession::new(Some(title_str.clone()), raw_html);
+        session.raw_mode = raw_mode;
+        self.title = title_str;
+        self.session = session;
+        if revision.is_some() {
+            self.revision = revision;
         }
     }
 

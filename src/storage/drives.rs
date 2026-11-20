@@ -1,10 +1,17 @@
 //! SQLite persistence for SharePoint sites, drives, drive items (with FTS5 sync),
 //! recent/shared lists, pinned sites/folders, and sync cursors.
 
+use std::{
+    collections::{HashSet, VecDeque},
+    path::Path,
+};
+
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::models::{DriveInfo, DriveItem, PinnedTarget, SharePointSite, SyncCursor};
+use crate::models::{
+    DownloadBaseline, DriveInfo, DriveItem, PinnedTarget, SharePointSite, SyncCursor,
+};
 
 pub(crate) fn escape_like(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -25,36 +32,60 @@ pub(crate) fn escape_like(input: &str) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn upsert_sites(conn: &mut Connection, sites: &[SharePointSite]) -> Result<()> {
-    if sites.is_empty() {
-        return Ok(());
-    }
+    upsert_sites_inner(conn, sites, false)
+}
+
+/// Upserts an authoritative site list with exact follow state (reflecting site unfollows).
+pub fn upsert_sites_with_follow_state(
+    conn: &mut Connection,
+    sites: &[SharePointSite],
+) -> Result<()> {
+    upsert_sites_inner(conn, sites, true)
+}
+
+fn upsert_sites_inner(
+    conn: &mut Connection,
+    sites: &[SharePointSite],
+    authoritative_follow_state: bool,
+) -> Result<()> {
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare_cached(
-            "
-            INSERT INTO sites (id, name, display_name, description, web_url, is_followed, created_at, last_modified_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                display_name = excluded.display_name,
-                description = COALESCE(excluded.description, sites.description),
-                web_url = COALESCE(excluded.web_url, sites.web_url),
-                is_followed = MAX(sites.is_followed, excluded.is_followed),
-                created_at = COALESCE(excluded.created_at, sites.created_at),
-                last_modified_at = COALESCE(excluded.last_modified_at, sites.last_modified_at)
-            ",
-        )?;
-        for s in sites {
-            stmt.execute(params![
-                s.id,
-                s.name,
-                s.display_name,
-                s.description,
-                s.web_url,
-                if s.is_followed { 1i32 } else { 0i32 },
-                s.created_at,
-                s.last_modified_at,
-            ])?;
+        if authoritative_follow_state {
+            tx.execute("UPDATE sites SET is_followed = 0 WHERE is_followed != 0", [])?;
+        }
+        if !sites.is_empty() {
+            let follow_expr = if authoritative_follow_state {
+                "excluded.is_followed"
+            } else {
+                "MAX(sites.is_followed, excluded.is_followed)"
+            };
+            let sql = format!(
+                "
+                INSERT INTO sites (id, name, display_name, description, web_url, is_followed, created_at, last_modified_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    display_name = excluded.display_name,
+                    description = COALESCE(excluded.description, sites.description),
+                    web_url = COALESCE(excluded.web_url, sites.web_url),
+                    is_followed = {follow_expr},
+                    created_at = COALESCE(excluded.created_at, sites.created_at),
+                    last_modified_at = COALESCE(excluded.last_modified_at, sites.last_modified_at)
+                "
+            );
+            let mut stmt = tx.prepare_cached(&sql)?;
+            for s in sites {
+                stmt.execute(params![
+                    s.id,
+                    s.name,
+                    s.display_name,
+                    s.description,
+                    s.web_url,
+                    if s.is_followed { 1i32 } else { 0i32 },
+                    s.created_at,
+                    s.last_modified_at,
+                ])?;
+            }
         }
     }
     tx.commit()?;
@@ -221,13 +252,36 @@ fn author_text(item: &DriveItem) -> String {
     }
 }
 
-pub fn upsert_drive_items(conn: &mut Connection, items: &[DriveItem]) -> Result<usize> {
+fn normalize_parent_path(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        String::new()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn item_display_path(parent_path: &str, name: &str) -> String {
+    let p = normalize_parent_path(parent_path);
+    if p.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("{p}/{name}")
+    }
+}
+
+fn upsert_drive_items_tx(tx: &rusqlite::Transaction<'_>, items: &[DriveItem]) -> Result<usize> {
     if items.is_empty() {
         return Ok(0);
     }
-    let tx = conn.transaction()?;
     let mut written = 0usize;
+    let mut moved_folders: Vec<(String, String, String)> = Vec::new();
     {
+        let mut get_prev_folder_stmt = tx.prepare_cached(
+            "SELECT is_folder, parent_path, name FROM drive_items WHERE drive_id = ?1 AND id = ?2",
+        )?;
         let mut upsert_stmt = tx.prepare_cached(
             "
             INSERT INTO drive_items (
@@ -241,7 +295,7 @@ pub fn upsert_drive_items(conn: &mut Connection, items: &[DriveItem]) -> Result<
             )
             ON CONFLICT(drive_id, id) DO UPDATE SET
                 parent_id = COALESCE(excluded.parent_id, drive_items.parent_id),
-                parent_path = CASE WHEN excluded.parent_path != '' THEN excluded.parent_path ELSE drive_items.parent_path END,
+                parent_path = excluded.parent_path,
                 name = excluded.name,
                 size = excluded.size,
                 is_folder = excluded.is_folder,
@@ -273,11 +327,28 @@ pub fn upsert_drive_items(conn: &mut Connection, items: &[DriveItem]) -> Result<
         )?;
 
         for item in items {
+            let norm_parent_path = normalize_parent_path(&item.parent_path);
+            if item.is_folder {
+                let prev: Option<(i32, String, String)> = get_prev_folder_stmt
+                    .query_row(params![item.drive_id, item.id], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .optional()?;
+                if let Some((was_folder, old_pp, old_name)) = prev {
+                    if was_folder != 0 {
+                        let old_full = item_display_path(&old_pp, &old_name);
+                        let new_full = item_display_path(&norm_parent_path, &item.name);
+                        if old_full != new_full {
+                            moved_folders.push((item.drive_id.clone(), old_full, new_full));
+                        }
+                    }
+                }
+            }
             upsert_stmt.execute(params![
                 item.drive_id,
                 item.id,
                 item.parent_id,
-                item.parent_path,
+                norm_parent_path,
                 item.name,
                 item.size as i64,
                 if item.is_folder { 1i32 } else { 0i32 },
@@ -303,15 +374,151 @@ pub fn upsert_drive_items(conn: &mut Connection, items: &[DriveItem]) -> Result<
                 item.drive_id,
                 item.id,
                 item.name,
-                item.parent_path,
+                norm_parent_path,
                 author_text(item),
                 item.mime_type.as_deref().unwrap_or(""),
             ])?;
             written += 1;
         }
     }
+
+    for (drive_id, old_prefix, new_prefix) in moved_folders {
+        let like_pat = format!("{}/%", escape_like(&old_prefix));
+        let descendants: Vec<(i64, String, String, String, Option<String>, Option<String>, Option<String>)> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT rowid, id, parent_path, name, last_modified_by, created_by, mime_type
+                 FROM drive_items
+                 WHERE drive_id = ?1
+                   AND (parent_path = ?2 COLLATE NOCASE OR parent_path LIKE ?3 ESCAPE '\\' COLLATE NOCASE)",
+            )?;
+            let mapped = stmt.query_map(params![drive_id, old_prefix, like_pat], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut upd_path = tx.prepare_cached(
+            "UPDATE drive_items SET parent_path = ?1 WHERE drive_id = ?2 AND id = ?3",
+        )?;
+        let mut del_fts = tx.prepare_cached("DELETE FROM drive_items_fts WHERE rowid = ?1")?;
+        let mut ins_fts = tx.prepare_cached(
+            "INSERT INTO drive_items_fts (rowid, drive_id, item_id, name, parent_path, author, mime_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for (rowid, id, pp, name, mod_by, cr_by, mime) in descendants {
+            let suffix = pp.get(old_prefix.len()..).unwrap_or("");
+            let updated_pp = format!("{new_prefix}{suffix}");
+            upd_path.execute(params![updated_pp, drive_id, id])?;
+            del_fts.execute([rowid])?;
+            let dummy = DriveItem {
+                last_modified_by: mod_by,
+                created_by: cr_by,
+                ..Default::default()
+            };
+            ins_fts.execute(params![
+                rowid,
+                drive_id,
+                id,
+                name,
+                updated_pp,
+                author_text(&dummy),
+                mime.as_deref().unwrap_or(""),
+            ])?;
+        }
+    }
+
+    Ok(written)
+}
+
+pub fn upsert_drive_items(conn: &mut Connection, items: &[DriveItem]) -> Result<usize> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+    let written = upsert_drive_items_tx(&tx, items)?;
     tx.commit()?;
     Ok(written)
+}
+
+/// Deletes an item and, if it is a cached folder, recursively deletes all cached descendants
+/// from `drive_items`, `drive_items_fts`, and `drive_item_lists`.
+fn delete_item_and_descendants_tx(
+    tx: &rusqlite::Transaction<'_>,
+    drive_id: &str,
+    item_id: &str,
+) -> Result<()> {
+    let mut visited_ids: HashSet<String> = HashSet::new();
+    let mut to_delete: Vec<(i64, String)> = Vec::new();
+    let mut folder_queue: VecDeque<(String, String)> = VecDeque::new();
+
+    let root_row: Option<(i64, i32, String, String)> = tx
+        .query_row(
+            "SELECT rowid, is_folder, parent_path, name FROM drive_items WHERE drive_id = ?1 AND id = ?2",
+            params![drive_id, item_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+
+    if let Some((rid, is_folder, pp, name)) = root_row {
+        visited_ids.insert(item_id.to_string());
+        to_delete.push((rid, item_id.to_string()));
+        if is_folder != 0 {
+            folder_queue.push_back((item_id.to_string(), item_display_path(&pp, &name)));
+        }
+    } else {
+        tx.execute(
+            "DELETE FROM drive_item_lists WHERE drive_id = ?1 AND item_id = ?2",
+            params![drive_id, item_id],
+        )?;
+        return Ok(());
+    }
+
+    while let Some((folder_id, folder_path)) = folder_queue.pop_front() {
+        let like_pat = format!("{}/%", escape_like(&folder_path));
+        let children: Vec<(i64, String, i32, String, String)> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT rowid, id, is_folder, parent_path, name
+                 FROM drive_items
+                 WHERE drive_id = ?1
+                   AND (
+                       parent_id = ?2
+                       OR parent_path = ?3 COLLATE NOCASE
+                       OR parent_path LIKE ?4 ESCAPE '\\' COLLATE NOCASE
+                   )",
+            )?;
+            let mapped = stmt.query_map(params![drive_id, folder_id, folder_path, like_pat], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (rid, cid, is_folder, pp, name) in children {
+            if visited_ids.insert(cid.clone()) {
+                to_delete.push((rid, cid.clone()));
+                if is_folder != 0 {
+                    folder_queue.push_back((cid, item_display_path(&pp, &name)));
+                }
+            }
+        }
+    }
+
+    let mut del_fts = tx.prepare_cached("DELETE FROM drive_items_fts WHERE rowid = ?1")?;
+    let mut del_item =
+        tx.prepare_cached("DELETE FROM drive_items WHERE drive_id = ?1 AND id = ?2")?;
+    let mut del_list =
+        tx.prepare_cached("DELETE FROM drive_item_lists WHERE drive_id = ?1 AND item_id = ?2")?;
+    for (rid, id) in to_delete {
+        del_fts.execute([rid])?;
+        del_item.execute(params![drive_id, id])?;
+        del_list.execute(params![drive_id, id])?;
+    }
+    Ok(())
 }
 
 /// Replaces cached children for a specific `(drive_id, parent_id)` folder view so deleted items vanish cleanly.
@@ -324,34 +531,75 @@ pub fn replace_folder_children(
     let pid = parent_id.map(str::trim).filter(|s| !s.is_empty() && *s != "root");
     let tx = conn.transaction()?;
     {
-        let existing_ids: Vec<(i64, String)> = if let Some(p) = pid {
+        let existing_ids: Vec<String> = if let Some(p) = pid {
             let mut stmt = tx.prepare_cached(
-                "SELECT rowid, id FROM drive_items WHERE drive_id = ?1 AND parent_id = ?2",
+                "SELECT id FROM drive_items WHERE drive_id = ?1 AND parent_id = ?2",
             )?;
-            let mapped = stmt.query_map(params![drive_id, p], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let mapped = stmt.query_map(params![drive_id, p], |r| r.get(0))?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
         } else {
             let mut stmt = tx.prepare_cached(
-                "SELECT rowid, id FROM drive_items WHERE drive_id = ?1 AND (parent_path = '' OR parent_path = '/')",
+                "SELECT id FROM drive_items WHERE drive_id = ?1 AND (parent_path = '' OR parent_path = '/')",
             )?;
-            let mapped = stmt.query_map([drive_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let mapped = stmt.query_map([drive_id], |r| r.get(0))?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
-        let incoming: std::collections::HashSet<&str> =
-            items.iter().map(|i| i.id.as_str()).collect();
-        let mut del_item =
-            tx.prepare_cached("DELETE FROM drive_items WHERE drive_id = ?1 AND id = ?2")?;
-        let mut del_fts = tx.prepare_cached("DELETE FROM drive_items_fts WHERE rowid = ?1")?;
-        for (rowid, id) in existing_ids {
+        let incoming: HashSet<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        for id in existing_ids {
             if !incoming.contains(id.as_str()) {
-                del_fts.execute([rowid])?;
-                del_item.execute(params![drive_id, id])?;
+                delete_item_and_descendants_tx(&tx, drive_id, &id)?;
             }
         }
+        upsert_drive_items_tx(&tx, items)?;
     }
     tx.commit()?;
-    upsert_drive_items(conn, items)?;
+    Ok(())
+}
+
+/// Replaces cached children for a folder addressed by logical path (e.g. `"/Projects"` or `"Projects"`).
+pub fn replace_folder_children_by_path(
+    conn: &mut Connection,
+    drive_id: &str,
+    folder_path: &str,
+    items: &[DriveItem],
+) -> Result<()> {
+    let norm_path = normalize_parent_path(folder_path);
+    if norm_path.is_empty() {
+        return replace_folder_children(conn, drive_id, None, items);
+    }
+
+    let tx = conn.transaction()?;
+    {
+        let folder_id = get_drive_item_by_path_conn(&tx, drive_id, &norm_path)?
+            .filter(|it| it.is_folder)
+            .map(|it| it.id);
+        let existing_ids: Vec<String> = if let Some(ref fid) = folder_id {
+            let mut stmt = tx.prepare_cached(
+                "SELECT id FROM drive_items
+                 WHERE drive_id = ?1
+                   AND (parent_path = ?2 COLLATE NOCASE OR parent_id = ?3)",
+            )?;
+            let mapped = stmt.query_map(params![drive_id, norm_path, fid], |r| r.get(0))?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut stmt = tx.prepare_cached(
+                "SELECT id FROM drive_items
+                 WHERE drive_id = ?1 AND parent_path = ?2 COLLATE NOCASE",
+            )?;
+            let mapped = stmt.query_map(params![drive_id, norm_path], |r| r.get(0))?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let incoming: HashSet<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        for id in existing_ids {
+            if !incoming.contains(id.as_str()) {
+                delete_item_and_descendants_tx(&tx, drive_id, &id)?;
+            }
+        }
+        upsert_drive_items_tx(&tx, items)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -375,21 +623,76 @@ pub fn list_folder_children(
         return rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into);
     }
 
-    let path = parent_path.unwrap_or("").trim().trim_end_matches('/');
-    let norm_path = if path.is_empty() || path == "/" {
-        ""
-    } else {
-        path
-    };
+    let norm_path = normalize_parent_path(parent_path.unwrap_or(""));
+    if norm_path.is_empty() {
+        let sql = format!(
+            "SELECT {DRIVE_ITEM_COLS} FROM drive_items
+             WHERE drive_id = ?1 AND (parent_path = '' OR parent_path = '/')
+             ORDER BY is_folder DESC, name COLLATE NOCASE ASC
+             LIMIT ?2"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![drive_id, lim], map_drive_item_row)?;
+        return rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into);
+    }
+
     let sql = format!(
         "SELECT {DRIVE_ITEM_COLS} FROM drive_items
-         WHERE drive_id = ?1 AND parent_path = ?2
+         WHERE drive_id = ?1 AND parent_path = ?2 COLLATE NOCASE
          ORDER BY is_folder DESC, name COLLATE NOCASE ASC
          LIMIT ?3"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params![drive_id, norm_path, lim], map_drive_item_row)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
+fn get_drive_item_by_path_conn(
+    conn: &Connection,
+    drive_id: &str,
+    path: &str,
+) -> Result<Option<DriveItem>> {
+    let trimmed = path.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let (parent_path, name) = match trimmed.rsplit_once('/') {
+        Some((parent, leaf)) => (format!("/{parent}"), leaf),
+        None => (String::new(), trimmed),
+    };
+    if parent_path.is_empty() {
+        let sql = format!(
+            "SELECT {DRIVE_ITEM_COLS} FROM drive_items
+             WHERE drive_id = ?1
+               AND (parent_path = '' OR parent_path = '/')
+               AND name = ?2 COLLATE NOCASE
+             LIMIT 1"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        stmt.query_row(params![drive_id, name], map_drive_item_row)
+            .optional()
+            .map_err(Into::into)
+    } else {
+        let sql = format!(
+            "SELECT {DRIVE_ITEM_COLS} FROM drive_items
+             WHERE drive_id = ?1
+               AND parent_path = ?2 COLLATE NOCASE
+               AND name = ?3 COLLATE NOCASE
+             LIMIT 1"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        stmt.query_row(params![drive_id, parent_path, name], map_drive_item_row)
+            .optional()
+            .map_err(Into::into)
+    }
+}
+
+pub fn get_drive_item_by_path(
+    conn: &Connection,
+    drive_id: &str,
+    path: &str,
+) -> Result<Option<DriveItem>> {
+    get_drive_item_by_path_conn(conn, drive_id, path)
 }
 
 pub fn get_drive_item(
@@ -416,26 +719,7 @@ pub fn get_drive_item_by_id_any_drive(conn: &Connection, item_id: &str) -> Resul
 
 pub fn delete_drive_item(conn: &mut Connection, drive_id: &str, item_id: &str) -> Result<()> {
     let tx = conn.transaction()?;
-    {
-        let rowid: Option<i64> = tx
-            .query_row(
-                "SELECT rowid FROM drive_items WHERE drive_id = ?1 AND id = ?2",
-                params![drive_id, item_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(rid) = rowid {
-            tx.execute("DELETE FROM drive_items_fts WHERE rowid = ?1", [rid])?;
-        }
-        tx.execute(
-            "DELETE FROM drive_items WHERE drive_id = ?1 AND id = ?2",
-            params![drive_id, item_id],
-        )?;
-        tx.execute(
-            "DELETE FROM drive_item_lists WHERE drive_id = ?1 AND item_id = ?2",
-            params![drive_id, item_id],
-        )?;
-    }
+    delete_item_and_descendants_tx(&tx, drive_id, item_id)?;
     tx.commit()?;
     Ok(())
 }
@@ -573,4 +857,89 @@ pub fn upsert_sync_cursor(conn: &Connection, cursor: &SyncCursor) -> Result<()> 
         ],
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Local Download Baselines (for conditional re-upload with If-Match)
+// ---------------------------------------------------------------------------
+
+pub fn normalize_local_baseline_path(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = resolved.to_string_lossy().to_string();
+    #[cfg(windows)]
+    {
+        let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+        stripped.replace('/', "\\").to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        s
+    }
+}
+
+pub fn upsert_download_baseline(conn: &Connection, baseline: &DownloadBaseline) -> Result<()> {
+    conn.execute(
+        "
+        INSERT INTO local_download_baselines (
+            local_path, drive_id, item_id, parent_id, parent_path, remote_name,
+            e_tag, c_tag, last_modified_at, downloaded_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(local_path) DO UPDATE SET
+            drive_id = excluded.drive_id,
+            item_id = excluded.item_id,
+            parent_id = excluded.parent_id,
+            parent_path = excluded.parent_path,
+            remote_name = excluded.remote_name,
+            e_tag = excluded.e_tag,
+            c_tag = excluded.c_tag,
+            last_modified_at = excluded.last_modified_at,
+            downloaded_at = excluded.downloaded_at
+        ",
+        params![
+            baseline.local_path,
+            baseline.drive_id,
+            baseline.item_id,
+            baseline.parent_id,
+            normalize_parent_path(&baseline.parent_path),
+            baseline.remote_name,
+            baseline.e_tag,
+            baseline.c_tag,
+            baseline.last_modified_at,
+            baseline.downloaded_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_download_baseline(
+    conn: &Connection,
+    local_path: &Path,
+) -> Result<Option<DownloadBaseline>> {
+    let key = normalize_local_baseline_path(local_path);
+    let mut stmt = conn.prepare_cached(
+        "
+        SELECT local_path, drive_id, item_id, parent_id, parent_path, remote_name,
+               e_tag, c_tag, last_modified_at, downloaded_at
+        FROM local_download_baselines
+        WHERE local_path = ?1
+        LIMIT 1
+        ",
+    )?;
+    stmt.query_row([key], |row| {
+        Ok(DownloadBaseline {
+            local_path: row.get(0)?,
+            drive_id: row.get(1)?,
+            item_id: row.get(2)?,
+            parent_id: row.get(3)?,
+            parent_path: row.get(4)?,
+            remote_name: row.get(5)?,
+            e_tag: row.get(6)?,
+            c_tag: row.get(7)?,
+            last_modified_at: row.get(8)?,
+            downloaded_at: row.get(9)?,
+        })
+    })
+    .optional()
+    .map_err(Into::into)
 }

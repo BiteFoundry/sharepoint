@@ -156,6 +156,17 @@ impl DriveItem {
             .unwrap_or(&self.id)
     }
 
+    /// Revision stamp combining remote content tags, modification timestamp, and byte size.
+    pub fn content_revision(&self) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            self.c_tag.as_deref().unwrap_or(""),
+            self.e_tag.as_deref().unwrap_or(""),
+            self.last_modified_at.as_deref().unwrap_or(""),
+            self.size
+        )
+    }
+
     pub fn extension(&self) -> Option<String> {
         if self.is_folder {
             return None;
@@ -361,6 +372,28 @@ pub struct DownloadedFile {
     pub mime_type: String,
     pub size_bytes: u64,
     pub is_image: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e_tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub c_tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadBaseline {
+    pub local_path: String,
+    pub drive_id: String,
+    pub item_id: String,
+    pub parent_id: Option<String>,
+    pub parent_path: String,
+    pub remote_name: String,
+    pub e_tag: Option<String>,
+    pub c_tag: Option<String>,
+    pub last_modified_at: Option<String>,
+    pub downloaded_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

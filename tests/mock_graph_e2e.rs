@@ -738,3 +738,660 @@ async fn e2e_http_api_and_mcp_tools_parity() {
     api_server.abort();
     graph_server.abort();
 }
+
+#[tokio::test]
+async fn e2e_sync_fixes_write_targeting_conditional_upload_partial_limit_and_offline_isolation() {
+    use sharepoint_cli::{
+        cli,
+        graph::drives::{ConflictBehavior, UploadOptions},
+        resolver,
+    };
+
+    #[derive(Clone)]
+    struct SyncMock {
+        base_url: String,
+        items: Arc<Mutex<std::collections::HashMap<(String, String), Value>>>,
+        contents: Arc<Mutex<std::collections::HashMap<(String, String), Vec<u8>>>>,
+        sessions: Arc<Mutex<std::collections::HashMap<String, (String, Option<String>, String)>>>,
+        followed_sites: Arc<Mutex<Vec<Value>>>,
+        requests: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+        /// When set, bumps `item-doc` eTag to this value right after the next GET /items/item-doc
+        /// so we can test the documented `POST .../items/{id}/createUploadSession` If-Match 412 guard.
+        mutate_doc_etag_after_next_get: Arc<Mutex<Option<String>>>,
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+
+    let mut init_items = std::collections::HashMap::new();
+    init_items.insert(
+        ("drv-me".to_string(), "fld-fin".to_string()),
+        json!({
+            "id": "fld-fin",
+            "name": "Finance",
+            "size": 0,
+            "folder": { "childCount": 1 },
+            "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+        }),
+    );
+    init_items.insert(
+        ("drv-me".to_string(), "item-secret".to_string()),
+        json!({
+            "id": "item-secret",
+            "name": "secret.md",
+            "size": 12,
+            "file": { "mimeType": "text/markdown" },
+            "parentReference": { "driveId": "drv-me", "id": "fld-fin", "path": "/drive/root:/Finance" }
+        }),
+    );
+    init_items.insert(
+        ("drv-me".to_string(), "item-doc".to_string()),
+        json!({
+            "id": "item-doc",
+            "name": "doc.md",
+            "size": 9,
+            "eTag": "\"etag-v1\"",
+            "cTag": "\"ctag-v1\"",
+            "file": { "mimeType": "text/markdown" },
+            "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+        }),
+    );
+    init_items.insert(
+        ("drv-me".to_string(), "item-root-2".to_string()),
+        json!({
+            "id": "item-root-2",
+            "name": "zeta.txt",
+            "size": 5,
+            "file": { "mimeType": "text/plain" },
+            "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+        }),
+    );
+
+    let mut init_contents = std::collections::HashMap::new();
+    init_contents.insert(
+        ("drv-me".to_string(), "item-doc".to_string()),
+        b"VERSION_1".to_vec(),
+    );
+
+    let st = SyncMock {
+        base_url: base_url.clone(),
+        items: Arc::new(Mutex::new(init_items)),
+        contents: Arc::new(Mutex::new(init_contents)),
+        sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        followed_sites: Arc::new(Mutex::new(vec![json!({
+            "id": "site-eng",
+            "name": "engineering",
+            "displayName": "Engineering Hub",
+            "webUrl": "https://synthetic.sharepoint.test/sites/engineering"
+        })])),
+        requests: Arc::new(Mutex::new(Vec::new())),
+        mutate_doc_etag_after_next_get: Arc::new(Mutex::new(None)),
+    };
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/followedSites",
+            get(|State(s): State<SyncMock>| async move {
+                s.requests
+                    .lock()
+                    .await
+                    .push(("GET".into(), "/v1.0/me/followedSites".into(), None));
+                let vals = s.followed_sites.lock().await.clone();
+                Json(json!({ "value": vals }))
+            }),
+        )
+        .route(
+            "/v1.0/sites",
+            get(|State(s): State<SyncMock>, Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                let search = q.get("search").cloned().unwrap_or_else(|| "*".into());
+                s.requests
+                    .lock()
+                    .await
+                    .push(("GET".into(), format!("/v1.0/sites?search={search}"), None));
+                let all = vec![
+                    json!({
+                        "id": "site-eng",
+                        "name": "engineering",
+                        "displayName": "Engineering Hub",
+                        "webUrl": "https://synthetic.sharepoint.test/sites/engineering"
+                    }),
+                    json!({
+                        "id": "site-mkt",
+                        "name": "marketing",
+                        "displayName": "Marketing Portal",
+                        "webUrl": "https://synthetic.sharepoint.test/sites/marketing"
+                    }),
+                ];
+                let filtered: Vec<Value> = if search == "*" {
+                    all
+                } else {
+                    let ql = search.to_lowercase();
+                    all.into_iter()
+                        .filter(|v| v["displayName"].as_str().unwrap_or("").to_lowercase().contains(&ql))
+                        .collect()
+                };
+                Json(json!({ "value": filtered }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/root/children",
+            get(|State(s): State<SyncMock>, Path(drive_id): Path<String>, Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                let top: usize = q.get("$top").and_then(|v| v.parse().ok()).unwrap_or(200);
+                s.requests.lock().await.push(("GET".into(), format!("/v1.0/drives/{drive_id}/root/children?$top={top}"), None));
+                let items = s.items.lock().await;
+                let mut out: Vec<Value> = items
+                    .iter()
+                    .filter(|((d, _), v)| {
+                        d == &drive_id
+                            && v["parentReference"]["path"]
+                                .as_str()
+                                .unwrap_or("")
+                                .ends_with("root:")
+                    })
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+                out.truncate(top);
+                Json(json!({ "value": out }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}",
+            get(|State(s): State<SyncMock>, Path((drive_id, item_id)): Path<(String, String)>| async move {
+                s.requests.lock().await.push(("GET".into(), format!("/v1.0/drives/{drive_id}/items/{item_id}"), None));
+                let found = s.items.lock().await.get(&(drive_id.clone(), item_id.clone())).cloned();
+                if item_id == "item-doc" {
+                    if let Some(next_etag) = s.mutate_doc_etag_after_next_get.lock().await.take() {
+                        if let Some(entry) = s.items.lock().await.get_mut(&(drive_id, item_id.clone())) {
+                            entry["eTag"] = json!(next_etag);
+                        }
+                        s.contents
+                            .lock()
+                            .await
+                            .insert(("drv-me".into(), item_id), b"VERSION_RACED_BEFORE_SESSION".to_vec());
+                    }
+                }
+                match found {
+                    Some(v) => (StatusCode::OK, Json(v)).into_response(),
+                    None => (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "itemNotFound" } }))).into_response(),
+                }
+            })
+            .delete(|State(s): State<SyncMock>, Path((drive_id, item_id)): Path<(String, String)>| async move {
+                s.requests.lock().await.push(("DELETE".into(), format!("/v1.0/drives/{drive_id}/items/{item_id}"), None));
+                s.items.lock().await.remove(&(drive_id, item_id));
+                StatusCode::NO_CONTENT
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}/content",
+            get(|State(s): State<SyncMock>, Path((drive_id, item_id)): Path<(String, String)>| async move {
+                match s.contents.lock().await.get(&(drive_id, item_id)).cloned() {
+                    Some(data) => ([(header::CONTENT_TYPE, "text/markdown")], data).into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                }
+            })
+            // Intentionally IGNORES If-Match/If-None-Match on PUT /content to prove client does not rely on undocumented PUT headers!
+            .put(|State(s): State<SyncMock>, Path((drive_id, item_id)): Path<(String, String)>, headers: HeaderMap, body: Bytes| async move {
+                let if_match = headers.get("if-match").and_then(|v| v.to_str().ok()).map(str::to_string);
+                let req_num = {
+                    let mut reqs = s.requests.lock().await;
+                    reqs.push(("PUT".into(), format!("/v1.0/drives/{drive_id}/items/{item_id}/content"), if_match));
+                    reqs.len()
+                };
+                let mut items = s.items.lock().await;
+                let Some(existing) = items.get(&(drive_id.clone(), item_id.clone())).cloned() else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                let mut updated = existing;
+                updated["size"] = json!(body.len());
+                updated["eTag"] = json!(format!("\"etag-put-{req_num}\""));
+                updated["cTag"] = json!(format!("\"ctag-put-{req_num}\""));
+                items.insert((drive_id.clone(), item_id.clone()), updated.clone());
+                s.contents.lock().await.insert((drive_id, item_id), body.to_vec());
+                (StatusCode::OK, Json(updated)).into_response()
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}/createUploadSession",
+            post(|State(s): State<SyncMock>, Path((drive_id, item_id)): Path<(String, String)>, headers: HeaderMap| async move {
+                let if_match = headers.get("if-match").and_then(|v| v.to_str().ok()).map(str::to_string);
+                let req_num = {
+                    let mut reqs = s.requests.lock().await;
+                    reqs.push(("POST".into(), format!("/v1.0/drives/{drive_id}/items/{item_id}/createUploadSession"), if_match.clone()));
+                    reqs.len()
+                };
+                let items = s.items.lock().await;
+                let Some(existing) = items.get(&(drive_id.clone(), item_id.clone())) else {
+                    return (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "itemNotFound" } }))).into_response();
+                };
+                if let Some(ref expected) = if_match {
+                    let current = existing["eTag"].as_str().unwrap_or("");
+                    if expected != current {
+                        return (
+                            StatusCode::PRECONDITION_FAILED,
+                            Json(json!({ "error": { "code": "resourceModified", "message": "createUploadSession If-Match mismatch" } })),
+                        )
+                            .into_response();
+                    }
+                }
+                let name = existing["name"].as_str().unwrap_or("file.bin").to_string();
+                let sid = format!("sess-{req_num}");
+                s.sessions.lock().await.insert(sid.clone(), (drive_id, Some(item_id), name));
+                let upload_url = format!("{}/upload-session/{sid}", s.base_url.trim_end_matches("/v1.0"));
+                (StatusCode::OK, Json(json!({ "uploadUrl": upload_url, "expirationDateTime": "2026-11-20T09:00:00Z" }))).into_response()
+            }),
+        )
+        .route(
+            "/upload-session/{sid}",
+            put(|State(s): State<SyncMock>, Path(sid): Path<String>, body: Bytes| async move {
+                let req_num = {
+                    let mut reqs = s.requests.lock().await;
+                    reqs.push(("PUT".into(), format!("/upload-session/{sid}"), None));
+                    reqs.len()
+                };
+                let Some((drive_id, existing_id, name)) = s.sessions.lock().await.get(&sid).cloned() else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                let mut items = s.items.lock().await;
+                let id = existing_id.unwrap_or_else(|| format!("item-sess-{req_num}"));
+                let updated = json!({
+                    "id": id,
+                    "name": name,
+                    "size": body.len(),
+                    "eTag": format!("\"etag-sess-{req_num}\""),
+                    "cTag": format!("\"ctag-sess-{req_num}\""),
+                    "file": { "mimeType": "text/markdown" },
+                    "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                });
+                items.insert((drive_id.clone(), id.clone()), updated.clone());
+                s.contents.lock().await.insert((drive_id, id), body.to_vec());
+                (StatusCode::OK, Json(updated)).into_response()
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/{*tail}",
+            get(|State(s): State<SyncMock>, Path((drive_id, tail)): Path<(String, String)>| async move {
+                s.requests.lock().await.push(("GET".into(), format!("/v1.0/drives/{drive_id}/{tail}"), None));
+                if tail.starts_with("root:/") && tail.ends_with(":/children") {
+                    let rel = tail.trim_start_matches("root:/").trim_end_matches(":/children");
+                    let want = format!("/drive/root:/{}", rel.trim_matches('/'));
+                    let items = s.items.lock().await;
+                    let out: Vec<Value> = items
+                        .iter()
+                        .filter(|((d, _), v)| {
+                            d == &drive_id
+                                && v["parentReference"]["path"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .eq_ignore_ascii_case(&want)
+                        })
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    return (StatusCode::OK, Json(json!({ "value": out }))).into_response();
+                }
+                if tail.starts_with("root:/") && tail.ends_with(':') {
+                    let rel = tail.trim_start_matches("root:/").trim_end_matches(':');
+                    let norm = format!("/{}", rel.trim_matches('/'));
+                    let items = s.items.lock().await;
+                    for ((d, _), v) in items.iter() {
+                        if d != &drive_id {
+                            continue;
+                        }
+                        let pp = v["parentReference"]["path"].as_str().unwrap_or("");
+                        let ptail = pp.split("root:").nth(1).unwrap_or("").trim_end_matches('/');
+                        let name = v["name"].as_str().unwrap_or("");
+                        let full = if ptail.is_empty() {
+                            format!("/{name}")
+                        } else {
+                            format!("{ptail}/{name}")
+                        };
+                        if full.eq_ignore_ascii_case(&norm) {
+                            return (StatusCode::OK, Json(v.clone())).into_response();
+                        }
+                    }
+                }
+                (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "itemNotFound" } }))).into_response()
+            })
+            // Intentionally IGNORES If-Match/If-None-Match on PUT /root:/...:/content to mirror Graph's undocumented PUT behavior!
+            .put(|State(s): State<SyncMock>, Path((drive_id, tail)): Path<(String, String)>, headers: HeaderMap, body: Bytes| async move {
+                let if_match = headers
+                    .get("if-match")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let req_num = {
+                    let mut reqs = s.requests.lock().await;
+                    reqs.push(("PUT".into(), format!("/v1.0/drives/{drive_id}/{tail}"), if_match));
+                    reqs.len()
+                };
+                if tail.starts_with("root:/") && tail.ends_with(":/content") {
+                    let name = tail.trim_start_matches("root:/").trim_end_matches(":/content");
+                    let mut items = s.items.lock().await;
+                    let existing_key = items
+                        .iter()
+                        .find(|((d, _), v)| {
+                            d == &drive_id
+                                && v["name"].as_str().unwrap_or("").eq_ignore_ascii_case(name)
+                                && v["parentReference"]["path"].as_str().unwrap_or("").ends_with("root:")
+                        })
+                        .map(|(k, _)| k.clone());
+                    let id = existing_key
+                        .as_ref()
+                        .map(|(_, id)| id.clone())
+                        .unwrap_or_else(|| format!("item-new-{}", items.len()));
+                    let new_etag = format!("\"etag-up-{req_num}\"");
+                    let updated = json!({
+                        "id": id,
+                        "name": name,
+                        "size": body.len(),
+                        "eTag": new_etag,
+                        "cTag": format!("\"ctag-up-{req_num}\""),
+                        "file": { "mimeType": "text/markdown" },
+                        "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                    });
+                    items.insert((drive_id.clone(), id.clone()), updated.clone());
+                    s.contents.lock().await.insert((drive_id, id), body.to_vec());
+                    return (StatusCode::OK, Json(updated)).into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            })
+            .post(|State(s): State<SyncMock>, Path((drive_id, tail)): Path<(String, String)>, Json(body): Json<Value>| async move {
+                let req_num = {
+                    let mut reqs = s.requests.lock().await;
+                    reqs.push(("POST".into(), format!("/v1.0/drives/{drive_id}/{tail}"), None));
+                    reqs.len()
+                };
+                if tail.starts_with("root:/") && tail.ends_with(":/createUploadSession") {
+                    let name = tail
+                        .trim_start_matches("root:/")
+                        .trim_end_matches(":/createUploadSession")
+                        .to_string();
+                    let behavior = body["item"]["@microsoft.graph.conflictBehavior"]
+                        .as_str()
+                        .unwrap_or("replace");
+                    let items = s.items.lock().await;
+                    let existing = items
+                        .iter()
+                        .find(|((d, _), v)| {
+                            d == &drive_id
+                                && v["name"].as_str().unwrap_or("").eq_ignore_ascii_case(&name)
+                                && v["parentReference"]["path"].as_str().unwrap_or("").ends_with("root:")
+                        })
+                        .map(|((_, id), _)| id.clone());
+                    if existing.is_some() && behavior == "fail" {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(json!({ "error": { "code": "nameAlreadyExists", "message": "exists" } })),
+                        )
+                            .into_response();
+                    }
+                    let sid = format!("sess-{req_num}");
+                    s.sessions.lock().await.insert(sid.clone(), (drive_id, existing, name));
+                    let upload_url = format!("{}/upload-session/{sid}", s.base_url.trim_end_matches("/v1.0"));
+                    return (StatusCode::OK, Json(json!({ "uploadUrl": upload_url, "expirationDateTime": "2026-11-20T09:00:00Z" }))).into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            }),
+        )
+        .with_state(st.clone());
+
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let (_cfg, graph, storage) = make_graph_and_storage(&base_url);
+
+    // S5: Cache /Finance/secret.md, then online resolve_item_for_write("secret.md") MUST fail with 0 deletes!
+    let fin_items = cli::fetch_folder_items(&graph, &storage, "drv-me", Some("/Finance"), 100, false, false, false)
+        .await
+        .unwrap();
+    assert_eq!(fin_items.len(), 1);
+    assert!(resolver::resolve_item_for_write(&graph, &storage, "drv-me", "secret.md").await.is_err());
+    assert!(
+        st.items.lock().await.contains_key(&("drv-me".into(), "item-secret".into())),
+        "unrelated /Finance/secret.md must remain untouched"
+    );
+    // Exact path and exact ID succeed
+    assert_eq!(
+        resolver::resolve_item_for_write(&graph, &storage, "drv-me", "/Finance/secret.md")
+            .await
+            .unwrap()
+            .id,
+        "item-secret"
+    );
+    assert_eq!(
+        resolver::resolve_item_for_write(&graph, &storage, "drv-me", "item-secret")
+            .await
+            .unwrap()
+            .id,
+        "item-secret"
+    );
+
+    // S3: Full root listing caches 3 items; limit=1 listing MUST preserve all 3 cached items
+    let all_root = cli::fetch_folder_items(&graph, &storage, "drv-me", None, 100, false, false, false)
+        .await
+        .unwrap();
+    assert_eq!(all_root.len(), 3);
+    let partial_root = cli::fetch_folder_items(&graph, &storage, "drv-me", None, 1, false, false, false)
+        .await
+        .unwrap();
+    assert_eq!(partial_root.len(), 1);
+    let offline_root = cli::fetch_folder_items(&graph, &storage, "drv-me", None, 100, false, true, false)
+        .await
+        .unwrap();
+    assert_eq!(offline_root.len(), 3, "partial limit=1 fetch must not wipe cached siblings");
+
+    // S6: Download doc.md (etag-v1), server edits to VERSION_2_EXTERNAL (etag-v2),
+    // re-uploading edited downloaded file sends If-Match: "etag-v1" -> 412 conflict, preserves both remote and local!
+    let tmp = tempdir().unwrap();
+    let doc_item = resolver::resolve_item(&graph, &storage, "drv-me", "item-doc", false)
+        .await
+        .unwrap();
+    let mut dl = graph
+        .download_item_to_file("drv-me", "item-doc", Some("doc.md"), Some("text/markdown"), None, tmp.path())
+        .await
+        .unwrap();
+    cli::record_download_baseline(&storage, &doc_item, &mut dl);
+    assert_eq!(dl.e_tag.as_deref(), Some("\"etag-v1\""));
+
+    // External server edit -> v2
+    {
+        let mut items = st.items.lock().await;
+        let entry = items.get_mut(&("drv-me".into(), "item-doc".into())).unwrap();
+        entry["eTag"] = json!("\"etag-v2\"");
+        entry["size"] = json!(18);
+        st.contents
+            .lock()
+            .await
+            .insert(("drv-me".into(), "item-doc".into()), b"VERSION_2_EXTERNAL".to_vec());
+    }
+
+    // Edit downloaded file locally and attempt default re-upload (no --conflict replace)
+    // Note: this mock IGNORES If-Match on PUT /content; client must block via up-front baseline comparison!
+    std::fs::write(&dl.path, b"STALE_LOCAL_EDIT").unwrap();
+    let auto_opts = cli::resolve_upload_options_for_local_file(
+        &storage,
+        "drv-me",
+        None,
+        Some(""),
+        None,
+        &dl.path,
+        None,
+        None,
+    );
+    assert_eq!(auto_opts.if_match.as_deref(), Some("\"etag-v1\""));
+    assert_eq!(auto_opts.target_item_id.as_deref(), Some("item-doc"));
+    let reqs_before_stale = st.requests.lock().await.len();
+    let conflict_err = graph
+        .upload_local_file_with_options("drv-me", None, None, &dl.path, &auto_opts)
+        .await
+        .expect_err("conditional upload with stale ETag must fail with 412 even when PUT ignores If-Match");
+    assert!(
+        format!("{conflict_err:#}").contains("412"),
+        "expected 412 conflict error, got: {conflict_err:#}"
+    );
+    assert!(
+        !st.requests.lock().await[reqs_before_stale..]
+            .iter()
+            .any(|(m, _, _)| m == "PUT" || m == "POST"),
+        "stale baseline must abort before sending any PUT/POST write"
+    );
+    assert_eq!(
+        st.contents.lock().await.get(&("drv-me".into(), "item-doc".into())).unwrap().as_slice(),
+        b"VERSION_2_EXTERNAL",
+        "latest remote content must be preserved on conflict"
+    );
+    assert_eq!(
+        std::fs::read(&dl.path).unwrap().as_slice(),
+        b"STALE_LOCAL_EDIT",
+        "local file must be preserved on conflict"
+    );
+
+    // Zero-length conditional upload against already-changed server MUST ALSO fail up front (0 PUTs)
+    std::fs::write(&dl.path, b"").unwrap();
+    let reqs_before_zero_stale = st.requests.lock().await.len();
+    let zero_conflict = graph
+        .upload_local_file_with_options("drv-me", None, None, &dl.path, &auto_opts)
+        .await
+        .expect_err("zero-length conditional upload with stale ETag must fail with 412");
+    assert!(format!("{zero_conflict:#}").contains("412"));
+    assert!(
+        !st.requests.lock().await[reqs_before_zero_stale..]
+            .iter()
+            .any(|(m, _, _)| m == "PUT" || m == "POST")
+    );
+    assert_eq!(
+        st.contents.lock().await.get(&("drv-me".into(), "item-doc".into())).unwrap().as_slice(),
+        b"VERSION_2_EXTERNAL"
+    );
+
+    // Race between preflight GET and POST /items/{id}/createUploadSession:
+    // documented createUploadSession If-Match check rejects with 412 and uploads 0 chunks!
+    std::fs::write(&dl.path, b"LOCAL_EDIT_V2").unwrap();
+    *st.mutate_doc_etag_after_next_get.lock().await = Some("\"etag-v3-raced\"".into());
+    let v2_opts = UploadOptions {
+        conflict_behavior: None,
+        if_match: Some("\"etag-v2\"".into()),
+        expected_c_tag: None,
+        target_item_id: Some("item-doc".into()),
+    };
+    let reqs_before_race = st.requests.lock().await.len();
+    let race_err = graph
+        .upload_local_file_with_options("drv-me", None, None, &dl.path, &v2_opts)
+        .await
+        .expect_err("createUploadSession must reject raced ETag with 412");
+    assert!(format!("{race_err:#}").contains("412"));
+    let race_reqs = st.requests.lock().await[reqs_before_race..].to_vec();
+    assert!(
+        race_reqs.iter().any(|(m, p, im)| m == "POST"
+            && p == "/v1.0/drives/drv-me/items/item-doc/createUploadSession"
+            && im.as_deref() == Some("\"etag-v2\"")),
+        "expected documented POST /items/item-doc/createUploadSession with If-Match, got: {race_reqs:?}"
+    );
+    assert!(
+        !race_reqs.iter().any(|(m, _, _)| m == "PUT"),
+        "failed session creation must not upload any chunks"
+    );
+    assert_eq!(
+        st.contents.lock().await.get(&("drv-me".into(), "item-doc".into())).unwrap().as_slice(),
+        b"VERSION_RACED_BEFORE_SESSION"
+    );
+
+    // Clean non-empty conditional upload uses documented POST /items/{id}/createUploadSession with If-Match
+    let v3_opts = UploadOptions {
+        conflict_behavior: None,
+        if_match: Some("\"etag-v3-raced\"".into()),
+        expected_c_tag: None,
+        target_item_id: Some("item-doc".into()),
+    };
+    let reqs_before_clean = st.requests.lock().await.len();
+    let clean_up = graph
+        .upload_local_file_with_options("drv-me", None, None, &dl.path, &v3_opts)
+        .await
+        .unwrap();
+    let clean_reqs = st.requests.lock().await[reqs_before_clean..].to_vec();
+    assert!(
+        clean_reqs.iter().any(|(m, p, im)| m == "POST"
+            && p == "/v1.0/drives/drv-me/items/item-doc/createUploadSession"
+            && im.as_deref() == Some("\"etag-v3-raced\"")),
+        "clean conditional upload must use createUploadSession with If-Match: {clean_reqs:?}"
+    );
+    assert_eq!(
+        st.contents.lock().await.get(&("drv-me".into(), "item-doc".into())).unwrap().as_slice(),
+        b"LOCAL_EDIT_V2"
+    );
+
+    // Clean zero-length conditional upload uses exact item-ID PUT /items/{id}/content (valid for 0-byte files)
+    std::fs::write(&dl.path, b"").unwrap();
+    let zero_ok_opts = UploadOptions {
+        conflict_behavior: None,
+        if_match: clean_up.e_tag.clone(),
+        expected_c_tag: None,
+        target_item_id: Some("item-doc".into()),
+    };
+    let reqs_before_zero_ok = st.requests.lock().await.len();
+    let zero_up = graph
+        .upload_local_file_with_options("drv-me", None, None, &dl.path, &zero_ok_opts)
+        .await
+        .unwrap();
+    let zero_ok_reqs = st.requests.lock().await[reqs_before_zero_ok..].to_vec();
+    assert!(
+        zero_ok_reqs
+            .iter()
+            .any(|(m, p, _)| m == "PUT" && p == "/v1.0/drives/drv-me/items/item-doc/content"),
+        "zero-length conditional upload must use exact item-ID PUT /content: {zero_ok_reqs:?}"
+    );
+    assert_eq!(zero_up.size, 0);
+    assert_eq!(
+        st.contents.lock().await.get(&("drv-me".into(), "item-doc".into())).unwrap().as_slice(),
+        b""
+    );
+
+    // Explicit replace workflow MUST still work!
+    std::fs::write(&dl.path, b"EXPLICIT_REPLACE_DATA").unwrap();
+    let replace_opts = cli::resolve_upload_options_for_local_file(
+        &storage,
+        "drv-me",
+        None,
+        Some(""),
+        None,
+        &dl.path,
+        None,
+        Some(ConflictBehavior::Replace),
+    );
+    assert_eq!(
+        replace_opts,
+        UploadOptions {
+            conflict_behavior: Some(ConflictBehavior::Replace),
+            if_match: None,
+            expected_c_tag: None,
+            target_item_id: None,
+        }
+    );
+    let replaced = graph
+        .upload_local_file_with_options("drv-me", None, None, &dl.path, &replace_opts)
+        .await
+        .unwrap();
+    assert_eq!(replaced.id, "item-doc");
+    assert_eq!(
+        st.contents.lock().await.get(&("drv-me".into(), "item-doc".into())).unwrap().as_slice(),
+        b"EXPLICIT_REPLACE_DATA"
+    );
+
+    // S4: Offline sites search sends 0 network requests + unfollow persists false
+    let sites1 = cli::fetch_sites(&graph, &storage, None, 50, false, false, false).await.unwrap();
+    assert_eq!(sites1.len(), 2);
+    st.followed_sites.lock().await.clear();
+    let sites2 = cli::fetch_sites(&graph, &storage, None, 50, true, false, false).await.unwrap();
+    assert!(sites2.iter().all(|s| !s.is_followed));
+
+    let reqs_before = st.requests.lock().await.len();
+    let offline_eng = cli::fetch_sites(&graph, &storage, Some("eng"), 50, false, true, false)
+        .await
+        .unwrap();
+    assert_eq!(st.requests.lock().await.len(), reqs_before, "offline sites search must make 0 network requests");
+    assert_eq!(offline_eng.len(), 1);
+    assert_eq!(offline_eng[0].id, "site-eng");
+    assert!(!offline_eng[0].is_followed);
+
+    server.abort();
+}

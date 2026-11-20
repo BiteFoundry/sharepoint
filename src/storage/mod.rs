@@ -12,7 +12,8 @@ use std::{
 use anyhow::Result;
 
 use crate::models::{
-    DriveInfo, DriveItem, DriveSearchHit, PinnedTarget, SharePointSite, SyncCursor,
+    DownloadBaseline, DriveInfo, DriveItem, DriveSearchHit, PinnedTarget, SharePointSite,
+    SyncCursor,
 };
 
 const MAX_READER_POOL_SIZE: usize = 4;
@@ -175,6 +176,11 @@ impl Storage {
         drives::upsert_sites(&mut conn, sites)
     }
 
+    pub fn upsert_sites_with_follow_state(&self, sites: &[SharePointSite]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        drives::upsert_sites_with_follow_state(&mut conn, sites)
+    }
+
     pub fn list_sites(&self) -> Result<Vec<SharePointSite>> {
         let conn = self.read_conn()?;
         drives::list_sites(&conn)
@@ -207,6 +213,25 @@ impl Storage {
     ) -> Result<()> {
         let mut conn = self.lock_conn()?;
         drives::replace_folder_children(&mut conn, drive_id, parent_id, items)
+    }
+
+    pub fn replace_folder_children_by_path(
+        &self,
+        drive_id: &str,
+        folder_path: &str,
+        items: &[DriveItem],
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        drives::replace_folder_children_by_path(&mut conn, drive_id, folder_path, items)
+    }
+
+    pub fn get_drive_item_by_path(
+        &self,
+        drive_id: &str,
+        path: &str,
+    ) -> Result<Option<DriveItem>> {
+        let conn = self.read_conn()?;
+        drives::get_drive_item_by_path(&conn, drive_id, path)
     }
 
     pub fn list_folder_children(
@@ -294,6 +319,18 @@ impl Storage {
     pub fn upsert_sync_cursor(&self, cursor: &SyncCursor) -> Result<()> {
         let conn = self.lock_conn()?;
         drives::upsert_sync_cursor(&conn, cursor)
+    }
+
+    // --- Download Baselines ---
+
+    pub fn upsert_download_baseline(&self, baseline: &DownloadBaseline) -> Result<()> {
+        let conn = self.lock_conn()?;
+        drives::upsert_download_baseline(&conn, baseline)
+    }
+
+    pub fn get_download_baseline(&self, local_path: &Path) -> Result<Option<DownloadBaseline>> {
+        let conn = self.read_conn()?;
+        drives::get_download_baseline(&conn, local_path)
     }
 }
 
@@ -390,5 +427,152 @@ mod tests {
         storage.delete_drive_item("drv-1", "item-1").unwrap();
         assert!(storage.get_drive_item("drv-1", "item-1").unwrap().is_none());
         assert!(storage.search_items("kubernetes", None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn move_to_root_path_prune_recursive_folder_delete_and_site_unfollow() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        // S1: Move from /Projects to root ("") updates drive_items + FTS5 + offline listing + root prune
+        let folder = DriveItem {
+            id: "fld-proj".into(),
+            drive_id: "drv-me".into(),
+            parent_id: Some("root".into()),
+            parent_path: "".into(),
+            name: "Projects".into(),
+            is_folder: true,
+            ..Default::default()
+        };
+        let spec_proj = DriveItem {
+            id: "item-spec".into(),
+            drive_id: "drv-me".into(),
+            parent_id: Some("fld-proj".into()),
+            parent_path: "/Projects".into(),
+            name: "spec.md".into(),
+            size: 12,
+            ..Default::default()
+        };
+        let keep_proj = DriveItem {
+            id: "item-keep".into(),
+            drive_id: "drv-me".into(),
+            parent_id: Some("fld-proj".into()),
+            parent_path: "/Projects".into(),
+            name: "keep.md".into(),
+            size: 8,
+            ..Default::default()
+        };
+        let gone_proj = DriveItem {
+            id: "item-gone".into(),
+            drive_id: "drv-me".into(),
+            parent_id: Some("fld-proj".into()),
+            parent_path: "/Projects".into(),
+            name: "gone.md".into(),
+            size: 8,
+            ..Default::default()
+        };
+        storage
+            .upsert_drive_items(&[
+                folder.clone(),
+                spec_proj.clone(),
+                keep_proj.clone(),
+                gone_proj.clone(),
+            ])
+            .unwrap();
+
+        let spec_root = DriveItem {
+            parent_id: Some("root".into()),
+            parent_path: "".into(),
+            ..spec_proj
+        };
+        storage.upsert_drive_items(&[spec_root]).unwrap();
+
+        let stored_spec = storage.get_drive_item("drv-me", "item-spec").unwrap().unwrap();
+        assert_eq!(stored_spec.parent_path, "");
+        assert_eq!(stored_spec.display_path(), "/spec.md");
+
+        let root_children: Vec<String> = storage
+            .list_folder_children("drv-me", None, Some(""), 50)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert!(root_children.contains(&"item-spec".to_string()));
+        let proj_children: Vec<String> = storage
+            .list_folder_children("drv-me", None, Some("/Projects"), 50)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        assert!(!proj_children.contains(&"item-spec".to_string()));
+
+        // Remote delete of root spec.md pruned cleanly by authoritative root replace
+        storage
+            .replace_folder_children("drv-me", None, &[folder.clone()])
+            .unwrap();
+        assert!(storage.get_drive_item("drv-me", "item-spec").unwrap().is_none());
+        assert!(storage
+            .search_items("spec.md", Some("drv-me"), 10)
+            .unwrap()
+            .is_empty());
+
+        // S2: Path-based folder replace prunes gone.md, then deleting fld-proj removes keep.md descendant
+        storage
+            .replace_folder_children_by_path("drv-me", "/Projects", &[keep_proj.clone()])
+            .unwrap();
+        assert!(storage.get_drive_item("drv-me", "item-gone").unwrap().is_none());
+        assert!(storage
+            .search_items("gone.md", Some("drv-me"), 10)
+            .unwrap()
+            .is_empty());
+        assert!(storage.get_drive_item("drv-me", "item-keep").unwrap().is_some());
+
+        storage.delete_drive_item("drv-me", "fld-proj").unwrap();
+        assert!(storage.get_drive_item("drv-me", "fld-proj").unwrap().is_none());
+        assert!(storage.get_drive_item("drv-me", "item-keep").unwrap().is_none());
+        assert!(storage
+            .search_items("keep.md", Some("drv-me"), 10)
+            .unwrap()
+            .is_empty());
+
+        // S4: Authoritative follow-state update clears unfollowed site flag
+        let site_eng_followed = SharePointSite {
+            id: "site-eng".into(),
+            name: "engineering".into(),
+            display_name: "Engineering Hub".into(),
+            is_followed: true,
+            ..Default::default()
+        };
+        let site_mkt = SharePointSite {
+            id: "site-mkt".into(),
+            name: "marketing".into(),
+            display_name: "Marketing Portal".into(),
+            is_followed: false,
+            ..Default::default()
+        };
+        storage
+            .upsert_sites_with_follow_state(&[site_eng_followed.clone(), site_mkt.clone()])
+            .unwrap();
+        assert!(storage
+            .list_sites()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "site-eng")
+            .unwrap()
+            .is_followed);
+
+        let site_eng_unfollowed = SharePointSite {
+            is_followed: false,
+            ..site_eng_followed
+        };
+        storage
+            .upsert_sites_with_follow_state(&[site_eng_unfollowed, site_mkt])
+            .unwrap();
+        assert!(!storage
+            .list_sites()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "site-eng")
+            .unwrap()
+            .is_followed);
     }
 }

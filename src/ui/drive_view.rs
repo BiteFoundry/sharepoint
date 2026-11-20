@@ -483,7 +483,7 @@ pub fn draw_inspector(
     }
 
     // Version history summary if loaded
-    if let Some(versions) = app.item_versions.get(&item.id) {
+    if let Some(versions) = app.versions_for(&item) {
         if !versions.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!(" Versions ({}):", versions.len()),
@@ -563,7 +563,7 @@ pub fn draw_inspector(
                     lines.push(img_line.clone());
                 }
             }
-        } else if let Some(err) = app.preview_errors.get(&item.id) {
+        } else if let Some(err) = app.image_preview_error_for(&item) {
             lines.push(Line::from(Span::styled(
                 format!(" Image preview unavailable: {err}"),
                 Style::default().fg(theme.warning),
@@ -1009,7 +1009,7 @@ mod tests {
         app.current_items = vec![fake_png.clone()];
         app.active_selected_id = Some(fake_png.id.clone());
         app.raw_image_bytes.insert(
-            fake_png.id.clone(),
+            AppState::item_revision_key(&fake_png),
             std::sync::Arc::from(b"<!DOCTYPE html><html><body><h1>Sign In</h1></body></html>".as_slice()),
         );
         let key = app.modal_image_cache_key(&fake_png, 40, 20, crate::img_preview::TerminalImageProtocol::Halfblock);
@@ -1036,7 +1036,7 @@ mod tests {
             ..Default::default()
         };
         app.raw_image_bytes.insert(
-            fake_svg.id.clone(),
+            AppState::item_revision_key(&fake_svg),
             std::sync::Arc::from(b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>".as_slice()),
         );
         let svg_key = app.modal_image_cache_key(&fake_svg, 40, 20, crate::img_preview::TerminalImageProtocol::Halfblock);
@@ -1048,8 +1048,7 @@ mod tests {
             .expect("channel open");
         app.apply_ui_msg(svg_msg, &mut ui);
         let err = app
-            .preview_errors
-            .get(&fake_svg.id)
+            .image_preview_error_for(&fake_svg)
             .expect("expected SVG preview error");
         assert!(err.contains("SVG"), "unexpected error: {err}");
     }

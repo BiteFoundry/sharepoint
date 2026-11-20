@@ -279,12 +279,18 @@ impl SyncController {
 pub async fn bootstrap_sharepoint(graph: &GraphClient, storage: &Storage) -> Result<()> {
     if let Ok(drive) = graph.get_my_drive().await {
         let _ = storage.upsert_drives(std::slice::from_ref(&drive));
-        if let Ok(children) = graph.list_children(&drive.id, None, Some(200)).await {
-            let _ = storage.replace_folder_children(&drive.id, None, &children);
+        if let Ok(page) = graph.list_children_detailed(&drive.id, None, Some(200)).await {
+            if page.complete {
+                let _ = storage.replace_folder_children(&drive.id, None, &page.items);
+            } else {
+                let _ = storage.upsert_drive_items(&page.items);
+            }
         }
     }
 
-    let mut sites = graph.list_followed_sites().await.unwrap_or_default();
+    let followed_res = graph.list_followed_sites().await;
+    let authoritative_follow = followed_res.is_ok();
+    let mut sites = followed_res.unwrap_or_default();
     if let Ok(discovered) = graph.list_sites(Some("*"), 50).await {
         for s in discovered {
             if !sites.iter().any(|existing| existing.id == s.id) {
@@ -292,8 +298,12 @@ pub async fn bootstrap_sharepoint(graph: &GraphClient, storage: &Storage) -> Res
             }
         }
     }
-    if !sites.is_empty() {
+    if authoritative_follow {
+        let _ = storage.upsert_sites_with_follow_state(&sites);
+    } else if !sites.is_empty() {
         let _ = storage.upsert_sites(&sites);
+    }
+    if !sites.is_empty() {
         for site in sites.iter().take(6) {
             if let Ok(drives) = graph
                 .list_site_drives(&site.id, Some(site.effective_name()))
@@ -415,13 +425,17 @@ pub fn spawn_sync_engine(
                         }
                         let focus = focus_rx.borrow().clone();
                         if let Some(did) = focus.active_drive_id {
-                            match graph.list_children(&did, focus.active_parent_id.as_deref(), Some(200)).await {
-                                Ok(items) => {
-                                    let _ = storage.replace_folder_children(&did, focus.active_parent_id.as_deref(), &items);
+                            match graph.list_children_detailed(&did, focus.active_parent_id.as_deref(), Some(200)).await {
+                                Ok(page) => {
+                                    if page.complete {
+                                        let _ = storage.replace_folder_children(&did, focus.active_parent_id.as_deref(), &page.items);
+                                    } else {
+                                        let _ = storage.upsert_drive_items(&page.items);
+                                    }
                                     let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
                                         drive_id: did,
                                         parent_id: focus.active_parent_id,
-                                        items,
+                                        items: page.items,
                                     });
                                     shared.clear_auth_pause();
                                     if backoff.record_success() {
@@ -517,7 +531,9 @@ async fn sync_sites_once(
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
 ) {
-    let mut combined: Vec<SharePointSite> = graph.list_followed_sites().await.unwrap_or_default();
+    let followed_res = graph.list_followed_sites().await;
+    let authoritative_follow = followed_res.is_ok();
+    let mut combined: Vec<SharePointSite> = followed_res.unwrap_or_default();
     if let Ok(discovered) = graph.list_sites(Some("*"), 50).await {
         for site in discovered {
             if !combined.iter().any(|existing| existing.id == site.id) {
@@ -525,8 +541,12 @@ async fn sync_sites_once(
             }
         }
     }
-    if !combined.is_empty() {
+    if authoritative_follow {
+        let _ = storage.upsert_sites_with_follow_state(&combined);
+    } else if !combined.is_empty() {
         let _ = storage.upsert_sites(&combined);
+    }
+    if !combined.is_empty() || authoritative_follow {
         let _ = event_tx.send(CoreEvent::SitesUpdated(combined.clone()));
         for site in combined.iter().take(6) {
             if let Ok(drives) = graph
@@ -550,12 +570,16 @@ async fn sync_folder_once(
     drive_id: &str,
     parent_id: Option<&str>,
 ) {
-    if let Ok(items) = graph.list_children(drive_id, parent_id, Some(200)).await {
-        let _ = storage.replace_folder_children(drive_id, parent_id, &items);
+    if let Ok(page) = graph.list_children_detailed(drive_id, parent_id, Some(200)).await {
+        if page.complete {
+            let _ = storage.replace_folder_children(drive_id, parent_id, &page.items);
+        } else {
+            let _ = storage.upsert_drive_items(&page.items);
+        }
         let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
             drive_id: drive_id.to_string(),
             parent_id: parent_id.map(str::to_string),
-            items,
+            items: page.items,
         });
     }
 }

@@ -12,7 +12,10 @@ use crate::{
     auth::diagnose_access_token_scopes,
     cli,
     config::{AppConfig, Persona},
-    graph::GraphClient,
+    graph::{
+        drives::{ConflictBehavior, UploadOptions},
+        GraphClient,
+    },
     resolver,
     storage::Storage,
 };
@@ -355,6 +358,8 @@ async fn call_tool(
                 "drive_id": item.drive_id,
                 "name": item.name,
                 "mime_type": item.mime_type,
+                "e_tag": item.e_tag,
+                "c_tag": item.c_tag,
                 "size_bytes": bytes.len(),
                 "content": String::from_utf8_lossy(&bytes),
             }))
@@ -385,7 +390,7 @@ async fn call_tool(
             )
             .await?;
             let dest_dir = cli::normalize_download_dir(config, dir.as_deref());
-            let downloaded = map_graph_err(
+            let mut downloaded = map_graph_err(
                 graph,
                 graph
                     .download_item_to_file(
@@ -399,6 +404,7 @@ async fn call_tool(
                     .await,
             )
             .await?;
+            cli::record_download_baseline(storage, &item, &mut downloaded);
             serde_json::to_value(downloaded).map_err(|e| e.to_string())
         }
         "upload_file" => {
@@ -406,6 +412,12 @@ async fn call_tool(
             let site_q = str_arg("site");
             let parent_id = str_arg("parent_id");
             let file_name = str_arg("file_name");
+            let target_item_id = str_arg("item_id");
+            let if_match = str_arg("if_match");
+            let explicit_conflict = match str_arg("conflict_behavior").or_else(|| str_arg("conflict")) {
+                Some(raw) => Some(ConflictBehavior::parse_str(&raw).map_err(|e| e.to_string())?),
+                None => None,
+            };
             let drive = map_graph_err(
                 graph,
                 resolver::resolve_target_drive(
@@ -419,43 +431,96 @@ async fn call_tool(
                 .await,
             )
             .await?;
+            let (resolved_parent_id, resolved_parent_path) = match parent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "/" && *s != "root")
+            {
+                Some(p) if p.starts_with('/') || p.contains('/') => {
+                    let folder = map_graph_err(
+                        graph,
+                        resolver::resolve_item_for_write(graph, storage, &drive.id, p).await,
+                    )
+                    .await?;
+                    (Some(folder.id.clone()), Some(folder.display_path()))
+                }
+                Some(pid) => (Some(pid.to_string()), None),
+                None => (None, Some(String::new())),
+            };
 
             let uploaded = if let Some(lp) = str_arg("local_path") {
-                map_graph_err(
+                let path = PathBuf::from(lp);
+                let mut opts = cli::resolve_upload_options_for_local_file(
+                    storage,
+                    &drive.id,
+                    resolved_parent_id.as_deref(),
+                    resolved_parent_path.as_deref(),
+                    file_name.as_deref(),
+                    &path,
+                    if_match.as_deref(),
+                    explicit_conflict,
+                );
+                if target_item_id.is_some() {
+                    opts.target_item_id = target_item_id.clone();
+                }
+                let item = map_graph_err(
                     graph,
                     graph
-                        .upload_local_file(
+                        .upload_local_file_with_options(
                             &drive.id,
-                            parent_id.as_deref(),
+                            resolved_parent_id.as_deref(),
                             file_name.as_deref(),
-                            &PathBuf::from(lp),
+                            &path,
+                            &opts,
                         )
                         .await,
                 )
-                .await?
+                .await?;
+                cli::refresh_download_baseline_after_upload(storage, &path, &item, &opts);
+                item
             } else if let Some(b64) = str_arg("content_base64") {
                 let name = file_name.ok_or_else(|| "file_name is required with content_base64".to_string())?;
                 let bytes = B64_STANDARD
                     .decode(b64.trim())
                     .map_err(|e| format!("Invalid base64: {e}"))?;
+                let opts = UploadOptions {
+                    conflict_behavior: explicit_conflict,
+                    if_match,
+                    expected_c_tag: None,
+                    target_item_id,
+                };
                 map_graph_err(
                     graph,
                     graph
-                        .upload_bytes(&drive.id, parent_id.as_deref(), &name, bytes, None)
+                        .upload_bytes_with_options(
+                            &drive.id,
+                            resolved_parent_id.as_deref(),
+                            &name,
+                            bytes,
+                            None,
+                            &opts,
+                        )
                         .await,
                 )
                 .await?
             } else if let Some(text) = args.get("content_text").and_then(Value::as_str) {
                 let name = file_name.ok_or_else(|| "file_name is required with content_text".to_string())?;
+                let opts = UploadOptions {
+                    conflict_behavior: explicit_conflict,
+                    if_match,
+                    expected_c_tag: None,
+                    target_item_id,
+                };
                 map_graph_err(
                     graph,
                     graph
-                        .upload_bytes(
+                        .upload_bytes_with_options(
                             &drive.id,
-                            parent_id.as_deref(),
+                            resolved_parent_id.as_deref(),
                             &name,
                             text.as_bytes().to_vec(),
                             Some("text/plain; charset=utf-8"),
+                            &opts,
                         )
                         .await,
                 )
@@ -517,9 +582,22 @@ async fn call_tool(
             .await?;
             let item = map_graph_err(
                 graph,
-                resolver::resolve_item(graph, storage, &drive.id, &item_q, false).await,
+                resolver::resolve_item_for_write(graph, storage, &drive.id, &item_q).await,
             )
             .await?;
+            let resolved_parent_id = match new_parent_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some("/") | Some("root") => Some("root".to_string()),
+                Some(p) if p.starts_with('/') || p.contains('/') => {
+                    let folder = map_graph_err(
+                        graph,
+                        resolver::resolve_item_for_write(graph, storage, &drive.id, p).await,
+                    )
+                    .await?;
+                    Some(folder.id)
+                }
+                Some(pid) => Some(pid.to_string()),
+                None => None,
+            };
             let updated = map_graph_err(
                 graph,
                 graph
@@ -527,7 +605,7 @@ async fn call_tool(
                         &drive.id,
                         &item.id,
                         new_name.as_deref(),
-                        new_parent_id.as_deref(),
+                        resolved_parent_id.as_deref(),
                     )
                     .await,
             )
@@ -559,7 +637,7 @@ async fn call_tool(
             .await?;
             let item = map_graph_err(
                 graph,
-                resolver::resolve_item(graph, storage, &drive.id, &item_q, false).await,
+                resolver::resolve_item_for_write(graph, storage, &drive.id, &item_q).await,
             )
             .await?;
             map_graph_err(graph, graph.delete_item(&drive.id, &item.id).await).await?;
@@ -718,7 +796,7 @@ pub fn tool_catalog() -> Vec<Value> {
         tool_def("get_file_info", "Get detailed metadata for a file or folder by item_id or path", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "offline": { "type": "boolean" } } })),
         tool_def("read_text_file", "Read text/Markdown/JSON/YAML/CSV/code file content up to a safe byte cap", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "max_bytes": { "type": "integer" } } })),
         tool_def("download_file", "Download a OneDrive or SharePoint file to local disk, returning { ok, path, file_name, mime_type, size_bytes, is_image }", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "dir": { "type": "string" } } })),
-        tool_def("upload_file", "Upload a local file, base64 bytes, or text content into OneDrive or SharePoint (auto simple < 4 MiB or chunked >= 4 MiB)", json!({ "type": "object", "properties": { "local_path": { "type": "string" }, "file_name": { "type": "string" }, "content_base64": { "type": "string" }, "content_text": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" } } })),
+        tool_def("upload_file", "Upload a local file, base64 bytes, or text content into OneDrive or SharePoint (auto simple < 4 MiB or chunked >= 4 MiB)", json!({ "type": "object", "properties": { "local_path": { "type": "string" }, "file_name": { "type": "string" }, "content_base64": { "type": "string" }, "content_text": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" }, "item_id": { "type": "string" }, "if_match": { "type": "string" }, "conflict_behavior": { "type": "string", "enum": ["replace", "fail", "rename"] } } })),
         tool_def("create_folder", "Create a new folder inside OneDrive or a SharePoint document library", json!({ "type": "object", "required": ["name"], "properties": { "name": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" } } })),
         tool_def("move_or_rename_item", "Rename and/or move a OneDrive or SharePoint item to another folder", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "new_name": { "type": "string" }, "new_parent_id": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" } } })),
         tool_def("delete_item", "Delete a OneDrive or SharePoint file or folder (requires confirm: true)", json!({ "type": "object", "required": ["confirm"], "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "confirm": { "type": "boolean" } } })),

@@ -295,7 +295,12 @@ pub async fn resolve_personal_drive(
     Ok(drive)
 }
 
-/// Resolves a drive item by exact item ID, path (`/Projects/plan.md` or `Projects/plan.md`), or cached lookup.
+/// Resolves a drive item strictly within `drive_id` by exact item ID or exact path
+/// (`/Projects/plan.md` or `plan.md` at drive root).
+///
+/// Online lookups (`offline == false`) never fall back to local cache search or bare-filename
+/// matching across other folders. Offline lookups (`offline == true`) match only exact ID or
+/// exact path within `drive_id`.
 pub async fn resolve_item(
     graph: &GraphClient,
     storage: &Storage,
@@ -309,38 +314,58 @@ pub async fn resolve_item(
     }
     let looks_like_path = raw.starts_with('/') || raw.contains('/');
 
-    if !looks_like_path {
-        if let Some(cached) = storage.get_drive_item(drive_id, raw)? {
-            if offline {
+    if offline {
+        if !looks_like_path {
+            if let Some(cached) = storage.get_drive_item(drive_id, raw)? {
                 return Ok(cached);
             }
         }
-        if !offline {
-            if let Ok(item) = graph.get_item(drive_id, raw).await {
+        if let Some(exact) = storage.get_drive_item_by_path(drive_id, raw)? {
+            return Ok(exact);
+        }
+        bail!("Drive item not found in local cache for drive '{drive_id}': {raw}")
+    }
+
+    if !looks_like_path {
+        if let Ok(item) = graph.get_item(drive_id, raw).await {
+            if item.drive_id == drive_id || item.effective_drive_id() == drive_id {
                 let _ = storage.upsert_drive_items(std::slice::from_ref(&item));
                 return Ok(item);
             }
         }
     }
 
-    if !offline {
-        if let Ok(item) = graph.get_item_by_path(drive_id, raw).await {
+    if let Ok(item) = graph.get_item_by_path(drive_id, raw).await {
+        if item.drive_id == drive_id || item.effective_drive_id() == drive_id {
             let _ = storage.upsert_drive_items(std::slice::from_ref(&item));
             return Ok(item);
         }
     }
 
-    // Fallback: search local cache by exact display path or name
-    let clean_target = format!("/{}", raw.trim_start_matches('/'));
-    let hits = storage.search_items(raw.trim_matches('/'), Some(drive_id), 25)?;
-    if let Some(exact) = hits.iter().find(|h| {
-        h.item.id == raw
-            || h.item.display_path().eq_ignore_ascii_case(&clean_target)
-            || h.item.name.eq_ignore_ascii_case(raw.trim_matches('/'))
-    }) {
-        return Ok(exact.item.clone());
-    }
     bail!("Drive item not found in drive '{drive_id}': {raw}")
+}
+
+/// Resolves a drive item for mutating operations (delete, move/rename, target folder).
+/// Requires a confirmed live match by exact ID or exact path inside `drive_id`.
+pub async fn resolve_item_for_write(
+    graph: &GraphClient,
+    storage: &Storage,
+    drive_id: &str,
+    item_or_path: &str,
+) -> Result<DriveItem> {
+    let raw = item_or_path.trim();
+    if raw.is_empty() || raw == "/" || raw == "root" {
+        bail!("Refusing write target '{raw}': specify an exact item ID or path inside drive '{drive_id}'.");
+    }
+    let item = resolve_item(graph, storage, drive_id, raw, false).await?;
+    if item.drive_id != drive_id {
+        bail!(
+            "Resolved item '{}' belongs to drive '{}' rather than requested drive '{drive_id}'.",
+            item.id,
+            item.drive_id
+        );
+    }
+    Ok(item)
 }
 
 fn format_site_candidates(candidates: &[&SharePointSite]) -> String {

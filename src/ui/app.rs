@@ -141,6 +141,7 @@ pub enum UiMsg {
         content: String,
     },
     VersionsLoaded {
+        cache_key: String,
         item_id: String,
         versions: Vec<DriveItemVersion>,
     },
@@ -151,7 +152,7 @@ pub enum UiMsg {
         error: String,
     },
     ImageBytesFetched {
-        item_id: String,
+        cache_key: String,
         bytes: Arc<[u8]>,
     },
     ImageDecoded {
@@ -323,6 +324,7 @@ pub struct AppState {
     pub sync_busy: bool,
     pub sync_summary: String,
     pub text_previews: Option<(String, String)>,
+    pub text_preview_revision: Option<String>,
     pub item_versions: HashMap<String, Vec<DriveItemVersion>>,
     pub created_share_links: HashMap<String, String>,
     pub preview_errors: HashMap<String, String>,
@@ -372,6 +374,7 @@ impl AppState {
             sync_busy: false,
             sync_summary: "Ready".to_string(),
             text_previews: None,
+            text_preview_revision: None,
             item_versions: HashMap::new(),
             created_share_links: HashMap::new(),
             preview_errors: HashMap::new(),
@@ -441,6 +444,15 @@ impl AppState {
         self.sorted_visible_items().into_iter().next()
     }
 
+    pub fn item_revision_key(item: &DriveItem) -> String {
+        format!(
+            "{}:{}:{}",
+            item.effective_drive_id(),
+            item.effective_item_id(),
+            item.content_revision()
+        )
+    }
+
     pub fn text_preview_key(drive_id: &str, item_id: &str) -> String {
         format!("{drive_id}:{item_id}")
     }
@@ -451,7 +463,11 @@ impl AppState {
 
     pub fn text_preview_for(&self, item: &DriveItem) -> Option<&str> {
         let (key, content) = self.text_previews.as_ref()?;
-        text_preview_key_matches(key, item.effective_drive_id(), &item.id)
+        let rev_ok = self
+            .text_preview_revision
+            .as_deref()
+            .is_none_or(|rev| rev == item.content_revision());
+        (text_preview_key_matches(key, item.effective_drive_id(), &item.id) && rev_ok)
             .then_some(content.as_str())
     }
 
@@ -460,33 +476,83 @@ impl AppState {
         self.preview_errors.get(&key).map(String::as_str)
     }
 
+    pub fn versions_for(&self, item: &DriveItem) -> Option<&[DriveItemVersion]> {
+        self.item_versions
+            .get(&Self::item_revision_key(item))
+            .map(Vec::as_slice)
+    }
+
+    pub fn image_preview_error_for(&self, item: &DriveItem) -> Option<&str> {
+        self.preview_errors
+            .get(&Self::item_revision_key(item))
+            .or_else(|| self.preview_errors.get(&item.id))
+            .map(String::as_str)
+    }
+
     pub fn set_text_preview(&mut self, drive_id: &str, item_id: &str, content: String) {
+        let rev = self
+            .selected_item_ref()
+            .filter(|item| item.effective_drive_id() == drive_id && item.id == item_id)
+            .map(DriveItem::content_revision);
         self.text_previews = Some((Self::text_preview_key(drive_id, item_id), content));
+        self.text_preview_revision = rev;
     }
 
     pub fn clear_inspector_preview(&mut self, ui: &mut UiState) {
         self.text_previews = None;
+        self.text_preview_revision = None;
         ui.markup_cache = None;
         self.preview_errors.retain(|k, _| !k.starts_with("txt:"));
     }
 
+    pub fn invalidate_active_item_caches(&mut self, ui: &mut UiState) {
+        let active = self.active_item();
+        self.clear_inspector_preview(ui);
+        if let Some(item) = active {
+            let rev_key = Self::item_revision_key(&item);
+            let drive_item_prefix = format!("{}:{}:", item.effective_drive_id(), item.effective_item_id());
+            self.item_versions.retain(|k, _| !k.starts_with(&drive_item_prefix));
+            self.raw_image_bytes.retain(|k, _| !k.starts_with(&drive_item_prefix));
+            self.rendered_images.retain(|k, _| {
+                !k.starts_with(&format!("inline:{drive_item_prefix}"))
+                    && !k.starts_with(&format!("modal:{drive_item_prefix}"))
+            });
+            self.preview_errors.remove(&rev_key);
+            self.preview_errors.remove(&item.id);
+            self.inflight_previews
+                .remove(&Self::text_preview_inflight_key(item.effective_drive_id(), &item.id));
+            self.inflight_previews.remove(&format!("ver:{rev_key}"));
+        }
+    }
+
     pub fn sync_inspector_preview_for(&mut self, selected: Option<&DriveItem>, ui: &mut UiState) {
-        let active_pair = selected
+        let active_triple = selected
             .filter(|item| !item.is_folder && item.is_text_previewable())
             .map(|item| {
                 (
                     Self::text_preview_key(item.effective_drive_id(), &item.id),
                     Self::text_preview_inflight_key(item.effective_drive_id(), &item.id),
+                    item.content_revision(),
                 )
             });
-        match active_pair {
-            Some((ref expected_key, ref expected_err_key)) => {
-                if self
+        match active_triple {
+            Some((ref expected_key, ref expected_err_key, ref expected_rev)) => {
+                let key_mismatch = self
                     .text_previews
                     .as_ref()
-                    .is_some_and(|(stored, _)| stored != expected_key)
-                {
+                    .is_some_and(|(stored, _)| stored != expected_key);
+                let rev_mismatch = self
+                    .text_preview_revision
+                    .as_deref()
+                    .is_some_and(|rev| rev != expected_rev.as_str());
+                if key_mismatch || rev_mismatch {
                     self.text_previews = None;
+                    self.text_preview_revision = None;
+                    ui.markup_cache = None;
+                    if rev_mismatch {
+                        self.inflight_previews.remove(expected_err_key);
+                        self.preview_errors.remove(expected_err_key);
+                    }
                 }
                 if ui
                     .markup_cache
@@ -553,7 +619,7 @@ impl AppState {
     }
 
     pub fn inline_image_cache_key(&self, item: &DriveItem) -> String {
-        format!("inline:{}:{}", item.effective_drive_id(), item.effective_item_id())
+        format!("inline:{}", Self::item_revision_key(item))
     }
 
     pub fn modal_image_cache_key(
@@ -564,13 +630,101 @@ impl AppState {
         proto: TerminalImageProtocol,
     ) -> String {
         format!(
-            "modal:{}:{}:{}x{}:{}",
-            item.effective_drive_id(),
-            item.effective_item_id(),
+            "modal:{}:{}x{}:{}",
+            Self::item_revision_key(item),
             cols,
             rows,
             proto.as_str()
         )
+    }
+
+    pub fn refresh_open_overlays_for_items(&mut self, ui: &mut UiState) {
+        let mut html_refresh: Option<DriveItem> = None;
+        let mut image_refresh: Option<(DriveItem, String, u16, u16)> = None;
+
+        for overlay in &mut ui.overlays {
+            match overlay {
+                Overlay::HtmlPreview(ov) => {
+                    if let Some(ref target_id) = ov.item_id {
+                        if let Some(updated) = self.current_items.iter().find(|it| {
+                            it.id == *target_id
+                                && ov
+                                    .drive_id
+                                    .as_deref()
+                                    .is_none_or(|d| d == it.effective_drive_id())
+                        }) {
+                            let new_rev = updated.content_revision();
+                            if ov.revision.as_deref() != Some(new_rev.as_str()) {
+                                ov.revision = Some(new_rev);
+                                html_refresh = Some(updated.clone());
+                            }
+                        }
+                    }
+                }
+                Overlay::ImagePreview(ov) => {
+                    let prev_cur = ov.current().cloned();
+                    let new_images: Vec<DriveItem> = self
+                        .current_items
+                        .iter()
+                        .filter(|i| i.is_image())
+                        .cloned()
+                        .collect();
+                    if !new_images.is_empty() {
+                        if let Some(ref prev) = prev_cur {
+                            if let Some(pos) = new_images.iter().position(|i| i.id == prev.id) {
+                                let updated = &new_images[pos];
+                                let changed = updated.content_revision() != prev.content_revision();
+                                ov.index = pos;
+                                if changed {
+                                    let (cols, rows) =
+                                        ov.target_dimensions(ui.term_width, ui.term_height);
+                                    let key = self.modal_image_cache_key(
+                                        updated,
+                                        cols,
+                                        rows,
+                                        ui.graphics_caps.protocol,
+                                    );
+                                    image_refresh = Some((updated.clone(), key, cols, rows));
+                                }
+                            } else {
+                                ov.index = ov.index.min(new_images.len() - 1);
+                            }
+                        }
+                        ov.items = new_images;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(item) = html_refresh {
+            let graph = self.graph.clone();
+            let tx = self.ui_tx.clone();
+            let did = item.effective_drive_id().to_string();
+            let iid = item.effective_item_id().to_string();
+            let dl = item.download_url.clone();
+            let drive_for_msg = did.clone();
+            let item_id = item.id.clone();
+            let title = item.name.clone();
+            tokio::spawn(async move {
+                if let Ok(bytes) = graph
+                    .download_item_bytes(&did, &iid, dl.as_deref(), DEFAULT_TEXT_PREVIEW_MAX_BYTES)
+                    .await
+                {
+                    let html = String::from_utf8_lossy(&bytes).into_owned();
+                    let _ = tx.send(UiMsg::HtmlPreviewReady {
+                        drive_id: drive_for_msg,
+                        item_id,
+                        title,
+                        html,
+                    });
+                }
+            });
+        }
+
+        if let Some((item, key, cols, rows)) = image_refresh {
+            self.request_image_decode(&item, key, cols, rows, ui.graphics_caps);
+        }
     }
 
     pub fn spawn_bootstrap_from_cache(&self) {
@@ -658,15 +812,23 @@ impl AppState {
 
         tokio::spawn(async move {
             match graph
-                .list_children(&drive_id, parent_id.as_deref(), Some(200))
+                .list_children_detailed(&drive_id, parent_id.as_deref(), Some(200))
                 .await
             {
-                Ok(items) => {
-                    let _ = storage.replace_folder_children(&drive_id, parent_id.as_deref(), &items);
+                Ok(page) => {
+                    if page.complete {
+                        let _ = storage.replace_folder_children(
+                            &drive_id,
+                            parent_id.as_deref(),
+                            &page.items,
+                        );
+                    } else {
+                        let _ = storage.upsert_drive_items(&page.items);
+                    }
                     let _ = tx.send(UiMsg::FolderLoaded {
                         drive_id,
                         parent_id,
-                        items,
+                        items: page.items,
                     });
                 }
                 Err(err) => {
@@ -692,19 +854,22 @@ impl AppState {
             return;
         }
         let item_id = item.id.clone();
+        let rev_key = Self::item_revision_key(&item);
 
-        // Fetch version history lazily
-        if !self.item_versions.contains_key(&item_id) {
-            let vkey = format!("ver:{item_id}");
+        // Fetch version history lazily (keyed by drive + item + revision)
+        if !self.item_versions.contains_key(&rev_key) {
+            let vkey = format!("ver:{rev_key}");
             if self.inflight_previews.insert(vkey) {
                 let graph = self.graph.clone();
                 let tx = self.ui_tx.clone();
                 let did = item.effective_drive_id().to_string();
                 let iid = item.effective_item_id().to_string();
                 let id_for_msg = item_id.clone();
+                let cache_key = rev_key.clone();
                 tokio::spawn(async move {
                     if let Ok(versions) = graph.list_item_versions(&did, &iid).await {
                         let _ = tx.send(UiMsg::VersionsLoaded {
+                            cache_key,
                             item_id: id_for_msg,
                             versions,
                         });
@@ -774,10 +939,11 @@ impl AppState {
         let tx = self.ui_tx.clone();
         let did = item.effective_drive_id().to_string();
         let item_id = item.id.clone();
+        let raw_cache_key = Self::item_revision_key(item);
         let item_name = item.name.clone();
         let item_mime = item.mime_type.clone();
 
-        if let Some(raw) = self.raw_image_bytes.get(&item_id).cloned() {
+        if let Some(raw) = self.raw_image_bytes.get(&raw_cache_key).cloned() {
             tokio::task::spawn_blocking(move || {
                 match sniff_content_kind(item_mime.as_deref(), Some(&item_name), Some(&raw)) {
                     ContentKind::Html => {
@@ -870,7 +1036,7 @@ impl AppState {
                     }
                     let arc: Arc<[u8]> = Arc::from(bytes);
                     let _ = tx.send(UiMsg::ImageBytesFetched {
-                        item_id: item_id.clone(),
+                        cache_key: raw_cache_key,
                         bytes: Arc::clone(&arc),
                     });
                     let decode_tx = tx.clone();
@@ -1029,6 +1195,7 @@ impl AppState {
                     self.current_items = items;
                     self.loading_folder = false;
                     self.reconcile_selection_after_items_update(ui);
+                    self.refresh_open_overlays_for_items(ui);
                     self.ensure_inspector_loaded(ui);
                 }
             }
@@ -1106,11 +1273,8 @@ impl AppState {
                 {
                     self.current_items = items;
                     self.loading_folder = false;
-                    let sorted = self.sorted_visible_items();
-                    let first = sorted.first();
-                    ui.list_scroll.selected_idx = first.map(|_| 0);
-                    self.active_selected_id = first.map(|i| i.id.clone());
-                    self.sync_inspector_preview_for(first, ui);
+                    self.reconcile_selection_after_items_update(ui);
+                    self.refresh_open_overlays_for_items(ui);
                     self.ensure_inspector_loaded(ui);
                 }
             }
@@ -1153,9 +1317,13 @@ impl AppState {
                     self.set_text_preview(&drive_id, &item_id, content);
                 }
             }
-            UiMsg::VersionsLoaded { item_id, versions } => {
-                self.inflight_previews.remove(&format!("ver:{item_id}"));
-                self.item_versions.insert(item_id, versions);
+            UiMsg::VersionsLoaded {
+                cache_key,
+                versions,
+                ..
+            } => {
+                self.inflight_previews.remove(&format!("ver:{cache_key}"));
+                self.item_versions.insert(cache_key, versions);
             }
             UiMsg::PreviewFailed {
                 drive_id,
@@ -1175,14 +1343,20 @@ impl AppState {
                         );
                     }
                 } else {
-                    self.preview_errors.insert(item_id, error);
+                    let err_key = self
+                        .current_items
+                        .iter()
+                        .find(|it| it.effective_drive_id() == drive_id && it.id == item_id)
+                        .map(Self::item_revision_key)
+                        .unwrap_or(item_id);
+                    self.preview_errors.insert(err_key, error);
                 }
             }
-            UiMsg::ImageBytesFetched { item_id, bytes } => {
+            UiMsg::ImageBytesFetched { cache_key, bytes } => {
                 if self.raw_image_bytes.len() >= 8 {
                     self.raw_image_bytes.clear();
                 }
-                self.raw_image_bytes.insert(item_id, bytes);
+                self.raw_image_bytes.insert(cache_key, bytes);
             }
             UiMsg::ImageDecoded {
                 cache_key,
@@ -1231,16 +1405,28 @@ impl AppState {
                 title,
                 html,
             } => {
+                let current_rev = self
+                    .current_items
+                    .iter()
+                    .find(|it| it.effective_drive_id() == drive_id && it.id == item_id)
+                    .map(DriveItem::content_revision);
                 if self.is_active_text_item(&drive_id, &item_id) {
                     self.preview_errors
                         .remove(&Self::text_preview_inflight_key(&drive_id, &item_id));
                     self.set_text_preview(&drive_id, &item_id, html.clone());
                 }
-                ui.push_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
-                    title,
-                    html,
-                    Some(item_id),
-                )));
+                if let Some(Overlay::HtmlPreview(ov)) = ui.overlays.last_mut() {
+                    if ov.item_id.as_deref() == Some(item_id.as_str())
+                        && ov.drive_id.as_deref().is_none_or(|d| d == drive_id)
+                    {
+                        ov.replace_html(title, html, current_rev);
+                        return;
+                    }
+                }
+                let mut ov = HtmlPreviewOverlay::new(title, html, Some(item_id));
+                ov.drive_id = Some(drive_id);
+                ov.revision = current_rev;
+                ui.push_overlay(Overlay::HtmlPreview(ov));
             }
             UiMsg::HtmlServed { url } => match open::that(&url) {
                 Ok(()) => ui.toast(format!("Serving HTML at {url}"), ToastKind::Success),
@@ -1911,5 +2097,338 @@ mod tests {
         let body = reqwest::get(&url).await.unwrap().text().await.unwrap();
         assert!(body.contains("Requested Report"), "{body}");
         app.html_server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn external_edit_same_id_refreshes_tui_text_html_image_and_versions() {
+        use std::io::Cursor;
+        use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+
+        fn make_png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+            let mut out = Vec::new();
+            let img = RgbaImage::from_pixel(w, h, Rgba(rgba));
+            DynamicImage::ImageRgba8(img)
+                .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+                .unwrap();
+            out
+        }
+
+        #[derive(Clone)]
+        struct RevisionServer {
+            version: Arc<AtomicUsize>,
+            doc_hits: Arc<AtomicUsize>,
+            html_hits: Arc<AtomicUsize>,
+            img_hits: Arc<AtomicUsize>,
+            ver_hits: Arc<AtomicUsize>,
+        }
+
+        let st = RevisionServer {
+            version: Arc::new(AtomicUsize::new(1)),
+            doc_hits: Arc::new(AtomicUsize::new(0)),
+            html_hits: Arc::new(AtomicUsize::new(0)),
+            img_hits: Arc::new(AtomicUsize::new(0)),
+            ver_hits: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let router = Router::new()
+            .route(
+                "/v1.0/drives/{drive_id}/items/{item_id}/content",
+                get(
+                    |State(s): State<RevisionServer>, Path((drive_id, item_id)): Path<(String, String)>| async move {
+                        let ver = s.version.load(Ordering::SeqCst);
+                        match item_id.as_str() {
+                            "item-doc" => {
+                                s.doc_hits.fetch_add(1, Ordering::SeqCst);
+                                (
+                                    [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+                                    format!("# Doc v{ver}\nBody revision {ver}\n"),
+                                )
+                                    .into_response()
+                            }
+                            "item-html" => {
+                                s.html_hits.fetch_add(1, Ordering::SeqCst);
+                                (
+                                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                                    format!("<html><body><h1>HTML v{ver}</h1></body></html>"),
+                                )
+                                    .into_response()
+                            }
+                            "item-img" => {
+                                s.img_hits.fetch_add(1, Ordering::SeqCst);
+                                let png = if drive_id == "drv-2" {
+                                    make_png(4, 4, [0, 0, 255, 255])
+                                } else if ver == 1 {
+                                    make_png(1, 1, [255, 0, 0, 255])
+                                } else {
+                                    make_png(3, 3, [0, 255, 0, 255])
+                                };
+                                ([(header::CONTENT_TYPE, "image/png")], png).into_response()
+                            }
+                            _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1.0/drives/{drive_id}/items/{item_id}/versions",
+                get(|State(s): State<RevisionServer>| async move {
+                    let ver = s.ver_hits.fetch_add(1, Ordering::SeqCst);
+                    let cur = s.version.load(Ordering::SeqCst);
+                    let _ = ver;
+                    let list = if cur == 1 {
+                        serde_json::json!({ "value": [{ "id": "1.0", "size": 24 }] })
+                    } else {
+                        serde_json::json!({
+                            "value": [
+                                { "id": "2.0", "size": 48 },
+                                { "id": "1.0", "size": 24 }
+                            ]
+                        })
+                    };
+                    axum::Json(list)
+                }),
+            )
+            .with_state(st.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let base_url = format!("http://{addr}/v1.0");
+        let (mut app, mut ui, mut rx) = test_app_and_ui_with_base_url(Some(&base_url));
+        ui.inline_images = true;
+        ui.graphics_caps.protocol = TerminalImageProtocol::Halfblock;
+        app.active_source = ActiveViewSource::Drive {
+            drive_id: "drv-1".into(),
+            label: "Docs".into(),
+        };
+
+        let make_rev_item = |drive: &str, id: &str, name: &str, mime: &str, ver: usize| DriveItem {
+            id: id.into(),
+            drive_id: drive.into(),
+            name: name.into(),
+            size: (20 * ver) as u64,
+            mime_type: Some(mime.into()),
+            e_tag: Some(format!("\"etag-{id}-v{ver}\"")),
+            c_tag: Some(format!("\"ctag-{id}-v{ver}\"")),
+            last_modified_at: Some(format!("2026-11-20T0{ver}:00:00Z")),
+            ..Default::default()
+        };
+
+        let doc_v1 = make_rev_item("drv-1", "item-doc", "doc.md", "text/markdown", 1);
+        let html_v1 = make_rev_item("drv-1", "item-html", "page.html", "text/html", 1);
+        let img_v1 = make_rev_item("drv-1", "item-img", "pic.png", "image/png", 1);
+        app.current_items = vec![doc_v1.clone(), html_v1.clone(), img_v1.clone()];
+        app.active_selected_id = Some("item-doc".into());
+        ui.list_scroll.selected_idx = Some(0);
+
+        // 1. Load Markdown v1 + versions v1
+        app.ensure_inspector_loaded(&ui);
+        let mut saw_doc_v1 = false;
+        let mut saw_ver_v1 = false;
+        while !(saw_doc_v1 && saw_ver_v1) {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected v1 doc/versions")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::TextPreviewLoaded { item_id, .. } if item_id == "item-doc") {
+                saw_doc_v1 = true;
+            }
+            if matches!(&msg, UiMsg::VersionsLoaded { item_id, .. } if item_id == "item-doc") {
+                saw_ver_v1 = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        assert_eq!(app.text_preview_for(&doc_v1), Some("# Doc v1\nBody revision 1\n"));
+        let screen_v1 = draw_inspector_frame(&app, &mut ui);
+        assert!(screen_v1.contains("Doc v1"), "{screen_v1}");
+
+        // External edit on server -> v2 for all 3 items, delivered via FolderItemsUpdated
+        st.version.store(2, Ordering::SeqCst);
+        let doc_v2 = make_rev_item("drv-1", "item-doc", "doc.md", "text/markdown", 2);
+        let html_v2 = make_rev_item("drv-1", "item-html", "page.html", "text/html", 2);
+        let img_v2 = make_rev_item("drv-1", "item-img", "pic.png", "image/png", 2);
+
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "drv-1".into(),
+                parent_id: None,
+                items: vec![doc_v2.clone(), html_v2.clone(), img_v2.clone()],
+            },
+            &mut ui,
+        );
+        assert!(
+            app.text_preview_for(&doc_v2).is_none(),
+            "stale v1 text preview must be invalidated when revision changes to v2"
+        );
+        assert!(
+            ui.markup_cache.is_none(),
+            "stale v1 markup cache must be invalidated when revision changes to v2"
+        );
+
+        let mut saw_doc_v2 = false;
+        let mut saw_ver_v2 = false;
+        while !(saw_doc_v2 && saw_ver_v2) {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected v2 doc/versions refetch after external edit")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::TextPreviewLoaded { item_id, .. } if item_id == "item-doc") {
+                saw_doc_v2 = true;
+            }
+            if matches!(&msg, UiMsg::VersionsLoaded { item_id, .. } if item_id == "item-doc") {
+                saw_ver_v2 = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        assert_eq!(st.doc_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(app.text_preview_for(&doc_v2), Some("# Doc v2\nBody revision 2\n"));
+        let screen_v2 = draw_inspector_frame(&app, &mut ui);
+        assert!(screen_v2.contains("Doc v2"), "{screen_v2}");
+        assert!(screen_v2.contains("v2.0"), "inspector must show refreshed v2.0 version:\n{screen_v2}");
+
+        // 2. HTML file: load v2 (reset to v1 first), open overlay, then bump to v2 -> overlay updates
+        st.version.store(1, Ordering::SeqCst);
+        app.current_items = vec![doc_v1.clone(), html_v1.clone(), img_v1.clone()];
+        app.active_selected_id = Some("item-html".into());
+        ui.list_scroll.selected_idx = Some(1);
+        app.sync_inspector_preview_for(Some(&html_v1), &mut ui);
+        app.ensure_inspector_loaded(&ui);
+        let mut saw_html_v1 = false;
+        while !saw_html_v1 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected html v1")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::TextPreviewLoaded { item_id, .. } if item_id == "item-html") {
+                saw_html_v1 = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        dispatch(Action::OpenHtmlPreview, &mut app, &mut ui);
+        match ui.overlays.last() {
+            Some(Overlay::HtmlPreview(ov)) => {
+                assert!(ov.session.raw_html().contains("HTML v1"));
+            }
+            other => panic!("expected HtmlPreview overlay, got {other:?}"),
+        }
+
+        // External edit HTML v1 -> v2 while HTML overlay is open
+        st.version.store(2, Ordering::SeqCst);
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "drv-1".into(),
+                parent_id: None,
+                items: vec![doc_v2.clone(), html_v2.clone(), img_v2.clone()],
+            },
+            &mut ui,
+        );
+        let mut saw_html_text_v2 = false;
+        let mut saw_html_overlay_v2 = false;
+        while !(saw_html_text_v2 && saw_html_overlay_v2) {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected html v2 refetch")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::TextPreviewLoaded { item_id, .. } if item_id == "item-html") {
+                saw_html_text_v2 = true;
+            }
+            if matches!(&msg, UiMsg::HtmlPreviewReady { item_id, .. } if item_id == "item-html") {
+                saw_html_overlay_v2 = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        assert_eq!(
+            app.text_preview_for(&html_v2),
+            Some("<html><body><h1>HTML v2</h1></body></html>")
+        );
+        match ui.overlays.last() {
+            Some(Overlay::HtmlPreview(ov)) => {
+                assert!(
+                    ov.session.raw_html().contains("HTML v2"),
+                    "open HTML overlay must refresh to v2, got: {}",
+                    ov.session.raw_html()
+                );
+            }
+            other => panic!("expected updated HtmlPreview overlay, got {other:?}"),
+        }
+        ui.pop_overlay();
+
+        // 3. Image file: load v1 (1x1 red), then external edit -> v2 (3x3 green) -> must re-fetch & re-decode!
+        st.version.store(1, Ordering::SeqCst);
+        app.current_items = vec![doc_v1.clone(), html_v1.clone(), img_v1.clone()];
+        app.active_selected_id = Some("item-img".into());
+        ui.list_scroll.selected_idx = Some(2);
+        app.sync_inspector_preview_for(Some(&img_v1), &mut ui);
+        app.ensure_inspector_loaded(&ui);
+        let v1_img_key = app.inline_image_cache_key(&img_v1);
+        let mut saw_img_v1 = false;
+        while !saw_img_v1 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected img v1 decode")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::ImageDecoded { cache_key, .. } if *cache_key == v1_img_key) {
+                saw_img_v1 = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        assert_eq!(app.rendered_images.get(&v1_img_key).unwrap().width_px, 1);
+
+        st.version.store(2, Ordering::SeqCst);
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "drv-1".into(),
+                parent_id: None,
+                items: vec![doc_v2.clone(), html_v2.clone(), img_v2.clone()],
+            },
+            &mut ui,
+        );
+        let v2_img_key = app.inline_image_cache_key(&img_v2);
+        let mut saw_img_v2 = false;
+        while !saw_img_v2 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected img v2 decode after external edit")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::ImageDecoded { cache_key, .. } if *cache_key == v2_img_key) {
+                saw_img_v2 = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        assert_eq!(app.rendered_images.get(&v2_img_key).unwrap().width_px, 3);
+        assert!(st.img_hits.load(Ordering::SeqCst) >= 2);
+
+        // 4. Cross-drive isolation for identical image item_id (`drv-2` 4x4 blue vs `drv-1` 3x3 green)
+        let img_drv2 = make_rev_item("drv-2", "item-img", "pic.png", "image/png", 2);
+        app.active_source = ActiveViewSource::Drive {
+            drive_id: "drv-2".into(),
+            label: "Drive Two".into(),
+        };
+        app.current_items = vec![img_drv2.clone()];
+        app.active_selected_id = Some("item-img".into());
+        ui.list_scroll.selected_idx = Some(0);
+        app.ensure_inspector_loaded(&ui);
+        let d2_img_key = app.inline_image_cache_key(&img_drv2);
+        let mut saw_img_d2 = false;
+        while !saw_img_d2 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected drv-2 img decode")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::ImageDecoded { cache_key, .. } if *cache_key == d2_img_key) {
+                saw_img_d2 = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        assert_eq!(
+            app.rendered_images.get(&d2_img_key).unwrap().width_px,
+            4,
+            "drv-2 image must not reuse drv-1 raw_image_bytes for same item_id"
+        );
+
+        server.abort();
     }
 }

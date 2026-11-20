@@ -15,9 +15,15 @@ use crate::{
         AuthManager, LoginOptions, StoredTokens,
     },
     config::{self, AppConfig, Persona},
-    graph::GraphClient,
+    graph::{
+        drives::{ConflictBehavior, UploadOptions},
+        GraphClient,
+    },
     img_preview,
-    models::{format_human_size, DriveInfo, DriveItem, SharePointSite, TreeNode},
+    models::{
+        format_human_size, DownloadBaseline, DownloadedFile, DriveInfo, DriveItem, SharePointSite,
+        TreeNode,
+    },
     resolver,
     serve::{self, ServeOptions},
     storage::Storage,
@@ -225,6 +231,15 @@ pub enum Command {
         /// Optional remote filename override
         #[arg(long)]
         name: Option<String>,
+        /// Optional exact target item ID for conditional replacement
+        #[arg(long = "item-id", value_name = "ITEM_ID")]
+        item_id: Option<String>,
+        /// Optional ETag precondition (`If-Match`) for conditional upload
+        #[arg(long = "if-match", value_name = "ETAG")]
+        if_match: Option<String>,
+        /// Conflict behavior when target file already exists (`replace`, `fail`, `rename`)
+        #[arg(long, value_parser = ["replace", "fail", "rename"])]
+        conflict: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -809,6 +824,8 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                         "drive_id": item.drive_id,
                         "name": item.name,
                         "mime_type": item.mime_type,
+                        "e_tag": item.e_tag,
+                        "c_tag": item.c_tag,
                         "size_bytes": bytes.len(),
                         "content": text,
                     }))?
@@ -845,7 +862,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 bail!("Cannot download folder '{}'; select a file.", item.name);
             }
             let dest_dir = dir.unwrap_or_else(|| config.resolved_download_dir());
-            let downloaded = graph
+            let mut downloaded = graph
                 .download_item_to_file(
                     item.effective_drive_id(),
                     item.effective_item_id(),
@@ -855,6 +872,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     &dest_dir,
                 )
                 .await?;
+            record_download_baseline(&storage, &item, &mut downloaded);
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&downloaded)?);
             } else {
@@ -873,6 +891,9 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             drive,
             site,
             name,
+            item_id,
+            if_match,
+            conflict,
             json: as_json,
         }) => {
             let (_, graph, storage) = init_runtime(&config, false).await?;
@@ -885,19 +906,53 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 false,
             )
             .await?;
-            let parent_id = match dest_folder.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "/") {
-                Some(p) => Some(resolver::resolve_item(&graph, &storage, &target_drive.id, p, false).await?.id),
+            let parent_item = match dest_folder
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "/" && *s != "root")
+            {
+                Some(p) => Some(
+                    resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, p).await?,
+                ),
                 None => None,
             };
+            let parent_id = parent_item.as_ref().map(|p| p.id.clone());
+            let parent_path = parent_item
+                .as_ref()
+                .map(|p| p.display_path())
+                .unwrap_or_default();
+            let explicit_conflict = match conflict.as_deref() {
+                Some(raw) => Some(ConflictBehavior::parse_str(raw)?),
+                None => None,
+            };
+            let mut upload_opts = resolve_upload_options_for_local_file(
+                &storage,
+                &target_drive.id,
+                parent_id.as_deref(),
+                Some(&parent_path),
+                name.as_deref(),
+                &local_path,
+                if_match.as_deref(),
+                explicit_conflict,
+            );
+            if let Some(explicit_id) = item_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                upload_opts.target_item_id = Some(explicit_id.to_string());
+            }
             let uploaded = graph
-                .upload_local_file(
+                .upload_local_file_with_options(
                     &target_drive.id,
                     parent_id.as_deref(),
                     name.as_deref(),
                     &local_path,
+                    &upload_opts,
                 )
                 .await?;
             let _ = storage.upsert_drive_items(std::slice::from_ref(&uploaded));
+            refresh_download_baseline_after_upload(&storage, &local_path, &uploaded, &upload_opts);
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&uploaded)?);
             } else {
@@ -928,8 +983,16 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 false,
             )
             .await?;
-            let parent_id = match parent.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "/") {
-                Some(p) => Some(resolver::resolve_item(&graph, &storage, &target_drive.id, p, false).await?.id),
+            let parent_id = match parent
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "/" && *s != "root")
+            {
+                Some(p) => Some(
+                    resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, p)
+                        .await?
+                        .id,
+                ),
                 None => None,
             };
             let folder = graph
@@ -962,11 +1025,15 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             )
             .await?;
             let item =
-                resolver::resolve_item(&graph, &storage, &target_drive.id, &item_or_path, false)
+                resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, &item_or_path)
                     .await?;
             let dest_parent_id = match parent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 Some("/") | Some("root") => Some("root".to_string()),
-                Some(p) => Some(resolver::resolve_item(&graph, &storage, &target_drive.id, p, false).await?.id),
+                Some(p) => Some(
+                    resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, p)
+                        .await?
+                        .id,
+                ),
                 None => None,
             };
             let updated = graph
@@ -1006,7 +1073,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             )
             .await?;
             let item =
-                resolver::resolve_item(&graph, &storage, &target_drive.id, &item_or_path, false)
+                resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, &item_or_path)
                     .await?;
             if !yes {
                 eprint!("Delete '{}' ({})? [y/N]: ", item.display_path(), item.id);
@@ -1466,16 +1533,38 @@ pub async fn fetch_sites(
     offline: bool,
     cached: bool,
 ) -> Result<Vec<SharePointSite>> {
-    if !refresh && (offline || cached) && search.is_none() {
+    let clean_search = search
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "*");
+    if !refresh && (offline || cached) {
         let local = storage.list_sites()?;
-        if !local.is_empty() || offline {
-            return Ok(local.into_iter().take(limit).collect());
+        let filtered: Vec<SharePointSite> = if let Some(q) = clean_search {
+            let ql = q.to_lowercase();
+            local
+                .into_iter()
+                .filter(|s| {
+                    s.name.to_lowercase().contains(&ql)
+                        || s.display_name.to_lowercase().contains(&ql)
+                        || s.web_url
+                            .as_deref()
+                            .is_some_and(|u| u.to_lowercase().contains(&ql))
+                        || s.id.to_lowercase().contains(&ql)
+                })
+                .collect()
+        } else {
+            local
+        };
+        if !filtered.is_empty() || offline {
+            return Ok(filtered.into_iter().take(limit).collect());
         }
     }
-    let mut combined = if search.is_none() {
-        graph.list_followed_sites().await.unwrap_or_default()
+    let (authoritative_follow, mut combined) = if clean_search.is_none() {
+        match graph.list_followed_sites().await {
+            Ok(followed) => (true, followed),
+            Err(_) => (false, Vec::new()),
+        }
     } else {
-        Vec::new()
+        (false, Vec::new())
     };
     let discovered = graph.list_sites(search, limit).await?;
     for s in discovered {
@@ -1483,7 +1572,11 @@ pub async fn fetch_sites(
             combined.push(s);
         }
     }
-    let _ = storage.upsert_sites(&combined);
+    if authoritative_follow {
+        let _ = storage.upsert_sites_with_follow_state(&combined);
+    } else {
+        let _ = storage.upsert_sites(&combined);
+    }
     Ok(combined.into_iter().take(limit).collect())
 }
 
@@ -1561,9 +1654,32 @@ pub async fn fetch_folder_items(
             None => storage.list_folder_children(drive_id, None, Some(""), limit)?,
             Some(p) if p.starts_with('/') || p.contains('/') => {
                 let norm = format!("/{}", p.trim_matches('/'));
-                storage.list_folder_children(drive_id, None, Some(&norm), limit)?
+                let by_path = storage.list_folder_children(drive_id, None, Some(&norm), limit)?;
+                if !by_path.is_empty() {
+                    by_path
+                } else if let Some(folder) = storage.get_drive_item_by_path(drive_id, &norm)? {
+                    storage.list_folder_children(drive_id, Some(&folder.id), None, limit)?
+                } else {
+                    Vec::new()
+                }
             }
-            Some(id) => storage.list_folder_children(drive_id, Some(id), None, limit)?,
+            Some(id) => {
+                let by_id = storage.list_folder_children(drive_id, Some(id), None, limit)?;
+                if !by_id.is_empty() {
+                    by_id
+                } else {
+                    let norm = format!("/{id}");
+                    let by_path =
+                        storage.list_folder_children(drive_id, None, Some(&norm), limit)?;
+                    if !by_path.is_empty() {
+                        by_path
+                    } else if let Some(folder) = storage.get_drive_item_by_path(drive_id, &norm)? {
+                        storage.list_folder_children(drive_id, Some(&folder.id), None, limit)?
+                    } else {
+                        Vec::new()
+                    }
+                }
+            }
         };
         if !local.is_empty() || offline {
             return Ok(local);
@@ -1572,33 +1688,230 @@ pub async fn fetch_folder_items(
 
     let items = match target {
         None => {
-            let live = graph.list_children(drive_id, None, Some(limit)).await?;
-            let _ = storage.replace_folder_children(drive_id, None, &live);
-            live
+            let page = graph
+                .list_children_detailed(drive_id, None, Some(limit))
+                .await?;
+            if page.complete {
+                let _ = storage.replace_folder_children(drive_id, None, &page.items);
+            } else {
+                let _ = storage.upsert_drive_items(&page.items);
+            }
+            page.items
         }
         Some(p) if p.starts_with('/') || p.contains('/') => {
-            let live = graph.list_children_by_path(drive_id, p, Some(limit)).await?;
-            let _ = storage.upsert_drive_items(&live);
-            live
+            let page = graph
+                .list_children_by_path_detailed(drive_id, p, Some(limit))
+                .await?;
+            if page.complete {
+                let _ = storage.replace_folder_children_by_path(drive_id, p, &page.items);
+            } else {
+                let _ = storage.upsert_drive_items(&page.items);
+            }
+            page.items
         }
         Some(id_or_name) => {
             // Try direct item ID children first, fall back to path-based children
-            match graph.list_children(drive_id, Some(id_or_name), Some(limit)).await {
-                Ok(live) => {
-                    let _ = storage.replace_folder_children(drive_id, Some(id_or_name), &live);
-                    live
+            match graph
+                .list_children_detailed(drive_id, Some(id_or_name), Some(limit))
+                .await
+            {
+                Ok(page) => {
+                    if page.complete {
+                        let _ = storage.replace_folder_children(
+                            drive_id,
+                            Some(id_or_name),
+                            &page.items,
+                        );
+                    } else {
+                        let _ = storage.upsert_drive_items(&page.items);
+                    }
+                    page.items
                 }
                 Err(_) => {
-                    let live = graph
-                        .list_children_by_path(drive_id, id_or_name, Some(limit))
+                    let page = graph
+                        .list_children_by_path_detailed(drive_id, id_or_name, Some(limit))
                         .await?;
-                    let _ = storage.upsert_drive_items(&live);
-                    live
+                    if page.complete {
+                        let _ = storage.replace_folder_children_by_path(
+                            drive_id,
+                            id_or_name,
+                            &page.items,
+                        );
+                    } else {
+                        let _ = storage.upsert_drive_items(&page.items);
+                    }
+                    page.items
                 }
             }
         }
     };
     Ok(items)
+}
+
+pub fn record_download_baseline(
+    storage: &Storage,
+    item: &DriveItem,
+    downloaded: &mut DownloadedFile,
+) {
+    downloaded.drive_id = Some(item.effective_drive_id().to_string());
+    downloaded.item_id = Some(item.effective_item_id().to_string());
+    downloaded.e_tag = item.e_tag.clone();
+    downloaded.c_tag = item.c_tag.clone();
+    let baseline = DownloadBaseline {
+        local_path: crate::storage::drives::normalize_local_baseline_path(&downloaded.path),
+        drive_id: item.effective_drive_id().to_string(),
+        item_id: item.effective_item_id().to_string(),
+        parent_id: item.parent_id.clone(),
+        parent_path: item.parent_path.clone(),
+        remote_name: item.name.clone(),
+        e_tag: item.e_tag.clone(),
+        c_tag: item.c_tag.clone(),
+        last_modified_at: item.last_modified_at.clone(),
+        downloaded_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = storage.upsert_download_baseline(&baseline);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_upload_options_for_local_file(
+    storage: &Storage,
+    drive_id: &str,
+    parent_id: Option<&str>,
+    parent_path: Option<&str>,
+    remote_name_override: Option<&str>,
+    local_path: &Path,
+    explicit_if_match: Option<&str>,
+    explicit_conflict: Option<ConflictBehavior>,
+) -> UploadOptions {
+    let target_name = remote_name_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            local_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        });
+    let matched_baseline = target_name.as_deref().and_then(|name| {
+        storage
+            .get_download_baseline(local_path)
+            .ok()
+            .flatten()
+            .filter(|b| {
+                b.drive_id == drive_id
+                    && b.remote_name.eq_ignore_ascii_case(name)
+                    && upload_parent_matches_baseline(b, parent_id, parent_path)
+            })
+    });
+
+    let clean_if_match = explicit_if_match
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if clean_if_match.is_some() {
+        return UploadOptions {
+            conflict_behavior: explicit_conflict,
+            if_match: clean_if_match,
+            expected_c_tag: None,
+            target_item_id: matched_baseline.map(|b| b.item_id),
+        };
+    }
+    if let Some(conflict) = explicit_conflict {
+        return UploadOptions {
+            conflict_behavior: Some(conflict),
+            if_match: None,
+            expected_c_tag: None,
+            target_item_id: None,
+        };
+    }
+
+    if let Some(baseline) = matched_baseline {
+        let e_tag = baseline
+            .e_tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let c_tag = baseline
+            .c_tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if e_tag.is_some() || c_tag.is_some() {
+            return UploadOptions {
+                conflict_behavior: None,
+                if_match: e_tag,
+                expected_c_tag: c_tag,
+                target_item_id: Some(baseline.item_id),
+            };
+        }
+    }
+
+    UploadOptions::default()
+}
+
+pub fn refresh_download_baseline_after_upload(
+    storage: &Storage,
+    local_path: &Path,
+    uploaded: &DriveItem,
+    used_options: &UploadOptions,
+) {
+    let had_baseline = storage
+        .get_download_baseline(local_path)
+        .ok()
+        .flatten()
+        .is_some();
+    if had_baseline || used_options.if_match.is_some() {
+        let baseline = DownloadBaseline {
+            local_path: crate::storage::drives::normalize_local_baseline_path(local_path),
+            drive_id: uploaded.effective_drive_id().to_string(),
+            item_id: uploaded.effective_item_id().to_string(),
+            parent_id: uploaded.parent_id.clone(),
+            parent_path: uploaded.parent_path.clone(),
+            remote_name: uploaded.name.clone(),
+            e_tag: uploaded.e_tag.clone(),
+            c_tag: uploaded.c_tag.clone(),
+            last_modified_at: uploaded.last_modified_at.clone(),
+            downloaded_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let _ = storage.upsert_download_baseline(&baseline);
+    }
+}
+
+fn upload_parent_matches_baseline(
+    baseline: &DownloadBaseline,
+    target_parent_id: Option<&str>,
+    target_parent_path: Option<&str>,
+) -> bool {
+    fn norm_pid(p: Option<&str>) -> Option<&str> {
+        p.map(str::trim).filter(|s| !s.is_empty() && *s != "root")
+    }
+    fn norm_pp(p: &str) -> String {
+        let t = p.trim().trim_end_matches('/');
+        if t.is_empty() || t == "/" {
+            String::new()
+        } else if t.starts_with('/') {
+            t.to_string()
+        } else {
+            format!("/{t}")
+        }
+    }
+
+    let t_pid = norm_pid(target_parent_id);
+    let b_pid = norm_pid(baseline.parent_id.as_deref());
+    let b_pp = norm_pp(&baseline.parent_path);
+    let t_pp = target_parent_path.map(norm_pp);
+
+    match (t_pid, b_pid) {
+        (None, None) => b_pp.is_empty(),
+        (None, Some(_)) => b_pp.is_empty() && t_pp.as_deref().unwrap_or("").is_empty(),
+        (Some(tp), Some(bp)) if tp == bp => true,
+        _ => t_pp
+            .as_deref()
+            .is_some_and(|tp| tp.eq_ignore_ascii_case(&b_pp)),
+    }
 }
 
 pub async fn search_items_combined(
@@ -1653,8 +1966,15 @@ fn build_tree<'a>(
     depth: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TreeNode>>> + Send + 'a>> {
     Box::pin(async move {
-        let items = graph.list_children(drive_id, parent_id, Some(200)).await?;
-        let _ = storage.upsert_drive_items(&items);
+        let page = graph
+            .list_children_detailed(drive_id, parent_id, Some(200))
+            .await?;
+        if page.complete {
+            let _ = storage.replace_folder_children(drive_id, parent_id, &page.items);
+        } else {
+            let _ = storage.upsert_drive_items(&page.items);
+        }
+        let items = page.items;
         let mut nodes = Vec::with_capacity(items.len());
         for item in items {
             let children = if item.is_folder && depth > 1 {

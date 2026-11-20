@@ -348,7 +348,7 @@ impl ImagePreviewOverlay {
         } else if let Some(err) = self
             .error
             .as_deref()
-            .or_else(|| app.preview_errors.get(&cur.id).map(String::as_str))
+            .or_else(|| app.image_preview_error_for(cur))
         {
             frame.render_widget(
                 Paragraph::new(Span::styled(

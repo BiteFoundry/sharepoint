@@ -3,8 +3,8 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 70;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 71;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 72;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 73;
 
 /// Initializes SQLite PRAGMAs, tables, indexes, and FTS5 virtual table.
 /// Returns `true` if `drive_items_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -42,7 +42,8 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drive_items_fts')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drive_items')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sites')
-                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drives')",
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='drives')
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_download_baselines')",
                     [],
                     |row| row.get(0),
                 )
@@ -144,6 +145,19 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             delta_link TEXT,
             history_next_link TEXT,
             last_synced_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS local_download_baselines (
+            local_path TEXT PRIMARY KEY,
+            drive_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            parent_id TEXT,
+            parent_path TEXT NOT NULL DEFAULT '',
+            remote_name TEXT NOT NULL,
+            e_tag TEXT,
+            c_tag TEXT,
+            last_modified_at TEXT,
+            downloaded_at TEXT NOT NULL
         );
         ",
     )

@@ -228,6 +228,15 @@ impl GraphClient {
         path_or_url: &str,
         body: &B,
     ) -> Result<T> {
+        self.post_json_with_headers(path_or_url, body, &[]).await
+    }
+
+    pub async fn post_json_with_headers<B: Serialize + ?Sized, T: DeserializeOwned>(
+        &self,
+        path_or_url: &str,
+        body: &B,
+        extra_headers: &[(&str, String)],
+    ) -> Result<T> {
         let url = self.resolve_url(path_or_url);
         let json_val = serde_json::to_value(body)?;
         let resp = self
@@ -235,7 +244,7 @@ impl GraphClient {
                 Method::POST,
                 &url,
                 RequestBody::Json(json_val),
-                &[],
+                extra_headers,
                 true,
                 STANDARD_REQUEST_TIMEOUT,
             )
@@ -350,6 +359,17 @@ impl GraphClient {
         bytes: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<T> {
+        self.put_bytes_with_headers(path_or_url, bytes, content_type, &[])
+            .await
+    }
+
+    pub async fn put_bytes_with_headers<T: DeserializeOwned>(
+        &self,
+        path_or_url: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+        extra_headers: &[(&str, String)],
+    ) -> Result<T> {
         let url = self.resolve_url(path_or_url);
         let resp = self
             .execute_with_retry(
@@ -359,7 +379,7 @@ impl GraphClient {
                     data: Arc::from(bytes),
                     content_type: content_type.map(str::to_string),
                 },
-                &[],
+                extra_headers,
                 true,
                 MEDIA_REQUEST_TIMEOUT,
             )

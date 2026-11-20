@@ -37,6 +37,72 @@ pub const DEFAULT_UPLOAD_CHUNK_BYTES: usize = 10 * 320 * 1024;
 /// Graph chunk alignment granularity (320 KiB).
 const UPLOAD_CHUNK_GRANULARITY: usize = 320 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictBehavior {
+    Replace,
+    Fail,
+    Rename,
+}
+
+impl ConflictBehavior {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replace => "replace",
+            Self::Fail => "fail",
+            Self::Rename => "rename",
+        }
+    }
+
+    pub fn parse_str(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "replace" => Ok(Self::Replace),
+            "fail" => Ok(Self::Fail),
+            "rename" => Ok(Self::Rename),
+            other => bail!("Invalid conflict behavior '{other}'; expected one of: replace, fail, rename"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UploadOptions {
+    pub conflict_behavior: Option<ConflictBehavior>,
+    /// Expected remote `eTag` (`If-Match`) for conditional replacement.
+    pub if_match: Option<String>,
+    /// Optional expected remote `cTag` checked up front alongside/when `eTag` is absent.
+    pub expected_c_tag: Option<String>,
+    /// Exact target item ID in `drive_id` when conditionally replacing an existing item.
+    pub target_item_id: Option<String>,
+}
+
+impl UploadOptions {
+    pub fn is_conditional(&self) -> bool {
+        self.if_match
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+            || self
+                .expected_c_tag
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FolderChildrenPage {
+    pub items: Vec<DriveItem>,
+    /// True only when the listing reached the final page without truncation by `limit`
+    /// or an unfollowed `@odata.nextLink`.
+    pub complete: bool,
+}
+
+pub fn is_precondition_failed_error(err: &anyhow::Error) -> bool {
+    let lower = format!("{err:#}").to_ascii_lowercase();
+    lower.contains("412")
+        || lower.contains("precondition failed")
+        || lower.contains("resourcemodified")
+        || lower.contains("itemalreadyexists")
+        || lower.contains("namealreadyexists")
+}
+
 // ---------------------------------------------------------------------------
 // Wire Deserialization Types
 // ---------------------------------------------------------------------------
@@ -541,8 +607,23 @@ impl GraphClient {
         parent_item_id: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<DriveItem>> {
+        Ok(self
+            .list_children_detailed(drive_id, parent_item_id, limit)
+            .await?
+            .items)
+    }
+
+    pub async fn list_children_detailed(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<FolderChildrenPage> {
         let enc_drive = urlencoding::encode(drive_id.trim());
-        let top = limit.unwrap_or(200).clamp(1, 200);
+        let top = match limit {
+            Some(cap) => cap.saturating_add(1).clamp(1, 200),
+            None => 200,
+        };
         let initial = match parent_item_id.map(str::trim).filter(|s| !s.is_empty() && *s != "root") {
             Some(pid) => {
                 let enc_item = urlencoding::encode(pid);
@@ -550,22 +631,7 @@ impl GraphClient {
             }
             None => format!("/drives/{enc_drive}/root/children?$top={top}"),
         };
-
-        let mut out = Vec::new();
-        let mut next: Option<String> = Some(initial);
-        while let Some(url) = next {
-            let page: GraphListPage<GraphDriveItem> = self.get_json(&url).await?;
-            for item in page.value {
-                out.push(item.into_model(drive_id));
-                if let Some(cap) = limit {
-                    if out.len() >= cap {
-                        return Ok(out);
-                    }
-                }
-            }
-            next = page.next_link;
-        }
-        Ok(out)
+        self.collect_children_pages(drive_id, initial, limit).await
     }
 
     pub async fn list_children_by_path(
@@ -574,29 +640,74 @@ impl GraphClient {
         path: &str,
         limit: Option<usize>,
     ) -> Result<Vec<DriveItem>> {
+        Ok(self
+            .list_children_by_path_detailed(drive_id, path, limit)
+            .await?
+            .items)
+    }
+
+    pub async fn list_children_by_path_detailed(
+        &self,
+        drive_id: &str,
+        path: &str,
+        limit: Option<usize>,
+    ) -> Result<FolderChildrenPage> {
         let encoded_path = encode_graph_path(path);
         if encoded_path.is_empty() {
-            return self.list_children(drive_id, None, limit).await;
+            return self.list_children_detailed(drive_id, None, limit).await;
         }
         let enc_drive = urlencoding::encode(drive_id.trim());
-        let top = limit.unwrap_or(200).clamp(1, 200);
+        let top = match limit {
+            Some(cap) => cap.saturating_add(1).clamp(1, 200),
+            None => 200,
+        };
+        let initial = format!("/drives/{enc_drive}/root:/{encoded_path}:/children?$top={top}");
+        self.collect_children_pages(drive_id, initial, limit).await
+    }
+
+    async fn collect_children_pages(
+        &self,
+        drive_id: &str,
+        initial_url: String,
+        limit: Option<usize>,
+    ) -> Result<FolderChildrenPage> {
         let mut out = Vec::new();
-        let mut next: Option<String> = Some(format!(
-            "/drives/{enc_drive}/root:/{encoded_path}:/children?$top={top}"
-        ));
+        let mut next: Option<String> = Some(initial_url);
+        let mut truncated = false;
+
         while let Some(url) = next {
             let page: GraphListPage<GraphDriveItem> = self.get_json(&url).await?;
-            for item in page.value {
+            let page_len = page.value.len();
+            for (idx, item) in page.value.into_iter().enumerate() {
+                if let Some(cap) = limit {
+                    if out.len() >= cap {
+                        truncated = true;
+                        break;
+                    }
+                }
                 out.push(item.into_model(drive_id));
                 if let Some(cap) = limit {
                     if out.len() >= cap {
-                        return Ok(out);
+                        if idx + 1 < page_len || page.next_link.is_some() || cap >= 200 {
+                            truncated = true;
+                        }
+                        return Ok(FolderChildrenPage {
+                            items: out,
+                            complete: !truncated,
+                        });
                     }
                 }
             }
+            if truncated {
+                break;
+            }
             next = page.next_link;
         }
-        Ok(out)
+
+        Ok(FolderChildrenPage {
+            items: out,
+            complete: !truncated,
+        })
     }
 
     pub async fn get_item(&self, drive_id: &str, item_id: &str) -> Result<DriveItem> {
@@ -618,6 +729,128 @@ impl GraphClient {
         };
         let raw: GraphDriveItem = self.get_json(&endpoint).await?;
         Ok(raw.into_model(drive_id))
+    }
+
+    async fn get_item_by_parent_and_name(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        file_name: &str,
+    ) -> Result<DriveItem> {
+        let enc_drive = urlencoding::encode(drive_id.trim());
+        let enc_name = urlencoding::encode(file_name.trim());
+        let endpoint = match parent_item_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "root")
+        {
+            Some(pid) => {
+                let enc_parent = urlencoding::encode(pid);
+                format!("/drives/{enc_drive}/items/{enc_parent}:/{enc_name}:")
+            }
+            None => format!("/drives/{enc_drive}/root:/{enc_name}:"),
+        };
+        let raw: GraphDriveItem = self.get_json(&endpoint).await?;
+        Ok(raw.into_model(drive_id))
+    }
+
+    /// Verifies exact drive/item target and compares the stored baseline tag (`eTag`/`cTag`)
+    /// against live server metadata up front before initiating any conditional write.
+    ///
+    /// Note: this detects already-changed files before upload starts and resolves the exact
+    /// item ID needed for `POST /drives/{driveId}/items/{itemId}/createUploadSession` with
+    /// `If-Match`. It does not provide commit-time locking across chunk transfer.
+    async fn preflight_conditional_target(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        file_name: &str,
+        options: &UploadOptions,
+    ) -> Result<DriveItem> {
+        let current = match options
+            .target_item_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(item_id) => self.get_item(drive_id, item_id).await.map_err(|err| {
+                if is_not_found_error(&err) {
+                    anyhow!(
+                        "Upload conflict (412 Precondition Failed) for '{file_name}': target item '{item_id}' no longer exists in drive '{drive_id}'. Cause: {err:#}"
+                    )
+                } else {
+                    err
+                }
+            })?,
+            None => self
+                .get_item_by_parent_and_name(drive_id, parent_item_id, file_name)
+                .await
+                .map_err(|err| {
+                    if is_not_found_error(&err) {
+                        anyhow!(
+                            "Upload conflict (412 Precondition Failed) for '{file_name}': target file does not exist in drive '{drive_id}' for conditional replacement. Cause: {err:#}"
+                        )
+                    } else {
+                        err
+                    }
+                })?,
+        };
+
+        if current.drive_id != drive_id && current.effective_drive_id() != drive_id {
+            bail!(
+                "Upload conflict (412 Precondition Failed) for '{file_name}': resolved item '{}' belongs to drive '{}' rather than '{drive_id}'.",
+                current.id,
+                current.drive_id
+            );
+        }
+
+        if let Some(expected_etag) = options
+            .if_match
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let actual = current.e_tag.as_deref().map(str::trim).unwrap_or("");
+            if actual != expected_etag {
+                bail!(
+                    "Upload conflict (412 Precondition Failed) for '{file_name}': remote file changed since expected version ({expected_etag}; server eTag is '{}'). Re-read/merge the latest remote file or pass --conflict replace to overwrite.",
+                    if actual.is_empty() { "<none>" } else { actual }
+                );
+            }
+        } else if let Some(expected_ctag) = options
+            .expected_c_tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let actual = current.c_tag.as_deref().map(str::trim).unwrap_or("");
+            if actual != expected_ctag {
+                bail!(
+                    "Upload conflict (412 Precondition Failed) for '{file_name}': remote file changed since expected cTag ({expected_ctag}; server cTag is '{}'). Re-read/merge the latest remote file or pass --conflict replace to overwrite.",
+                    if actual.is_empty() { "<none>" } else { actual }
+                );
+            }
+        }
+
+        Ok(current)
+    }
+
+    async fn preflight_fail_if_exists(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        file_name: &str,
+    ) -> Result<()> {
+        match self
+            .get_item_by_parent_and_name(drive_id, parent_item_id, file_name)
+            .await
+        {
+            Ok(existing) => bail!(
+                "Upload conflict (412 Precondition Failed) for '{file_name}': target file already exists (id: {}) and conflict behavior is 'fail'. Pass --conflict replace or --conflict rename.",
+                existing.id
+            ),
+            Err(err) if is_not_found_error(&err) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn list_item_versions(
@@ -896,6 +1129,10 @@ impl GraphClient {
             mime_type,
             size_bytes: total_written,
             is_image,
+            drive_id: Some(drive_id.to_string()),
+            item_id: Some(item_id.to_string()),
+            e_tag: None,
+            c_tag: None,
         })
     }
 
@@ -911,6 +1148,125 @@ impl GraphClient {
         bytes: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<DriveItem> {
+        self.upload_file_simple_with_options(
+            drive_id,
+            parent_item_id,
+            file_name,
+            bytes,
+            content_type,
+            &UploadOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn upload_file_simple_with_options(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        file_name: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+        options: &UploadOptions,
+    ) -> Result<DriveItem> {
+        // Conditional replacement: verify exact drive/item + baseline tag up front, then prefer
+        // the documented `POST /drives/{driveId}/items/{itemId}/createUploadSession` with
+        // `If-Match` for non-empty payloads, and exact item-ID `PUT /content` for zero-length files.
+        if options.is_conditional() {
+            let target = self
+                .preflight_conditional_target(drive_id, parent_item_id, file_name, options)
+                .await?;
+            if bytes.is_empty() {
+                return self
+                    .upload_item_content_put(
+                        drive_id,
+                        &target.id,
+                        file_name,
+                        bytes,
+                        content_type,
+                        options,
+                    )
+                    .await;
+            }
+            let mut resolved_opts = options.clone();
+            resolved_opts.target_item_id = Some(target.id);
+            return self
+                .upload_bytes_chunked_with_options_verified(
+                    drive_id,
+                    parent_item_id,
+                    file_name,
+                    &bytes,
+                    DEFAULT_UPLOAD_CHUNK_BYTES,
+                    &resolved_opts,
+                )
+                .await;
+        }
+
+        // Explicit `fail` or `rename` conflict policy on non-conditional uploads:
+        // prefer documented `createUploadSession` conflictBehavior for non-empty payloads,
+        // and check up front for zero-length `fail` so servers ignoring PUT headers still reject.
+        if matches!(
+            options.conflict_behavior,
+            Some(ConflictBehavior::Fail | ConflictBehavior::Rename)
+        ) {
+            if options.conflict_behavior == Some(ConflictBehavior::Fail) {
+                self.preflight_fail_if_exists(drive_id, parent_item_id, file_name)
+                    .await?;
+            }
+            if !bytes.is_empty() {
+                return self
+                    .upload_bytes_chunked_with_options_verified(
+                        drive_id,
+                        parent_item_id,
+                        file_name,
+                        &bytes,
+                        DEFAULT_UPLOAD_CHUNK_BYTES,
+                        options,
+                    )
+                    .await;
+            }
+        }
+
+        // Ordinary new upload or explicit replace (`< 4 MiB`)
+        self.upload_file_simple_put(
+            drive_id,
+            parent_item_id,
+            file_name,
+            bytes,
+            content_type,
+            options,
+        )
+        .await
+    }
+
+    async fn upload_item_content_put(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        file_name: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+        options: &UploadOptions,
+    ) -> Result<DriveItem> {
+        let enc_drive = urlencoding::encode(drive_id.trim());
+        let enc_item = urlencoding::encode(item_id.trim());
+        let endpoint = format!("/drives/{enc_drive}/items/{enc_item}/content");
+        let ct = content_type.unwrap_or_else(|| guess_mime_type(Path::new(file_name)));
+        let raw: GraphDriveItem = self
+            .put_bytes_with_headers(&endpoint, bytes, Some(ct), &[])
+            .await
+            .map_err(|err| annotate_upload_conflict(err, file_name, options))?;
+        Ok(raw.into_model(drive_id))
+    }
+
+    async fn upload_file_simple_put(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        file_name: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+        options: &UploadOptions,
+    ) -> Result<DriveItem> {
         let enc_drive = urlencoding::encode(drive_id.trim());
         let enc_name = urlencoding::encode(file_name.trim());
         let endpoint = match parent_item_id.map(str::trim).filter(|s| !s.is_empty() && *s != "root") {
@@ -921,7 +1277,10 @@ impl GraphClient {
             None => format!("/drives/{enc_drive}/root:/{enc_name}:/content"),
         };
         let ct = content_type.unwrap_or_else(|| guess_mime_type(Path::new(file_name)));
-        let raw: GraphDriveItem = self.put_bytes(&endpoint, bytes, Some(ct)).await?;
+        let raw: GraphDriveItem = self
+            .put_bytes_with_headers(&endpoint, bytes, Some(ct), &[])
+            .await
+            .map_err(|err| annotate_upload_conflict(err, file_name, options))?;
         Ok(raw.into_model(drive_id))
     }
 
@@ -950,22 +1309,65 @@ impl GraphClient {
         file_name: &str,
         conflict_behavior: &str,
     ) -> Result<UploadSession> {
+        self.create_upload_session_with_headers(
+            drive_id,
+            parent_item_id,
+            None,
+            file_name,
+            conflict_behavior,
+            &[],
+        )
+        .await
+    }
+
+    async fn create_upload_session_with_headers(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        target_item_id: Option<&str>,
+        file_name: &str,
+        conflict_behavior: &str,
+        extra_headers: &[(&str, String)],
+    ) -> Result<UploadSession> {
         let enc_drive = urlencoding::encode(drive_id.trim());
-        let enc_name = urlencoding::encode(file_name.trim());
-        let endpoint = match parent_item_id.map(str::trim).filter(|s| !s.is_empty() && *s != "root") {
-            Some(pid) => {
-                let enc_parent = urlencoding::encode(pid);
-                format!("/drives/{enc_drive}/items/{enc_parent}:/{enc_name}:/createUploadSession")
-            }
-            None => format!("/drives/{enc_drive}/root:/{enc_name}:/createUploadSession"),
+        let (endpoint, body) = if let Some(item_id) = target_item_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let enc_item = urlencoding::encode(item_id);
+            (
+                format!("/drives/{enc_drive}/items/{enc_item}/createUploadSession"),
+                json!({
+                    "item": {
+                        "@microsoft.graph.conflictBehavior": conflict_behavior,
+                    }
+                }),
+            )
+        } else {
+            let enc_name = urlencoding::encode(file_name.trim());
+            let ep = match parent_item_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "root")
+            {
+                Some(pid) => {
+                    let enc_parent = urlencoding::encode(pid);
+                    format!("/drives/{enc_drive}/items/{enc_parent}:/{enc_name}:/createUploadSession")
+                }
+                None => format!("/drives/{enc_drive}/root:/{enc_name}:/createUploadSession"),
+            };
+            (
+                ep,
+                json!({
+                    "item": {
+                        "@microsoft.graph.conflictBehavior": conflict_behavior,
+                        "name": file_name.trim(),
+                    }
+                }),
+            )
         };
-        let body = json!({
-            "item": {
-                "@microsoft.graph.conflictBehavior": conflict_behavior,
-                "name": file_name.trim(),
-            }
-        });
-        let session: GraphUploadSession = self.post_json(&endpoint, &body).await?;
+        let session: GraphUploadSession = self
+            .post_json_with_headers(&endpoint, &body, extra_headers)
+            .await?;
         Ok(UploadSession {
             upload_url: session.upload_url,
             expiration_date_time: session.expiration_date_time,
@@ -980,15 +1382,100 @@ impl GraphClient {
         bytes: &[u8],
         chunk_size: usize,
     ) -> Result<DriveItem> {
+        self.upload_bytes_chunked_with_options(
+            drive_id,
+            parent_item_id,
+            file_name,
+            bytes,
+            chunk_size,
+            &UploadOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn upload_bytes_chunked_with_options(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        file_name: &str,
+        bytes: &[u8],
+        chunk_size: usize,
+        options: &UploadOptions,
+    ) -> Result<DriveItem> {
+        let mut effective_opts = options.clone();
+        if effective_opts.is_conditional() {
+            let target = self
+                .preflight_conditional_target(drive_id, parent_item_id, file_name, &effective_opts)
+                .await?;
+            if bytes.is_empty() {
+                return self
+                    .upload_item_content_put(
+                        drive_id,
+                        &target.id,
+                        file_name,
+                        Vec::new(),
+                        None,
+                        &effective_opts,
+                    )
+                    .await;
+            }
+            effective_opts.target_item_id = Some(target.id);
+        } else if effective_opts.conflict_behavior == Some(ConflictBehavior::Fail) {
+            self.preflight_fail_if_exists(drive_id, parent_item_id, file_name)
+                .await?;
+        }
         if bytes.is_empty() {
             return self
-                .upload_file_simple(drive_id, parent_item_id, file_name, Vec::new(), None)
+                .upload_file_simple_put(
+                    drive_id,
+                    parent_item_id,
+                    file_name,
+                    Vec::new(),
+                    None,
+                    &effective_opts,
+                )
                 .await;
         }
+        self.upload_bytes_chunked_with_options_verified(
+            drive_id,
+            parent_item_id,
+            file_name,
+            bytes,
+            chunk_size,
+            &effective_opts,
+        )
+        .await
+    }
+
+    async fn upload_bytes_chunked_with_options_verified(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        file_name: &str,
+        bytes: &[u8],
+        chunk_size: usize,
+        options: &UploadOptions,
+    ) -> Result<DriveItem> {
         let aligned_chunk = align_chunk_size(chunk_size);
+        let behavior = options
+            .conflict_behavior
+            .unwrap_or(ConflictBehavior::Replace)
+            .as_str();
+        let mut session_headers: Vec<(&str, String)> = Vec::new();
+        if let Some(etag) = options.if_match.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            session_headers.push(("If-Match", etag.to_string()));
+        }
         let session = self
-            .create_upload_session(drive_id, parent_item_id, file_name, "replace")
-            .await?;
+            .create_upload_session_with_headers(
+                drive_id,
+                parent_item_id,
+                options.target_item_id.as_deref(),
+                file_name,
+                behavior,
+                &session_headers,
+            )
+            .await
+            .map_err(|err| annotate_upload_conflict(err, file_name, options))?;
         let total = bytes.len() as u64;
         let mut offset = 0usize;
         while offset < bytes.len() {
@@ -1002,7 +1489,8 @@ impl GraphClient {
                     (end - 1) as u64,
                     total,
                 )
-                .await?;
+                .await
+                .map_err(|err| annotate_upload_conflict(err, file_name, options))?;
             if status == StatusCode::OK || status == StatusCode::CREATED {
                 let item: GraphDriveItem = serde_json::from_value(val)
                     .context("Failed to deserialize completed chunked upload DriveItem")?;
@@ -1021,16 +1509,44 @@ impl GraphClient {
         bytes: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<DriveItem> {
+        self.upload_bytes_with_options(
+            drive_id,
+            parent_item_id,
+            file_name,
+            bytes,
+            content_type,
+            &UploadOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn upload_bytes_with_options(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        file_name: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+        options: &UploadOptions,
+    ) -> Result<DriveItem> {
         if (bytes.len() as u64) < SIMPLE_UPLOAD_MAX_BYTES {
-            self.upload_file_simple(drive_id, parent_item_id, file_name, bytes, content_type)
-                .await
+            self.upload_file_simple_with_options(
+                drive_id,
+                parent_item_id,
+                file_name,
+                bytes,
+                content_type,
+                options,
+            )
+            .await
         } else {
-            self.upload_bytes_chunked(
+            self.upload_bytes_chunked_with_options(
                 drive_id,
                 parent_item_id,
                 file_name,
                 &bytes,
                 DEFAULT_UPLOAD_CHUNK_BYTES,
+                options,
             )
             .await
         }
@@ -1042,6 +1558,24 @@ impl GraphClient {
         parent_item_id: Option<&str>,
         remote_file_name: Option<&str>,
         local_path: &Path,
+    ) -> Result<DriveItem> {
+        self.upload_local_file_with_options(
+            drive_id,
+            parent_item_id,
+            remote_file_name,
+            local_path,
+            &UploadOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn upload_local_file_with_options(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        remote_file_name: Option<&str>,
+        local_path: &Path,
+        options: &UploadOptions,
     ) -> Result<DriveItem> {
         let meta = tokio::fs::metadata(local_path)
             .await
@@ -1068,14 +1602,56 @@ impl GraphClient {
                 .with_context(|| format!("Failed to read file: {}", local_path.display()))?;
             let ct = guess_mime_type(local_path);
             return self
-                .upload_file_simple(drive_id, parent_item_id, &file_name, bytes, Some(ct))
-                .await;
+                .upload_file_simple_with_options(
+                    drive_id,
+                    parent_item_id,
+                    &file_name,
+                    bytes,
+                    Some(ct),
+                    options,
+                )
+                .await
+                .map_err(|err| annotate_local_upload_conflict(err, local_path, options));
         }
 
         // Streaming chunked upload session for >= 4 MiB files
+        let mut effective_opts = options.clone();
+        if effective_opts.is_conditional() {
+            let target = self
+                .preflight_conditional_target(drive_id, parent_item_id, &file_name, &effective_opts)
+                .await
+                .map_err(|err| annotate_local_upload_conflict(err, local_path, options))?;
+            effective_opts.target_item_id = Some(target.id);
+        } else if effective_opts.conflict_behavior == Some(ConflictBehavior::Fail) {
+            self.preflight_fail_if_exists(drive_id, parent_item_id, &file_name)
+                .await
+                .map_err(|err| annotate_local_upload_conflict(err, local_path, options))?;
+        }
+
+        let behavior = effective_opts
+            .conflict_behavior
+            .unwrap_or(ConflictBehavior::Replace)
+            .as_str();
+        let mut session_headers: Vec<(&str, String)> = Vec::new();
+        if let Some(etag) = effective_opts
+            .if_match
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            session_headers.push(("If-Match", etag.to_string()));
+        }
         let session = self
-            .create_upload_session(drive_id, parent_item_id, &file_name, "replace")
-            .await?;
+            .create_upload_session_with_headers(
+                drive_id,
+                parent_item_id,
+                effective_opts.target_item_id.as_deref(),
+                &file_name,
+                behavior,
+                &session_headers,
+            )
+            .await
+            .map_err(|err| annotate_local_upload_conflict(err, local_path, &effective_opts))?;
         let chunk_cap = DEFAULT_UPLOAD_CHUNK_BYTES;
         let mut file = tokio::fs::File::open(local_path)
             .await
@@ -1099,7 +1675,8 @@ impl GraphClient {
             let end_inclusive = offset + filled as u64 - 1;
             let (status, val) = self
                 .put_upload_chunk(&session.upload_url, &buf[..filled], offset, end_inclusive, total)
-                .await?;
+                .await
+                .map_err(|err| annotate_local_upload_conflict(err, local_path, &effective_opts))?;
             if status == StatusCode::OK || status == StatusCode::CREATED {
                 let item: GraphDriveItem = serde_json::from_value(val)
                     .context("Failed to deserialize completed chunked upload DriveItem")?;
@@ -1244,11 +1821,63 @@ impl GraphClient {
     }
 }
 
+fn is_not_found_error(err: &anyhow::Error) -> bool {
+    let lower = format!("{err:#}").to_ascii_lowercase();
+    lower.contains("404") || lower.contains("itemnotfound") || lower.contains("not found")
+}
+
 fn align_chunk_size(requested: usize) -> usize {
     if requested < UPLOAD_CHUNK_GRANULARITY {
         return requested.max(1);
     }
     (requested / UPLOAD_CHUNK_GRANULARITY) * UPLOAD_CHUNK_GRANULARITY
+}
+
+fn annotate_upload_conflict(
+    err: anyhow::Error,
+    file_name: &str,
+    options: &UploadOptions,
+) -> anyhow::Error {
+    if !is_precondition_failed_error(&err) {
+        return err;
+    }
+    if let Some(etag) = options.if_match.as_deref() {
+        anyhow!(
+            "Upload conflict (412 Precondition Failed) for '{file_name}': remote file changed since expected version ({etag}). Re-read/merge the latest remote file or pass --conflict replace to overwrite. Cause: {err:#}"
+        )
+    } else if options.conflict_behavior == Some(ConflictBehavior::Fail) {
+        anyhow!(
+            "Upload conflict (412 Precondition Failed) for '{file_name}': target file already exists and conflict behavior is 'fail'. Pass --conflict replace or --conflict rename. Cause: {err:#}"
+        )
+    } else {
+        err
+    }
+}
+
+fn annotate_local_upload_conflict(
+    err: anyhow::Error,
+    local_path: &Path,
+    options: &UploadOptions,
+) -> anyhow::Error {
+    if !is_precondition_failed_error(&err) {
+        return err;
+    }
+    let already_annotated = format!("{err:#}").contains("Upload conflict (412 Precondition Failed)");
+    if already_annotated {
+        anyhow!("{} Local file preserved at '{}'.", err, local_path.display())
+    } else if let Some(etag) = options.if_match.as_deref() {
+        anyhow!(
+            "Upload conflict (412 Precondition Failed): remote file changed since expected version ({etag}). Local file preserved at '{}'; re-download to merge or pass --conflict replace to overwrite. Cause: {err:#}",
+            local_path.display()
+        )
+    } else if options.conflict_behavior == Some(ConflictBehavior::Fail) {
+        anyhow!(
+            "Upload conflict (412 Precondition Failed): target file already exists and conflict behavior is 'fail'. Local file preserved at '{}'. Cause: {err:#}",
+            local_path.display()
+        )
+    } else {
+        err
+    }
 }
 
 #[cfg(test)]

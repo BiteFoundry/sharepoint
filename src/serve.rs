@@ -21,7 +21,10 @@ use crate::{
     auth::diagnose_access_token_scopes,
     cli,
     config::{self, AppConfig, Persona},
-    graph::GraphClient,
+    graph::{
+        drives::{is_precondition_failed_error, ConflictBehavior, UploadOptions},
+        GraphClient,
+    },
     resolver,
     storage::Storage,
 };
@@ -79,6 +82,8 @@ impl From<anyhow::Error> for ApiError {
     fn from(err: anyhow::Error) -> Self {
         let status = if cli::is_forbidden_error(&err) {
             StatusCode::FORBIDDEN
+        } else if is_precondition_failed_error(&err) {
+            StatusCode::PRECONDITION_FAILED
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
@@ -194,6 +199,12 @@ pub struct UploadBody {
     pub content_base64: Option<String>,
     #[serde(default)]
     pub content_text: Option<String>,
+    #[serde(default)]
+    pub item_id: Option<String>,
+    #[serde(default)]
+    pub if_match: Option<String>,
+    #[serde(default, alias = "conflict")]
+    pub conflict_behavior: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -524,6 +535,8 @@ async fn handle_item_content(
         "drive_id": item.drive_id,
         "name": item.name,
         "mime_type": item.mime_type,
+        "e_tag": item.e_tag,
+        "c_tag": item.c_tag,
         "size_bytes": bytes.len(),
         "content": String::from_utf8_lossy(&bytes),
     })))
@@ -583,17 +596,38 @@ async fn handle_upload(
         false,
     )
     .await?;
+    let explicit_conflict = match body.conflict_behavior.as_deref() {
+        Some(raw) => Some(ConflictBehavior::parse_str(raw).map_err(|e| ApiError::bad_request(e.to_string()))?),
+        None => None,
+    };
 
     let uploaded = if let Some(lp) = body.local_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        state
+        let path = PathBuf::from(lp);
+        let mut opts = cli::resolve_upload_options_for_local_file(
+            &state.storage,
+            &drive.id,
+            body.parent_id.as_deref(),
+            None,
+            body.file_name.as_deref(),
+            &path,
+            body.if_match.as_deref(),
+            explicit_conflict,
+        );
+        if let Some(id) = body.item_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            opts.target_item_id = Some(id.to_string());
+        }
+        let item = state
             .graph
-            .upload_local_file(
+            .upload_local_file_with_options(
                 &drive.id,
                 body.parent_id.as_deref(),
                 body.file_name.as_deref(),
-                &PathBuf::from(lp),
+                &path,
+                &opts,
             )
-            .await?
+            .await?;
+        cli::refresh_download_baseline_after_upload(&state.storage, &path, &item, &opts);
+        item
     } else if let Some(b64) = body.content_base64.as_deref() {
         let name = body
             .file_name
@@ -603,9 +637,15 @@ async fn handle_upload(
         let bytes = B64_STANDARD
             .decode(b64.trim())
             .map_err(|e| ApiError::bad_request(format!("Invalid base64: {e}")))?;
+        let opts = UploadOptions {
+            conflict_behavior: explicit_conflict,
+            if_match: body.if_match.clone(),
+            expected_c_tag: None,
+            target_item_id: body.item_id.clone(),
+        };
         state
             .graph
-            .upload_bytes(&drive.id, body.parent_id.as_deref(), name, bytes, None)
+            .upload_bytes_with_options(&drive.id, body.parent_id.as_deref(), name, bytes, None, &opts)
             .await?
     } else if let Some(text) = body.content_text {
         let name = body
@@ -613,14 +653,21 @@ async fn handle_upload(
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| ApiError::bad_request("file_name is required with content_text"))?;
+        let opts = UploadOptions {
+            conflict_behavior: explicit_conflict,
+            if_match: body.if_match.clone(),
+            expected_c_tag: None,
+            target_item_id: body.item_id.clone(),
+        };
         state
             .graph
-            .upload_bytes(
+            .upload_bytes_with_options(
                 &drive.id,
                 body.parent_id.as_deref(),
                 name,
                 text.into_bytes(),
                 Some("text/plain; charset=utf-8"),
+                &opts,
             )
             .await?
     } else {
@@ -789,7 +836,7 @@ async fn handle_download(
     .await?;
     let item = resolver::resolve_item(&state.graph, &state.storage, &drive.id, target, false).await?;
     let dest_dir = cli::normalize_download_dir(&state.config, body.dir.as_deref());
-    let downloaded = state
+    let mut downloaded = state
         .graph
         .download_item_to_file(
             item.effective_drive_id(),
@@ -800,6 +847,7 @@ async fn handle_download(
             &dest_dir,
         )
         .await?;
+    cli::record_download_baseline(&state.storage, &item, &mut downloaded);
     Ok(Json(serde_json::to_value(downloaded).unwrap()))
 }
 
