@@ -11,7 +11,7 @@ use ratatui::{
 
 use crate::{
     config::DensityMode,
-    models::format_human_size,
+    models::{format_human_size, VirtualListAvailability},
     ui::{
         app::{AppState, Focus, PendingPixelGraphic, UiState},
         hitmap::{ButtonId, HitMap, HitTarget},
@@ -141,13 +141,67 @@ pub fn draw_list(
 
     let items = app.sorted_visible_items();
     if items.is_empty() {
-        let empty_msg = if app.loading_folder {
-            " Loading items..."
-        } else {
-            " (Empty folder — press Ctrl+F to upload or n to create a folder)"
-        };
+        if app.loading_folder {
+            frame.render_widget(
+                Paragraph::new(Span::styled(" Loading items...", theme.muted_style())),
+                Rect::new(area.x, list_start_y, area.width, 1),
+            );
+            return;
+        }
+        if let Some((kind, status_opt)) = app.virtual_list_status_for_active() {
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            match status_opt {
+                Some(status) => match &status.availability {
+                    VirtualListAvailability::Unavailable { reason } => {
+                        lines.push(Line::from(Span::styled(
+                            format!(" {} unavailable: {}", kind.label(), reason),
+                            Style::default().fg(theme.warning),
+                        )));
+                        lines.push(Line::from(Span::styled(
+                            format!(" Last checked: {}", status.last_checked_at),
+                            theme.muted_style(),
+                        )));
+                        lines.push(Line::from(Span::styled(
+                            " Press Tab to switch to My Files or any SharePoint library.",
+                            theme.muted_style(),
+                        )));
+                    }
+                    VirtualListAvailability::Available => {
+                        lines.push(Line::from(Span::styled(
+                            format!(" (No {} items returned)", kind.label()),
+                            theme.muted_style(),
+                        )));
+                        lines.push(Line::from(Span::styled(
+                            format!(" Last checked: {}", status.last_checked_at),
+                            theme.muted_style(),
+                        )));
+                        lines.push(Line::from(Span::styled(
+                            " Press Tab to browse My Files or SharePoint libraries.",
+                            theme.muted_style(),
+                        )));
+                    }
+                },
+                None => {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            " (No {} items — press Tab to switch to My Files or a SharePoint library)",
+                            kind.label()
+                        ),
+                        theme.muted_style(),
+                    )));
+                }
+            }
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }),
+                Rect::new(area.x, list_start_y, area.width, list_h as u16),
+            );
+            return;
+        }
         frame.render_widget(
-            Paragraph::new(Span::styled(empty_msg, theme.muted_style())),
+            Paragraph::new(Span::styled(
+                " (Empty folder — press Ctrl+F to upload or n to create a folder)",
+                theme.muted_style(),
+            )),
             Rect::new(area.x, list_start_y, area.width, 1),
         );
         return;

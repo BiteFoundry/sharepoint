@@ -234,7 +234,8 @@ impl DaemonSharedState {
             | CoreEvent::DrivesUpdated { .. }
             | CoreEvent::FolderItemsUpdated { .. }
             | CoreEvent::RecentItemsUpdated(_)
-            | CoreEvent::SharedItemsUpdated(_) => {
+            | CoreEvent::SharedItemsUpdated(_)
+            | CoreEvent::VirtualListStatusUpdated { .. } => {
                 guard.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
                 guard.last_error = None;
             }
@@ -1656,6 +1657,7 @@ mod tests {
             active_drive_id: Some("drv-me".to_string()),
             active_parent_id: Some("folder-1".to_string()),
             active_site_id: None,
+            view_kind: crate::sync::FocusViewKind::Folder,
         });
         tokio::time::timeout(Duration::from_secs(1), harness.focus_rx.changed())
             .await

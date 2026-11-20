@@ -10,7 +10,8 @@ use anyhow::Result;
 #[cfg(not(windows))]
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyEventKind,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    Event as CrosstermEvent, EventStream, KeyEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -347,11 +348,12 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            EnableFocusChange
         )?;
         #[cfg(windows)]
         {
-            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableFocusChange)?;
             write_vt_mouse_enable(&mut stdout)?;
         }
         let keyboard_enhanced = if supports_keyboard_enhancement().unwrap_or(false) {
@@ -405,6 +407,7 @@ impl TerminalGuard {
         #[cfg(not(windows))]
         let _ = execute!(
             stdout,
+            DisableFocusChange,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -412,7 +415,7 @@ impl TerminalGuard {
         #[cfg(windows)]
         {
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(stdout, DisableFocusChange, DisableMouseCapture, LeaveAlternateScreen);
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -443,6 +446,7 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
         #[cfg(not(windows))]
         let _ = execute!(
             stdout,
+            DisableFocusChange,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -450,7 +454,7 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
         #[cfg(windows)]
         {
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(stdout, DisableFocusChange, DisableMouseCapture, LeaveAlternateScreen);
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -540,6 +544,10 @@ pub async fn run_tui(
                             app.ensure_inspector_loaded(&ui);
                             None
                         }
+                    }
+                    CrosstermEvent::FocusGained => {
+                        app.sync_ctrl.request(SyncCommand::FocusGained);
+                        None
                     }
                     _ => None,
                 };

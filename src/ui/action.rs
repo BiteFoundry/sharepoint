@@ -386,6 +386,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             Focus::List => {
                 if let Some(item) = app.active_item() {
                     if item.is_folder {
+                        app.initial_persona_library_selected = true;
                         let target_drive = item.effective_drive_id().to_string();
                         if app.active_drive_id().as_deref() != Some(target_drive.as_str()) {
                             app.active_source = ActiveViewSource::Drive {
@@ -425,24 +426,28 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
         }
         Action::OpenOneDriveRoot => {
+            app.initial_persona_library_selected = true;
             app.active_source = ActiveViewSource::OneDriveRoot;
             app.folder_stack.clear();
             ui.focus = Focus::List;
             app.navigate_to_active_folder(ui);
         }
         Action::OpenRecent => {
+            app.initial_persona_library_selected = true;
             app.active_source = ActiveViewSource::Recent;
             app.folder_stack.clear();
             ui.focus = Focus::List;
             app.navigate_to_active_folder(ui);
         }
         Action::OpenSharedWithMe => {
+            app.initial_persona_library_selected = true;
             app.active_source = ActiveViewSource::SharedWithMe;
             app.folder_stack.clear();
             ui.focus = Focus::List;
             app.navigate_to_active_folder(ui);
         }
         Action::SelectDrive { drive_id, label } => {
+            app.initial_persona_library_selected = true;
             app.active_source = ActiveViewSource::Drive { drive_id, label };
             app.folder_stack.clear();
             ui.focus = Focus::List;
@@ -786,39 +791,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                         .with_source(item.effective_drive_id(), item.content_revision()),
                 ));
             } else {
-                let graph = app.graph.clone();
-                let tx = app.ui_tx.clone();
-                let did = item.effective_drive_id().to_string();
-                let iid = item.effective_item_id().to_string();
-                let dl = item.download_url.clone();
-                let drive_for_msg = did.clone();
-                let item_id = item.id.clone();
-                let title = item.name.clone();
                 ui.toast(format!("Loading interactive HTML: {}...", item.name), ToastKind::Info);
-                tokio::spawn(async move {
-                    match graph
-                        .download_item_bytes(&did, &iid, dl.as_deref(), DEFAULT_TEXT_PREVIEW_MAX_BYTES)
-                        .await
-                    {
-                        Ok(bytes) => {
-                            let html = String::from_utf8_lossy(&bytes).into_owned();
-                            let _ = tx.send(UiMsg::HtmlPreviewReady {
-                                drive_id: drive_for_msg,
-                                item_id,
-                                title,
-                                html,
-                            });
-                        }
-                        Err(err) => {
-                            let _ = tx.send(UiMsg::PreviewFailed {
-                                drive_id: drive_for_msg,
-                                item_id,
-                                inflight_key: None,
-                                error: format!("{err:#}"),
-                            });
-                        }
-                    }
-                });
+                app.spawn_shared_text_fetch(&item, true);
             }
         }
         Action::ServeActiveHtml => {
@@ -981,6 +955,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::JumpToSearchHit(idx) => {
             if let Some(item) = app.search_results.get(idx).cloned() {
+                app.initial_persona_library_selected = true;
                 let target_drive = item.effective_drive_id().to_string();
                 app.active_source = ActiveViewSource::Drive {
                     drive_id: target_drive,
@@ -1127,6 +1102,7 @@ fn activate_nav_row(row_idx: usize, app: &mut AppState, ui: &mut UiState) {
             ..
         } => {
             if let Some(did) = drive_id {
+                app.initial_persona_library_selected = true;
                 app.active_source = ActiveViewSource::Drive {
                     drive_id: did,
                     label: label.clone(),

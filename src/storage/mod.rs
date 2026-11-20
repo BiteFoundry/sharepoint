@@ -11,9 +11,12 @@ use std::{
 
 use anyhow::Result;
 
-use crate::models::{
-    DownloadBaseline, DriveInfo, DriveItem, DriveSearchHit, PinnedTarget, SharePointSite,
-    SyncCursor,
+use crate::{
+    graph::drives::DriveDeltaChange,
+    models::{
+        DownloadBaseline, DriveInfo, DriveItem, DriveSearchHit, PinnedTarget, SharePointSite,
+        SyncCursor,
+    },
 };
 
 const MAX_READER_POOL_SIZE: usize = 4;
@@ -319,6 +322,39 @@ impl Storage {
     pub fn upsert_sync_cursor(&self, cursor: &SyncCursor) -> Result<()> {
         let conn = self.lock_conn()?;
         drives::upsert_sync_cursor(&conn, cursor)
+    }
+
+    pub fn delete_sync_cursor(&self, scope_key: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        drives::delete_sync_cursor(&conn, scope_key)
+    }
+
+    pub fn apply_delta_page(
+        &self,
+        drive_id: &str,
+        changes: &[DriveDeltaChange],
+        known_root_id: Option<&str>,
+        commit_cursor: Option<&SyncCursor>,
+    ) -> Result<drives::DeltaApplyOutcome> {
+        let mut conn = self.lock_conn()?;
+        drives::apply_delta_page(&mut conn, drive_id, changes, known_root_id, commit_cursor)
+    }
+
+    pub fn replace_drive_items_from_resync(
+        &self,
+        drive_id: &str,
+        changes: &[DriveDeltaChange],
+        known_root_id: Option<&str>,
+        commit_cursor: &SyncCursor,
+    ) -> Result<drives::DeltaApplyOutcome> {
+        let mut conn = self.lock_conn()?;
+        drives::replace_drive_items_from_resync(
+            &mut conn,
+            drive_id,
+            changes,
+            known_root_id,
+            commit_cursor,
+        )
     }
 
     // --- Download Baselines ---

@@ -18,13 +18,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     graph::{
-        client::GraphListPage,
+        client::{GraphGetOrGone, GraphListPage},
         media::{deduplicate_dest_path, guess_mime_type, sanitize_filename},
         GraphClient,
     },
     models::{
         DownloadedFile, DriveInfo, DriveItem, DriveItemVersion, ShareLinkResult, SharePointSite,
-        UploadSession,
+        UploadSession, VirtualListAvailability, VirtualListKind, VirtualListStatus,
     },
 };
 
@@ -92,6 +92,91 @@ pub struct FolderChildrenPage {
     /// True only when the listing reached the final page without truncation by `limit`
     /// or an unfollowed `@odata.nextLink`.
     pub complete: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum DriveDeltaChange {
+    Root {
+        id: String,
+    },
+    Upserted {
+        item: DriveItem,
+        has_explicit_parent_path: bool,
+    },
+    Deleted {
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct DriveDeltaPage {
+    pub changes: Vec<DriveDeltaChange>,
+    pub next_link: Option<String>,
+    pub delta_link: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DriveDeltaPageResponse {
+    Page(DriveDeltaPage),
+    ResyncRequired {
+        location: Option<String>,
+        detail: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketIoSubscription {
+    pub id: String,
+    pub notification_url: String,
+    pub expiration_date_time: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VirtualListFetch {
+    pub items: Vec<DriveItem>,
+    pub status: VirtualListStatus,
+}
+
+pub fn is_virtual_list_retired_or_unsupported(err: &anyhow::Error) -> Option<String> {
+    let raw = format!("{err:#}");
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("410 gone")
+        || lower.contains("404 not found")
+        || lower.contains("501 not implemented")
+        || lower.contains("notsupported")
+        || lower.contains("deprecated")
+        || lower.contains("retired")
+        || lower.contains("resourcenotfound")
+        || lower.contains("operationnotfound")
+        || lower.contains("itemnotfound")
+        || lower.contains("not supported")
+    {
+        let summary = if lower.contains("410") || lower.contains("deprecated") || lower.contains("retired") {
+            "Microsoft Graph retired this endpoint (no longer returns data)".to_string()
+        } else if lower.contains("404") || lower.contains("501") || lower.contains("notsupported") || lower.contains("not supported") {
+            "Endpoint unavailable or unsupported for this account".to_string()
+        } else {
+            "Virtual list unavailable from Microsoft Graph".to_string()
+        };
+        return Some(summary);
+    }
+    None
+}
+
+pub fn is_delta_unsupported_error(err: &anyhow::Error) -> bool {
+    let lower = format!("{err:#}").to_ascii_lowercase();
+    lower.contains("404 not found")
+        || lower.contains("501 not implemented")
+        || lower.contains("notsupported")
+}
+
+pub fn is_socketio_unsupported_error(err: &anyhow::Error) -> bool {
+    let lower = format!("{err:#}").to_ascii_lowercase();
+    lower.contains("404 not found")
+        || lower.contains("501 not implemented")
+        || lower.contains("403 forbidden")
+        || lower.contains("notsupported")
+        || lower.contains("accessdenied")
 }
 
 pub fn is_precondition_failed_error(err: &anyhow::Error) -> bool {
@@ -268,6 +353,33 @@ struct GraphRemoteItem {
 }
 
 #[derive(Debug, Deserialize)]
+struct GraphDeletedFacet {
+    #[serde(default)]
+    #[allow(dead_code)]
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphDeltaPageWire {
+    #[serde(default)]
+    value: Vec<GraphDriveItem>,
+    #[serde(rename = "@odata.nextLink", default)]
+    next_link: Option<String>,
+    #[serde(rename = "@odata.deltaLink", default)]
+    delta_link: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphSocketIoSubscriptionWire {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "notificationUrl")]
+    notification_url: String,
+    #[serde(rename = "expirationDateTime", default)]
+    expiration_date_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GraphDriveItem {
     id: String,
     #[serde(default)]
@@ -300,9 +412,32 @@ struct GraphDriveItem {
     shared: Option<GraphSharedFacet>,
     #[serde(rename = "remoteItem", default)]
     remote_item: Option<GraphRemoteItem>,
+    #[serde(default)]
+    deleted: Option<GraphDeletedFacet>,
+    #[serde(default)]
+    root: Option<serde_json::Value>,
 }
 
 impl GraphDriveItem {
+    fn into_delta_change(self, fallback_drive_id: &str) -> DriveDeltaChange {
+        if self.deleted.is_some() {
+            return DriveDeltaChange::Deleted { id: self.id };
+        }
+        if self.root.is_some() {
+            return DriveDeltaChange::Root { id: self.id };
+        }
+        let has_explicit_parent_path = self
+            .parent_reference
+            .as_ref()
+            .and_then(|p| p.path.as_deref())
+            .is_some_and(|s| !s.trim().is_empty());
+        let item = self.into_model(fallback_drive_id);
+        DriveDeltaChange::Upserted {
+            item,
+            has_explicit_parent_path,
+        }
+    }
+
     fn into_model(self, fallback_drive_id: &str) -> DriveItem {
         let remote_drive_id = self
             .remote_item
@@ -520,6 +655,113 @@ impl GraphClient {
             next = page.next_link;
         }
         Ok(out)
+    }
+
+    /// Queries `/me/drive/recent` or `/me/drive/sharedWithMe` while classifying Microsoft Graph
+    /// endpoint deprecation/retirement cleanly instead of letting root items or fake rankings intrude.
+    pub async fn fetch_virtual_list(
+        &self,
+        kind: VirtualListKind,
+        limit: usize,
+    ) -> Result<VirtualListFetch> {
+        let checked_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let res = match kind {
+            VirtualListKind::Recent => self.list_recent_items(limit).await,
+            VirtualListKind::SharedWithMe => self.list_shared_with_me(limit).await,
+        };
+        match res {
+            Ok(items) => Ok(VirtualListFetch {
+                items,
+                status: VirtualListStatus {
+                    availability: VirtualListAvailability::Available,
+                    last_checked_at: checked_at,
+                },
+            }),
+            Err(err) => {
+                if let Some(reason) = is_virtual_list_retired_or_unsupported(&err) {
+                    Ok(VirtualListFetch {
+                        items: Vec::new(),
+                        status: VirtualListStatus {
+                            availability: VirtualListAvailability::Unavailable { reason },
+                            last_checked_at: checked_at,
+                        },
+                    })
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-Drive Delta Tracking & Socket.IO Change Notifications (Graph v1.0)
+    // -----------------------------------------------------------------------
+
+    /// Acquires the latest delta cursor (`@odata.deltaLink`) for a drive before an initial folder load.
+    pub async fn get_drive_delta_latest_link(&self, drive_id: &str) -> Result<String> {
+        let enc_drive = urlencoding::encode(drive_id.trim());
+        let mut next = format!("/drives/{enc_drive}/root/delta?token=latest");
+        for _ in 0..8 {
+            let url = self.resolve_delta_url(&next)?;
+            let wire: GraphDeltaPageWire = self.get_json(&url).await?;
+            if let Some(delta_link) = wire.delta_link.filter(|s| !s.trim().is_empty()) {
+                return Ok(delta_link);
+            }
+            if let Some(next_link) = wire.next_link.filter(|s| !s.trim().is_empty()) {
+                next = next_link;
+                continue;
+            }
+            break;
+        }
+        bail!("Graph drive delta (?token=latest) returned no @odata.deltaLink for drive '{drive_id}'")
+    }
+
+    /// Fetches a single page of `driveItem: delta`, preserving HTTP `410 Gone` and its `Location` header.
+    pub async fn get_drive_delta_page(
+        &self,
+        drive_id: &str,
+        url_or_path: &str,
+    ) -> Result<DriveDeltaPageResponse> {
+        match self.get_json_or_gone::<GraphDeltaPageWire>(url_or_path).await? {
+            GraphGetOrGone::Gone { location, detail } => {
+                Ok(DriveDeltaPageResponse::ResyncRequired { location, detail })
+            }
+            GraphGetOrGone::Ok(wire) => {
+                let changes = wire
+                    .value
+                    .into_iter()
+                    .map(|raw| raw.into_delta_change(drive_id))
+                    .collect();
+                Ok(DriveDeltaPageResponse::Page(DriveDeltaPage {
+                    changes,
+                    next_link: wire.next_link.filter(|s| !s.trim().is_empty()),
+                    delta_link: wire.delta_link.filter(|s| !s.trim().is_empty()),
+                }))
+            }
+        }
+    }
+
+    /// Acquires a delegated Socket.IO change-notification endpoint for the given drive root
+    /// (`GET /drives/{driveId}/root/subscriptions/socketIo`, delegated `Files.Read` scope).
+    pub async fn get_drive_socketio_subscription(
+        &self,
+        drive_id: &str,
+    ) -> Result<SocketIoSubscription> {
+        let enc_drive = urlencoding::encode(drive_id.trim());
+        let wire: GraphSocketIoSubscriptionWire = self
+            .get_json_with_headers(
+                &format!("/drives/{enc_drive}/root/subscriptions/socketIo"),
+                &[("Content-Type", "application/json")],
+            )
+            .await?;
+        if wire.notification_url.trim().is_empty() {
+            bail!("Graph Socket.IO subscription returned empty notificationUrl for drive '{drive_id}'");
+        }
+        Ok(SocketIoSubscription {
+            id: wire.id.unwrap_or_default(),
+            notification_url: wire.notification_url,
+            expiration_date_time: wire.expiration_date_time,
+        })
     }
 
     // -----------------------------------------------------------------------

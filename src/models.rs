@@ -156,15 +156,24 @@ impl DriveItem {
             .unwrap_or(&self.id)
     }
 
-    /// Revision stamp combining remote content tags, modification timestamp, and byte size.
+    /// Revision stamp tracking content changes via `cTag` when present,
+    /// falling back to `eTag`/modification time/size when `cTag` is omitted (e.g. ODfB delta).
     pub fn content_revision(&self) -> String {
-        format!(
-            "{}|{}|{}|{}",
-            self.c_tag.as_deref().unwrap_or(""),
-            self.e_tag.as_deref().unwrap_or(""),
-            self.last_modified_at.as_deref().unwrap_or(""),
-            self.size
-        )
+        if let Some(ctag) = self
+            .c_tag
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            format!("ctag:{ctag}|{}", self.size)
+        } else {
+            format!(
+                "meta:{}|{}|{}",
+                self.e_tag.as_deref().unwrap_or(""),
+                self.last_modified_at.as_deref().unwrap_or(""),
+                self.size
+            )
+        }
     }
 
     pub fn extension(&self) -> Option<String> {
@@ -425,6 +434,41 @@ pub struct SyncCursor {
     pub last_synced_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtualListKind {
+    Recent,
+    SharedWithMe,
+}
+
+impl VirtualListKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Recent => "Recent",
+            Self::SharedWithMe => "Shared with Me",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum VirtualListAvailability {
+    Available,
+    Unavailable { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualListStatus {
+    pub availability: VirtualListAvailability,
+    pub last_checked_at: String,
+}
+
+impl VirtualListStatus {
+    pub fn is_available(&self) -> bool {
+        matches!(self.availability, VirtualListAvailability::Available)
+    }
+}
+
 /// Asynchronous events pushed from `SyncEngine` to TUI or live subscribers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
@@ -443,6 +487,10 @@ pub enum CoreEvent {
     },
     RecentItemsUpdated(Vec<DriveItem>),
     SharedItemsUpdated(Vec<DriveItem>),
+    VirtualListStatusUpdated {
+        kind: VirtualListKind,
+        status: VirtualListStatus,
+    },
     SyncStateChanged {
         busy: bool,
         summary: String,

@@ -3,6 +3,7 @@
 pub mod client;
 pub mod drives;
 pub mod media;
+pub mod socketio;
 
 use std::{
     sync::{Arc, OnceLock},

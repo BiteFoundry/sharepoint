@@ -16,10 +16,11 @@ use crate::graph::GraphClient;
 use crate::img_preview::{self, RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol};
 use crate::models::{
     CoreEvent, DownloadedFile, DriveInfo, DriveItem, DriveItemVersion, PinnedTarget,
-    ShareLinkResult, SharePointSite, UserProfile, POLL_RETRY_SUMMARY,
+    ShareLinkResult, SharePointSite, UserProfile, VirtualListKind, VirtualListStatus,
+    POLL_RETRY_SUMMARY,
 };
 use crate::storage::Storage;
-use crate::sync::{FocusTarget, SyncController};
+use crate::sync::{FocusTarget, FocusViewKind, SyncController};
 
 use super::hitmap::HitMap;
 use super::keymap::Keymap;
@@ -124,13 +125,13 @@ pub enum UiMsg {
         drives: Vec<DriveInfo>,
         pins: Vec<PinnedTarget>,
     },
-    FolderLoaded {
-        drive_id: String,
-        parent_id: Option<String>,
-        items: Vec<DriveItem>,
-    },
     RecentLoaded(Vec<DriveItem>),
     SharedLoaded(Vec<DriveItem>),
+    VirtualListLoaded {
+        kind: VirtualListKind,
+        items: Vec<DriveItem>,
+        status: VirtualListStatus,
+    },
     SiteDrivesLoaded {
         site_id: String,
         drives: Vec<DriveInfo>,
@@ -138,6 +139,7 @@ pub enum UiMsg {
     TextPreviewLoaded {
         drive_id: String,
         item_id: String,
+        revision: Option<String>,
         content: String,
     },
     VersionsLoaded {
@@ -148,6 +150,7 @@ pub enum UiMsg {
     PreviewFailed {
         drive_id: String,
         item_id: String,
+        revision: Option<String>,
         inflight_key: Option<String>,
         error: String,
     },
@@ -169,6 +172,7 @@ pub enum UiMsg {
     HtmlPreviewReady {
         drive_id: String,
         item_id: String,
+        revision: Option<String>,
         title: String,
         html: String,
     },
@@ -316,6 +320,10 @@ pub struct AppState {
     pub site_drives: HashMap<String, Vec<DriveInfo>>,
     pub pins: Vec<PinnedTarget>,
     pub active_source: ActiveViewSource,
+    /// True once initial SharePoint persona library selection has occurred or the user explicitly navigated.
+    pub initial_persona_library_selected: bool,
+    pub recent_status: Option<VirtualListStatus>,
+    pub shared_status: Option<VirtualListStatus>,
     /// Stack of `(item_id, display_name)` inside the currently selected drive.
     pub folder_stack: Vec<(String, String)>,
     pub current_items: Vec<DriveItem>,
@@ -331,6 +339,12 @@ pub struct AppState {
     pub raw_image_bytes: HashMap<String, Arc<[u8]>>,
     pub rendered_images: HashMap<String, RenderedTerminalImage>,
     pub inflight_previews: HashSet<String>,
+    /// Maps `txt:{drive_id}:{item_id}` -> revision currently being downloaded so inspector & overlays share one fetch.
+    pub inflight_text_revisions: HashMap<String, String>,
+    /// Tracks `txt:{drive_id}:{item_id}` keys whose in-flight download should also update/open an HTML preview overlay.
+    pub pending_html_overlay_fetches: HashSet<String>,
+    /// Deduplicates raw image byte downloads across inline and modal views for the same item revision.
+    pub inflight_raw_images: HashSet<String>,
     pub search_results: Vec<DriveItem>,
     pub active_selected_id: Option<String>,
     /// Lazy localhost Axum HTML server (`0 MB` idle until `o` is pressed).
@@ -367,6 +381,9 @@ impl AppState {
             site_drives: HashMap::new(),
             pins: Vec::new(),
             active_source,
+            initial_persona_library_selected: false,
+            recent_status: None,
+            shared_status: None,
             folder_stack: Vec::new(),
             current_items: Vec::new(),
             sort_mode: SortMode::NameAsc,
@@ -381,6 +398,9 @@ impl AppState {
             raw_image_bytes: HashMap::new(),
             rendered_images: HashMap::new(),
             inflight_previews: HashSet::new(),
+            inflight_text_revisions: HashMap::new(),
+            pending_html_overlay_fetches: HashSet::new(),
+            inflight_raw_images: HashSet::new(),
             search_results: Vec::new(),
             active_selected_id: None,
             html_server: NativeHtmlServer::new(),
@@ -391,9 +411,24 @@ impl AppState {
         match &self.active_source {
             ActiveViewSource::OneDriveRoot => self.my_drive.as_ref().map(|d| d.id.clone()),
             ActiveViewSource::Drive { drive_id, .. } => Some(drive_id.clone()),
-            ActiveViewSource::Recent | ActiveViewSource::SharedWithMe => {
-                self.my_drive.as_ref().map(|d| d.id.clone())
+            ActiveViewSource::Recent | ActiveViewSource::SharedWithMe => None,
+        }
+    }
+
+    /// Returns `Some((drive_id, parent_id))` only when viewing a real folder (`OneDriveRoot` or `Drive`),
+    /// never for virtual views (`Recent` / `SharedWithMe`).
+    pub fn active_folder_target(&self) -> Option<(String, Option<String>)> {
+        let drive_id = self.active_drive_id()?;
+        Some((drive_id, self.active_parent_id()))
+    }
+
+    pub fn virtual_list_status_for_active(&self) -> Option<(VirtualListKind, Option<&VirtualListStatus>)> {
+        match &self.active_source {
+            ActiveViewSource::Recent => Some((VirtualListKind::Recent, self.recent_status.as_ref())),
+            ActiveViewSource::SharedWithMe => {
+                Some((VirtualListKind::SharedWithMe, self.shared_status.as_ref()))
             }
+            _ => None,
         }
     }
 
@@ -519,8 +554,11 @@ impl AppState {
             });
             self.preview_errors.remove(&rev_key);
             self.preview_errors.remove(&item.id);
-            self.inflight_previews
-                .remove(&Self::text_preview_inflight_key(item.effective_drive_id(), &item.id));
+            let tkey = Self::text_preview_inflight_key(item.effective_drive_id(), &item.id);
+            self.inflight_previews.remove(&tkey);
+            self.inflight_text_revisions.remove(&tkey);
+            self.pending_html_overlay_fetches.remove(&tkey);
+            self.inflight_raw_images.retain(|k| !k.starts_with(&drive_item_prefix));
             self.inflight_previews.remove(&format!("ver:{rev_key}"));
         }
     }
@@ -550,7 +588,14 @@ impl AppState {
                     self.text_preview_revision = None;
                     ui.markup_cache = None;
                     if rev_mismatch {
-                        self.inflight_previews.remove(expected_err_key);
+                        let inflight_same_rev = self
+                            .inflight_text_revisions
+                            .get(expected_err_key)
+                            .is_some_and(|r| r == expected_rev);
+                        if !inflight_same_rev {
+                            self.inflight_previews.remove(expected_err_key);
+                            self.inflight_text_revisions.remove(expected_err_key);
+                        }
                         self.preview_errors.remove(expected_err_key);
                     }
                 }
@@ -638,6 +683,91 @@ impl AppState {
         )
     }
 
+    /// Shared text/HTML content fetcher used by both the reading pane (inspector) and open
+    /// `HtmlPreviewOverlay`, guaranteeing at most one `/content` download per item revision.
+    pub fn spawn_shared_text_fetch(&mut self, item: &DriveItem, notify_html_overlay: bool) {
+        let did = item.effective_drive_id().to_string();
+        let iid = item.effective_item_id().to_string();
+        let item_id = item.id.clone();
+        let rev = item.content_revision();
+        let tkey = Self::text_preview_inflight_key(&did, &item_id);
+
+        // If already cached at this exact revision, serve synchronously with 0 HTTP calls.
+        if let Some(cached) = self.text_preview_for(item).map(str::to_string) {
+            if notify_html_overlay {
+                let _ = self.ui_tx.send(UiMsg::HtmlPreviewReady {
+                    drive_id: did,
+                    item_id,
+                    revision: Some(rev),
+                    title: item.name.clone(),
+                    html: cached,
+                });
+            }
+            return;
+        }
+
+        // If the exact same revision is already in flight, coalesce instead of starting a second GET.
+        if self
+            .inflight_text_revisions
+            .get(&tkey)
+            .is_some_and(|in_rev| *in_rev == rev)
+        {
+            if notify_html_overlay {
+                self.pending_html_overlay_fetches.insert(tkey);
+            }
+            return;
+        }
+
+        self.inflight_previews.insert(tkey.clone());
+        self.inflight_text_revisions.insert(tkey.clone(), rev.clone());
+        if notify_html_overlay {
+            self.pending_html_overlay_fetches.insert(tkey.clone());
+        }
+
+        let graph = self.graph.clone();
+        let tx = self.ui_tx.clone();
+        let dl = item.download_url.clone();
+        let drive_for_msg = did.clone();
+        let id_for_msg = item_id.clone();
+        let title = item.name.clone();
+        let emit_html_ready = notify_html_overlay;
+
+        tokio::spawn(async move {
+            match graph
+                .download_item_bytes(&did, &iid, dl.as_deref(), DEFAULT_TEXT_PREVIEW_MAX_BYTES)
+                .await
+            {
+                Ok(bytes) => {
+                    let content = String::from_utf8_lossy(&bytes).into_owned();
+                    let _ = tx.send(UiMsg::TextPreviewLoaded {
+                        drive_id: drive_for_msg.clone(),
+                        item_id: id_for_msg.clone(),
+                        revision: Some(rev.clone()),
+                        content: content.clone(),
+                    });
+                    if emit_html_ready {
+                        let _ = tx.send(UiMsg::HtmlPreviewReady {
+                            drive_id: drive_for_msg,
+                            item_id: id_for_msg,
+                            revision: Some(rev),
+                            title,
+                            html: content,
+                        });
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::PreviewFailed {
+                        drive_id: drive_for_msg,
+                        item_id: id_for_msg,
+                        revision: Some(rev),
+                        inflight_key: Some(tkey),
+                        error: format!("{err:#}"),
+                    });
+                }
+            }
+        });
+    }
+
     pub fn refresh_open_overlays_for_items(&mut self, ui: &mut UiState) {
         let mut html_refresh: Option<DriveItem> = None;
         let mut image_refresh: Option<(DriveItem, String, u16, u16)> = None;
@@ -657,6 +787,9 @@ impl AppState {
                             if ov.revision.as_deref() != Some(new_rev.as_str()) {
                                 ov.revision = Some(new_rev);
                                 html_refresh = Some(updated.clone());
+                            } else if ov.title != updated.name {
+                                // Metadata-only rename: update overlay title without re-downloading body.
+                                ov.title = updated.name.clone();
                             }
                         }
                     }
@@ -698,28 +831,7 @@ impl AppState {
         }
 
         if let Some(item) = html_refresh {
-            let graph = self.graph.clone();
-            let tx = self.ui_tx.clone();
-            let did = item.effective_drive_id().to_string();
-            let iid = item.effective_item_id().to_string();
-            let dl = item.download_url.clone();
-            let drive_for_msg = did.clone();
-            let item_id = item.id.clone();
-            let title = item.name.clone();
-            tokio::spawn(async move {
-                if let Ok(bytes) = graph
-                    .download_item_bytes(&did, &iid, dl.as_deref(), DEFAULT_TEXT_PREVIEW_MAX_BYTES)
-                    .await
-                {
-                    let html = String::from_utf8_lossy(&bytes).into_owned();
-                    let _ = tx.send(UiMsg::HtmlPreviewReady {
-                        drive_id: drive_for_msg,
-                        item_id,
-                        title,
-                        html,
-                    });
-                }
-            });
+            self.spawn_shared_text_fetch(&item, true);
         }
 
         if let Some((item, key, cols, rows)) = image_refresh {
@@ -752,11 +864,23 @@ impl AppState {
 
         match &self.active_source {
             ActiveViewSource::Recent => {
+                self.sync_ctrl.set_focus(FocusTarget {
+                    active_drive_id: None,
+                    active_parent_id: None,
+                    active_site_id: None,
+                    view_kind: FocusViewKind::Recent,
+                });
                 tokio::spawn(async move {
-                    match graph.list_recent_items(50).await {
-                        Ok(items) => {
-                            let _ = storage.replace_recent_items(&items);
-                            let _ = tx.send(UiMsg::RecentLoaded(items));
+                    match graph.fetch_virtual_list(VirtualListKind::Recent, 50).await {
+                        Ok(fetch) => {
+                            if fetch.status.is_available() {
+                                let _ = storage.replace_recent_items(&fetch.items);
+                            }
+                            let _ = tx.send(UiMsg::VirtualListLoaded {
+                                kind: VirtualListKind::Recent,
+                                items: fetch.items,
+                                status: fetch.status,
+                            });
                         }
                         Err(err) => {
                             let _ = tx.send(UiMsg::TaskError {
@@ -769,11 +893,23 @@ impl AppState {
                 return;
             }
             ActiveViewSource::SharedWithMe => {
+                self.sync_ctrl.set_focus(FocusTarget {
+                    active_drive_id: None,
+                    active_parent_id: None,
+                    active_site_id: None,
+                    view_kind: FocusViewKind::SharedWithMe,
+                });
                 tokio::spawn(async move {
-                    match graph.list_shared_with_me(50).await {
-                        Ok(items) => {
-                            let _ = storage.replace_shared_items(&items);
-                            let _ = tx.send(UiMsg::SharedLoaded(items));
+                    match graph.fetch_virtual_list(VirtualListKind::SharedWithMe, 50).await {
+                        Ok(fetch) => {
+                            if fetch.status.is_available() {
+                                let _ = storage.replace_shared_items(&fetch.items);
+                            }
+                            let _ = tx.send(UiMsg::VirtualListLoaded {
+                                kind: VirtualListKind::SharedWithMe,
+                                items: fetch.items,
+                                status: fetch.status,
+                            });
                         }
                         Err(err) => {
                             let _ = tx.send(UiMsg::TaskError {
@@ -797,6 +933,7 @@ impl AppState {
             active_drive_id: Some(drive_id.clone()),
             active_parent_id: parent_id.clone(),
             active_site_id: None,
+            view_kind: FocusViewKind::Folder,
         });
 
         // Show cached children immediately, then refresh from Graph
@@ -810,35 +947,7 @@ impl AppState {
             }
         }
 
-        tokio::spawn(async move {
-            match graph
-                .list_children_detailed(&drive_id, parent_id.as_deref(), Some(200))
-                .await
-            {
-                Ok(page) => {
-                    if page.complete {
-                        let _ = storage.replace_folder_children(
-                            &drive_id,
-                            parent_id.as_deref(),
-                            &page.items,
-                        );
-                    } else {
-                        let _ = storage.upsert_drive_items(&page.items);
-                    }
-                    let _ = tx.send(UiMsg::FolderLoaded {
-                        drive_id,
-                        parent_id,
-                        items: page.items,
-                    });
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::TaskError {
-                        label: "List folder".into(),
-                        error: format!("{err:#}"),
-                    });
-                }
-            }
-        });
+        self.sync_ctrl.request(crate::sync::SyncCommand::SyncFolder { drive_id, parent_id });
     }
 
     pub fn ensure_inspector_loaded(&mut self, ui: &UiState) {
@@ -879,39 +988,7 @@ impl AppState {
         }
 
         if item.is_text_previewable() && self.text_preview_for(&item).is_none() {
-            let did = item.effective_drive_id().to_string();
-            let iid = item.effective_item_id().to_string();
-            let tkey = Self::text_preview_inflight_key(&did, &item_id);
-            if self.inflight_previews.insert(tkey.clone()) {
-                let graph = self.graph.clone();
-                let tx = self.ui_tx.clone();
-                let dl = item.download_url.clone();
-                let drive_for_msg = did.clone();
-                let id_for_msg = item_id.clone();
-                tokio::spawn(async move {
-                    match graph
-                        .download_item_bytes(&did, &iid, dl.as_deref(), DEFAULT_TEXT_PREVIEW_MAX_BYTES)
-                        .await
-                    {
-                        Ok(bytes) => {
-                            let content = String::from_utf8_lossy(&bytes).into_owned();
-                            let _ = tx.send(UiMsg::TextPreviewLoaded {
-                                drive_id: drive_for_msg,
-                                item_id: id_for_msg,
-                                content,
-                            });
-                        }
-                        Err(err) => {
-                            let _ = tx.send(UiMsg::PreviewFailed {
-                                drive_id: drive_for_msg,
-                                item_id: id_for_msg,
-                                inflight_key: Some(tkey),
-                                error: format!("{err:#}"),
-                            });
-                        }
-                    }
-                });
-            }
+            self.spawn_shared_text_fetch(&item, false);
         } else if item.is_image() && ui.inline_images {
             let cache_key = self.inline_image_cache_key(&item);
             if !self.rendered_images.contains_key(&cache_key) {
@@ -960,6 +1037,7 @@ impl AppState {
                         let _ = tx.send(UiMsg::PreviewFailed {
                             drive_id: did,
                             item_id,
+                            revision: None,
                             inflight_key: Some(cache_key),
                             error: "SVG vector image (image/svg+xml) cannot be raster-decoded — press o to open in browser".into(),
                         });
@@ -969,6 +1047,7 @@ impl AppState {
                         let _ = tx.send(UiMsg::PreviewFailed {
                             drive_id: did,
                             item_id,
+                            revision: None,
                             inflight_key: Some(cache_key),
                             error: format!("Unsupported image response ({kind:?}); refusing raster decode"),
                         });
@@ -987,12 +1066,20 @@ impl AppState {
                         let _ = tx.send(UiMsg::PreviewFailed {
                             drive_id: did,
                             item_id,
+                            revision: None,
                             inflight_key: Some(cache_key),
                             error: format!("{err:#}"),
                         });
                     }
                 }
             });
+            return;
+        }
+
+        if !self.inflight_raw_images.insert(raw_cache_key.clone()) {
+            // Another decode (e.g. inline vs modal) is already downloading this exact revision;
+            // allow re-requesting decode once `ImageBytesFetched` lands.
+            self.inflight_previews.remove(&cache_key);
             return;
         }
 
@@ -1020,6 +1107,7 @@ impl AppState {
                         let _ = tx.send(UiMsg::PreviewFailed {
                             drive_id: did,
                             item_id,
+                            revision: None,
                             inflight_key: Some(cache_key),
                             error: "SVG vector image (image/svg+xml) cannot be raster-decoded — press o to open in browser".into(),
                         });
@@ -1029,6 +1117,7 @@ impl AppState {
                         let _ = tx.send(UiMsg::PreviewFailed {
                             drive_id: did,
                             item_id,
+                            revision: None,
                             inflight_key: Some(cache_key),
                             error: format!("Unsupported image response ({kind:?}); refusing raster decode"),
                         });
@@ -1053,6 +1142,7 @@ impl AppState {
                                 let _ = decode_tx.send(UiMsg::PreviewFailed {
                                     drive_id: decode_did,
                                     item_id,
+                                    revision: None,
                                     inflight_key: Some(cache_key),
                                     error: format!("{err:#}"),
                                 });
@@ -1065,6 +1155,7 @@ impl AppState {
                     let _ = tx.send(UiMsg::PreviewFailed {
                         drive_id: did,
                         item_id,
+                        revision: None,
                         inflight_key: Some(cache_key),
                         error: format!("{err:#}"),
                     });
@@ -1150,13 +1241,16 @@ impl AppState {
             }
             CoreEvent::SitesUpdated(sites) => {
                 self.sites = sites;
-                // If SharePoint persona and still on empty default view, switch to first library when available
+                // Allow initial SharePoint startup library selection at most once, before user navigation.
                 if self.persona == Persona::SharePoint
+                    && !self.initial_persona_library_selected
                     && matches!(self.active_source, ActiveViewSource::OneDriveRoot)
+                    && self.folder_stack.is_empty()
                 {
                     if let Some(first_site) = self.sites.first() {
                         if let Some(drives) = self.site_drives.get(&first_site.id) {
                             if let Some(d) = drives.first() {
+                                self.initial_persona_library_selected = true;
                                 self.active_source = ActiveViewSource::Drive {
                                     drive_id: d.id.clone(),
                                     label: d.display_label(),
@@ -1170,11 +1264,13 @@ impl AppState {
             }
             CoreEvent::DrivesUpdated { site_id, drives } => {
                 let should_boot_sp = self.persona == Persona::SharePoint
+                    && !self.initial_persona_library_selected
                     && matches!(self.active_source, ActiveViewSource::OneDriveRoot)
-                    && self.current_items.is_empty()
+                    && self.folder_stack.is_empty()
                     && !drives.is_empty();
                 self.site_drives.insert(site_id, drives.clone());
                 if should_boot_sp {
+                    self.initial_persona_library_selected = true;
                     let d = &drives[0];
                     self.active_source = ActiveViewSource::Drive {
                         drive_id: d.id.clone(),
@@ -1189,9 +1285,7 @@ impl AppState {
                 parent_id,
                 items,
             } => {
-                if self.active_drive_id().as_deref() == Some(drive_id.as_str())
-                    && self.active_parent_id() == parent_id
-                {
+                if self.active_folder_target() == Some((drive_id, parent_id)) {
                     self.current_items = items;
                     self.loading_folder = false;
                     self.reconcile_selection_after_items_update(ui);
@@ -1204,6 +1298,8 @@ impl AppState {
                     self.current_items = items;
                     self.loading_folder = false;
                     self.reconcile_selection_after_items_update(ui);
+                    self.refresh_open_overlays_for_items(ui);
+                    self.ensure_inspector_loaded(ui);
                 }
             }
             CoreEvent::SharedItemsUpdated(items) => {
@@ -1211,6 +1307,33 @@ impl AppState {
                     self.current_items = items;
                     self.loading_folder = false;
                     self.reconcile_selection_after_items_update(ui);
+                    self.refresh_open_overlays_for_items(ui);
+                    self.ensure_inspector_loaded(ui);
+                }
+            }
+            CoreEvent::VirtualListStatusUpdated { kind, status } => {
+                let unavailable = !status.is_available();
+                match kind {
+                    VirtualListKind::Recent => {
+                        self.recent_status = Some(status);
+                        if unavailable && matches!(self.active_source, ActiveViewSource::Recent) {
+                            self.current_items.clear();
+                            self.active_selected_id = None;
+                            ui.list_scroll.selected_idx = None;
+                            self.loading_folder = false;
+                            self.clear_inspector_preview(ui);
+                        }
+                    }
+                    VirtualListKind::SharedWithMe => {
+                        self.shared_status = Some(status);
+                        if unavailable && matches!(self.active_source, ActiveViewSource::SharedWithMe) {
+                            self.current_items.clear();
+                            self.active_selected_id = None;
+                            ui.list_scroll.selected_idx = None;
+                            self.loading_folder = false;
+                            self.clear_inspector_preview(ui);
+                        }
+                    }
                 }
             }
             CoreEvent::SyncStateChanged { busy, summary } => {
@@ -1221,6 +1344,7 @@ impl AppState {
             }
             CoreEvent::SyncError(err) => {
                 self.sync_busy = false;
+                self.loading_folder = false;
                 ui.toast(format!("Sync error: {err}"), ToastKind::Error);
             }
         }
@@ -1249,10 +1373,15 @@ impl AppState {
                     }
                 }
                 self.pins = pins;
-                if self.persona == Persona::SharePoint {
+                if self.persona == Persona::SharePoint
+                    && !self.initial_persona_library_selected
+                    && matches!(self.active_source, ActiveViewSource::OneDriveRoot)
+                    && self.folder_stack.is_empty()
+                {
                     if let Some(site) = self.sites.first() {
                         if let Some(ds) = self.site_drives.get(&site.id) {
                             if let Some(d) = ds.first() {
+                                self.initial_persona_library_selected = true;
                                 self.active_source = ActiveViewSource::Drive {
                                     drive_id: d.id.clone(),
                                     label: d.display_label(),
@@ -1263,14 +1392,8 @@ impl AppState {
                 }
                 self.load_active_folder(ui);
             }
-            UiMsg::FolderLoaded {
-                drive_id,
-                parent_id,
-                items,
-            } => {
-                if self.active_drive_id().as_deref() == Some(drive_id.as_str())
-                    && self.active_parent_id() == parent_id
-                {
+            UiMsg::RecentLoaded(items) => {
+                if matches!(self.active_source, ActiveViewSource::Recent) {
                     self.current_items = items;
                     self.loading_folder = false;
                     self.reconcile_selection_after_items_update(ui);
@@ -1278,28 +1401,44 @@ impl AppState {
                     self.ensure_inspector_loaded(ui);
                 }
             }
-            UiMsg::RecentLoaded(items) => {
-                if matches!(self.active_source, ActiveViewSource::Recent) {
-                    self.current_items = items;
-                    self.loading_folder = false;
-                    let sorted = self.sorted_visible_items();
-                    let first = sorted.first();
-                    ui.list_scroll.selected_idx = first.map(|_| 0);
-                    self.active_selected_id = first.map(|i| i.id.clone());
-                    self.sync_inspector_preview_for(first, ui);
-                    self.ensure_inspector_loaded(ui);
-                }
-            }
             UiMsg::SharedLoaded(items) => {
                 if matches!(self.active_source, ActiveViewSource::SharedWithMe) {
                     self.current_items = items;
                     self.loading_folder = false;
-                    let sorted = self.sorted_visible_items();
-                    let first = sorted.first();
-                    ui.list_scroll.selected_idx = first.map(|_| 0);
-                    self.active_selected_id = first.map(|i| i.id.clone());
-                    self.sync_inspector_preview_for(first, ui);
+                    self.reconcile_selection_after_items_update(ui);
+                    self.refresh_open_overlays_for_items(ui);
                     self.ensure_inspector_loaded(ui);
+                }
+            }
+            UiMsg::VirtualListLoaded {
+                kind,
+                items,
+                status,
+            } => {
+                let is_avail = status.is_available();
+                let active_matches = match kind {
+                    VirtualListKind::Recent => {
+                        self.recent_status = Some(status);
+                        matches!(self.active_source, ActiveViewSource::Recent)
+                    }
+                    VirtualListKind::SharedWithMe => {
+                        self.shared_status = Some(status);
+                        matches!(self.active_source, ActiveViewSource::SharedWithMe)
+                    }
+                };
+                if active_matches {
+                    self.loading_folder = false;
+                    if is_avail {
+                        self.current_items = items;
+                        self.reconcile_selection_after_items_update(ui);
+                        self.refresh_open_overlays_for_items(ui);
+                        self.ensure_inspector_loaded(ui);
+                    } else {
+                        self.current_items.clear();
+                        self.active_selected_id = None;
+                        ui.list_scroll.selected_idx = None;
+                        self.clear_inspector_preview(ui);
+                    }
                 }
             }
             UiMsg::SiteDrivesLoaded { site_id, drives } => {
@@ -1308,13 +1447,51 @@ impl AppState {
             UiMsg::TextPreviewLoaded {
                 drive_id,
                 item_id,
+                revision,
                 content,
             } => {
                 let err_key = Self::text_preview_inflight_key(&drive_id, &item_id);
+                if revision.as_ref().is_some_and(|rev| self.inflight_text_revisions.get(&err_key) != Some(rev)) {
+                    return;
+                }
                 self.inflight_previews.remove(&err_key);
+                self.inflight_text_revisions.remove(&err_key);
+                let want_html_overlay = self.pending_html_overlay_fetches.remove(&err_key);
+                let matched_item = self
+                    .current_items
+                    .iter()
+                    .find(|it| it.effective_drive_id() == drive_id && it.id == item_id)
+                    .cloned();
+                let current_rev = matched_item.as_ref().map(DriveItem::content_revision);
+                if revision.is_some() && current_rev != revision {
+                    return;
+                }
                 if self.is_active_text_item(&drive_id, &item_id) {
                     self.preview_errors.remove(&err_key);
-                    self.set_text_preview(&drive_id, &item_id, content);
+                    self.set_text_preview(&drive_id, &item_id, content.clone());
+                }
+                let mut updated_open_overlay = false;
+                for overlay in &mut ui.overlays {
+                    if let Overlay::HtmlPreview(ov) = overlay {
+                        if ov.item_id.as_deref() == Some(item_id.as_str())
+                            && ov.drive_id.as_deref().is_none_or(|d| d == drive_id)
+                        {
+                            let title = matched_item
+                                .as_ref()
+                                .map(|it| it.name.clone())
+                                .unwrap_or_else(|| ov.title.clone());
+                            ov.replace_html(title, content.clone(), current_rev.clone());
+                            updated_open_overlay = true;
+                        }
+                    }
+                }
+                if want_html_overlay && !updated_open_overlay {
+                    if let Some(it) = matched_item {
+                        let mut ov = HtmlPreviewOverlay::new(it.name, content, Some(item_id));
+                        ov.drive_id = Some(drive_id);
+                        ov.revision = current_rev;
+                        ui.push_overlay(Overlay::HtmlPreview(ov));
+                    }
                 }
             }
             UiMsg::VersionsLoaded {
@@ -1328,12 +1505,30 @@ impl AppState {
             UiMsg::PreviewFailed {
                 drive_id,
                 item_id,
+                revision,
                 inflight_key,
                 error,
             } => {
+                if let Some(rev) = revision.as_ref() {
+                    let tracked = inflight_key.as_ref().and_then(|key| self.inflight_text_revisions.get(key));
+                    if tracked != Some(rev) {
+                        return;
+                    }
+                }
                 let is_text_req = inflight_key.as_deref().is_none_or(|k| k.starts_with("txt:"));
                 if let Some(key) = inflight_key {
                     self.inflight_previews.remove(&key);
+                    self.inflight_text_revisions.remove(&key);
+                    self.pending_html_overlay_fetches.remove(&key);
+                }
+                if !is_text_req {
+                    if let Some(it) = self
+                        .current_items
+                        .iter()
+                        .find(|it| it.effective_drive_id() == drive_id && it.id == item_id)
+                    {
+                        self.inflight_raw_images.remove(&Self::item_revision_key(it));
+                    }
                 }
                 if is_text_req {
                     if self.is_active_text_item(&drive_id, &item_id) {
@@ -1353,10 +1548,13 @@ impl AppState {
                 }
             }
             UiMsg::ImageBytesFetched { cache_key, bytes } => {
+                self.inflight_raw_images.remove(&cache_key);
                 if self.raw_image_bytes.len() >= 8 {
                     self.raw_image_bytes.clear();
                 }
                 self.raw_image_bytes.insert(cache_key, bytes);
+                // If an inline or modal image view was waiting on these bytes, trigger decode now.
+                self.ensure_inspector_loaded(ui);
             }
             UiMsg::ImageDecoded {
                 cache_key,
@@ -1402,6 +1600,7 @@ impl AppState {
             UiMsg::HtmlPreviewReady {
                 drive_id,
                 item_id,
+                revision,
                 title,
                 html,
             } => {
@@ -1410,6 +1609,9 @@ impl AppState {
                     .iter()
                     .find(|it| it.effective_drive_id() == drive_id && it.id == item_id)
                     .map(DriveItem::content_revision);
+                if revision.is_some() && current_rev != revision {
+                    return;
+                }
                 if self.is_active_text_item(&drive_id, &item_id) {
                     self.preview_errors
                         .remove(&Self::text_preview_inflight_key(&drive_id, &item_id));
@@ -1692,6 +1894,7 @@ mod tests {
                 UiMsg::TextPreviewLoaded {
                     drive_id: "drv-1".into(),
                     item_id: id.clone(),
+                    revision: None,
                     content: format!("# Document {idx:02}\n\nBody marker {idx:02}.\n"),
                 },
                 &mut ui,
@@ -1762,8 +1965,8 @@ mod tests {
         // PreviewFailed and TextPreviewLoaded must not clear Drive Two's pending request/error.
         let doc_d2 = make_text_file("drv-2", "shared-id", "spec.md", "text/markdown");
         let d2_inflight = AppState::text_preview_inflight_key("drv-2", "shared-id");
-        app.apply_ui_msg(
-            UiMsg::FolderLoaded {
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
                 drive_id: "drv-2".into(),
                 parent_id: None,
                 items: vec![doc_d2.clone()],
@@ -1778,6 +1981,7 @@ mod tests {
             UiMsg::PreviewFailed {
                 drive_id: "drv-1".into(),
                 item_id: "shared-id".into(),
+                revision: None,
                 inflight_key: Some(stale_inflight.clone()),
                 error: "drv-1 timeout".into(),
             },
@@ -1792,6 +1996,7 @@ mod tests {
             UiMsg::PreviewFailed {
                 drive_id: "drv-2".into(),
                 item_id: "shared-id".into(),
+                revision: None,
                 inflight_key: Some(d2_inflight.clone()),
                 error: "drv-2 403".into(),
             },
@@ -1804,6 +2009,7 @@ mod tests {
             UiMsg::TextPreviewLoaded {
                 drive_id: "drv-1".into(),
                 item_id: "shared-id".into(),
+                revision: None,
                 content: "# Stale Drive One Body\n".into(),
             },
             &mut ui,
@@ -1824,6 +2030,7 @@ mod tests {
             UiMsg::TextPreviewLoaded {
                 drive_id: "drv-2".into(),
                 item_id: "shared-id".into(),
+                revision: None,
                 content: "# Drive Two Spec\n".into(),
             },
             &mut ui,
@@ -2031,6 +2238,7 @@ mod tests {
             UiMsg::TextPreviewLoaded {
                 drive_id: "drv-1".into(),
                 item_id: "file-1".into(),
+                revision: None,
                 content: "LATE_A_MUST_NOT_REPLACE_B".into(),
             },
             &mut ui,
@@ -2060,6 +2268,7 @@ mod tests {
             UiMsg::HtmlPreviewReady {
                 drive_id: "drv-1".into(),
                 item_id: "html-1".into(),
+                revision: None,
                 title: "report.html".into(),
                 html: requested_html.clone(),
             },
@@ -2428,6 +2637,307 @@ mod tests {
             4,
             "drv-2 image must not reuse drv-1 raw_image_bytes for same item_id"
         );
+        // Verify HTML overlay + inspector shared a single GET /content for v2 (1 for v1 + 1 for v2 = 2 total)
+        assert_eq!(
+            st.html_hits.load(Ordering::SeqCst),
+            2,
+            "HTML inspector + open HtmlPreviewOverlay must share one /content download per revision"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn view_preservation_across_recent_shared_myfiles_sites_update_and_retired_virtual_lists() {
+        let (mut app, mut ui, _rx) = test_app_and_ui_with_base_url(None);
+        app.persona = Persona::SharePoint;
+        app.my_drive = Some(DriveInfo {
+            id: "drv-me".into(),
+            name: "OneDrive".into(),
+            drive_type: "business".into(),
+            ..Default::default()
+        });
+        let sp_site = SharePointSite {
+            id: "site-eng".into(),
+            name: "engineering".into(),
+            display_name: "Engineering Hub".into(),
+            is_followed: true,
+            ..Default::default()
+        };
+        let sp_drive = DriveInfo {
+            id: "drv-sp-eng".into(),
+            name: "Documents".into(),
+            drive_type: "documentLibrary".into(),
+            site_id: Some("site-eng".into()),
+            site_name: Some("Engineering Hub".into()),
+            ..Default::default()
+        };
+        app.site_drives.insert("site-eng".into(), vec![sp_drive.clone()]);
+
+        // 1. Even if MyDrive root items arrived first, initial DrivesUpdated switches SharePoint persona once to first library
+        app.current_items = vec![DriveItem {
+            id: "my-early".into(),
+            drive_id: "drv-me".into(),
+            name: "early.md".into(),
+            ..Default::default()
+        }];
+        app.site_drives.clear();
+        app.apply_core_event(CoreEvent::SitesUpdated(vec![sp_site.clone()]), &mut ui);
+        assert_eq!(app.active_source, ActiveViewSource::OneDriveRoot);
+        assert!(!app.initial_persona_library_selected);
+        app.apply_core_event(
+            CoreEvent::DrivesUpdated {
+                site_id: "site-eng".into(),
+                drives: vec![sp_drive.clone()],
+            },
+            &mut ui,
+        );
+        assert!(matches!(
+            &app.active_source,
+            ActiveViewSource::Drive { drive_id, .. } if drive_id == "drv-sp-eng"
+        ));
+        assert!(app.initial_persona_library_selected);
+
+        // 2. User navigates to OneDrive > My Files: subsequent SitesUpdated MUST NOT hijack view
+        dispatch(Action::OpenOneDriveRoot, &mut app, &mut ui);
+        assert_eq!(app.active_source, ActiveViewSource::OneDriveRoot);
+        app.current_items = vec![
+            DriveItem {
+                id: "my-a".into(),
+                drive_id: "drv-me".into(),
+                name: "a.md".into(),
+                ..Default::default()
+            },
+            DriveItem {
+                id: "my-b".into(),
+                drive_id: "drv-me".into(),
+                name: "b.md".into(),
+                ..Default::default()
+            },
+        ];
+        app.active_selected_id = Some("my-b".into());
+        app.apply_core_event(CoreEvent::SitesUpdated(vec![sp_site.clone()]), &mut ui);
+        assert_eq!(app.active_source, ActiveViewSource::OneDriveRoot);
+        assert_eq!(app.active_selected_id.as_deref(), Some("my-b"));
+
+        // Stale FolderItemsUpdated from another drive or subfolder must not replace My Files
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "drv-sp-eng".into(),
+                parent_id: None,
+                items: vec![DriveItem {
+                    id: "sp-other".into(),
+                    drive_id: "drv-sp-eng".into(),
+                    name: "sp.md".into(),
+                    ..Default::default()
+                }],
+            },
+            &mut ui,
+        );
+        assert_eq!(app.current_items.len(), 2);
+        assert_eq!(app.active_selected_id.as_deref(), Some("my-b"));
+
+        // 3. Switch to Recent: root FolderItemsUpdated MUST NOT clobber Recent, and RecentItemsUpdated preserves selection by ID
+        dispatch(Action::OpenRecent, &mut app, &mut ui);
+        assert_eq!(app.active_source, ActiveViewSource::Recent);
+        app.apply_core_event(
+            CoreEvent::RecentItemsUpdated(vec![
+                DriveItem {
+                    id: "rec-1".into(),
+                    drive_id: "drv-me".into(),
+                    name: "alpha-rec.md".into(),
+                    ..Default::default()
+                },
+                DriveItem {
+                    id: "rec-2".into(),
+                    drive_id: "drv-me".into(),
+                    name: "beta-rec.md".into(),
+                    ..Default::default()
+                },
+            ]),
+            &mut ui,
+        );
+        app.active_selected_id = Some("rec-2".into());
+
+        // Inject drv-me root FolderItemsUpdated while viewing Recent -> must be ignored!
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "drv-me".into(),
+                parent_id: None,
+                items: vec![DriveItem {
+                    id: "my-a".into(),
+                    drive_id: "drv-me".into(),
+                    name: "a.md".into(),
+                    ..Default::default()
+                }],
+            },
+            &mut ui,
+        );
+        assert_eq!(app.active_source, ActiveViewSource::Recent);
+        assert!(app.current_items.iter().any(|i| i.id == "rec-2"));
+        assert!(!app.current_items.iter().any(|i| i.id == "my-a"));
+        assert_eq!(app.active_selected_id.as_deref(), Some("rec-2"));
+
+        // Re-deliver RecentItemsUpdated with an added item -> selection stays on rec-2
+        app.apply_core_event(
+            CoreEvent::RecentItemsUpdated(vec![
+                DriveItem {
+                    id: "rec-0".into(),
+                    drive_id: "drv-me".into(),
+                    name: "aaa-new.md".into(),
+                    ..Default::default()
+                },
+                DriveItem {
+                    id: "rec-1".into(),
+                    drive_id: "drv-me".into(),
+                    name: "alpha-rec.md".into(),
+                    ..Default::default()
+                },
+                DriveItem {
+                    id: "rec-2".into(),
+                    drive_id: "drv-me".into(),
+                    name: "beta-rec.md".into(),
+                    ..Default::default()
+                },
+            ]),
+            &mut ui,
+        );
+        assert_eq!(app.active_selected_id.as_deref(), Some("rec-2"));
+
+        // 4. Switch to SharedWithMe and simulate retired API -> shows status + timestamp, never root items
+        dispatch(Action::OpenSharedWithMe, &mut app, &mut ui);
+        app.apply_core_event(
+            CoreEvent::VirtualListStatusUpdated {
+                kind: VirtualListKind::SharedWithMe,
+                status: VirtualListStatus {
+                    availability: crate::models::VirtualListAvailability::Unavailable {
+                        reason: "Microsoft Graph retired this endpoint".into(),
+                    },
+                    last_checked_at: "2026-11-20T10:00:00Z".into(),
+                },
+            },
+            &mut ui,
+        );
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "drv-me".into(),
+                parent_id: None,
+                items: vec![DriveItem {
+                    id: "root-intruder".into(),
+                    drive_id: "drv-me".into(),
+                    name: "intruder.txt".into(),
+                    ..Default::default()
+                }],
+            },
+            &mut ui,
+        );
+        assert!(app.current_items.is_empty());
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let mut hm = HitMap::default();
+                crate::ui::drive_view::draw_list(f, f.area(), &app, &mut ui, &mut hm);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let screen: String = (0..20)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Shared with Me unavailable"), "{screen}");
+        assert!(screen.contains("2026-11-20T10:00:00Z"), "{screen}");
+        assert!(!screen.contains("intruder.txt"), "{screen}");
+    }
+
+    #[tokio::test]
+    async fn metadata_only_rename_and_duplicate_notifications_avoid_extra_content_downloads() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = Arc::clone(&hits);
+        let router = Router::new().route(
+            "/v1.0/drives/{drive_id}/items/{item_id}/content",
+            get(move || {
+                let hits = Arc::clone(&hits_for_route);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+                        "# Same Body\n",
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let base_url = format!("http://{addr}/v1.0");
+        let (mut app, mut ui, mut rx) = test_app_and_ui_with_base_url(Some(&base_url));
+        app.active_source = ActiveViewSource::Drive {
+            drive_id: "drv-1".into(),
+            label: "Docs".into(),
+        };
+
+        let item_v1 = DriveItem {
+            id: "doc-1".into(),
+            drive_id: "drv-1".into(),
+            name: "orig.md".into(),
+            size: 12,
+            mime_type: Some("text/markdown".into()),
+            e_tag: Some("\"etag-1\"".into()),
+            c_tag: Some("\"ctag-1\"".into()),
+            last_modified_at: Some("2026-11-20T01:00:00Z".into()),
+            ..Default::default()
+        };
+        // Send two rapid identical notifications before download finishes -> must only fetch once!
+        for _ in 0..2 {
+            app.apply_core_event(
+                CoreEvent::FolderItemsUpdated {
+                    drive_id: "drv-1".into(),
+                    parent_id: None,
+                    items: vec![item_v1.clone()],
+                },
+                &mut ui,
+            );
+        }
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.apply_ui_msg(msg, &mut ui);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Metadata-only rename: name, eTag, and lastModifiedDateTime change; cTag & size stay identical!
+        let item_renamed = DriveItem {
+            name: "renamed.md".into(),
+            e_tag: Some("\"etag-2-rename\"".into()),
+            last_modified_at: Some("2026-11-20T01:05:00Z".into()),
+            ..item_v1.clone()
+        };
+        assert_eq!(item_v1.content_revision(), item_renamed.content_revision());
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "drv-1".into(),
+                parent_id: None,
+                items: vec![item_renamed.clone()],
+            },
+            &mut ui,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "metadata-only rename with unchanged cTag must not refetch /content"
+        );
+        assert_eq!(app.active_selected_id.as_deref(), Some("doc-1"));
+        assert_eq!(app.text_preview_for(&item_renamed), Some("# Same Body\n"));
 
         server.abort();
     }

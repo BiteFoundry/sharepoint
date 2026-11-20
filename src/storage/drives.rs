@@ -9,8 +9,11 @@ use std::{
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::models::{
-    DownloadBaseline, DriveInfo, DriveItem, PinnedTarget, SharePointSite, SyncCursor,
+use crate::{
+    graph::drives::DriveDeltaChange,
+    models::{
+        DownloadBaseline, DriveInfo, DriveItem, PinnedTarget, SharePointSite, SyncCursor,
+    },
 };
 
 pub(crate) fn escape_like(input: &str) -> String {
@@ -304,7 +307,13 @@ fn upsert_drive_items_tx(tx: &rusqlite::Transaction<'_>, items: &[DriveItem]) ->
                 web_url = COALESCE(excluded.web_url, drive_items.web_url),
                 download_url = COALESCE(excluded.download_url, drive_items.download_url),
                 e_tag = COALESCE(excluded.e_tag, drive_items.e_tag),
-                c_tag = COALESCE(excluded.c_tag, drive_items.c_tag),
+                c_tag = CASE
+                    WHEN excluded.c_tag IS NOT NULL THEN excluded.c_tag
+                    WHEN excluded.e_tag IS NOT NULL AND drive_items.e_tag IS NOT NULL AND excluded.e_tag != drive_items.e_tag THEN NULL
+                    WHEN excluded.size != drive_items.size THEN NULL
+                    WHEN excluded.last_modified_at IS NOT NULL AND drive_items.last_modified_at IS NOT NULL AND excluded.last_modified_at != drive_items.last_modified_at THEN NULL
+                    ELSE drive_items.c_tag
+                END,
                 created_at = COALESCE(excluded.created_at, drive_items.created_at),
                 last_modified_at = COALESCE(excluded.last_modified_at, drive_items.last_modified_at),
                 created_by = COALESCE(excluded.created_by, drive_items.created_by),
@@ -857,6 +866,308 @@ pub fn upsert_sync_cursor(conn: &Connection, cursor: &SyncCursor) -> Result<()> 
         ],
     )?;
     Ok(())
+}
+
+pub fn delete_sync_cursor(conn: &Connection, scope_key: &str) -> Result<()> {
+    conn.execute("DELETE FROM sync_cursors WHERE scope_key = ?1", [scope_key])?;
+    Ok(())
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeltaApplyOutcome {
+    pub upserted_count: usize,
+    pub deleted_count: usize,
+    pub affected_root: bool,
+    pub affected_parent_ids: HashSet<String>,
+    pub detected_root_id: Option<String>,
+}
+
+fn is_root_parent_id(pid: Option<&str>, known_root_id: Option<&str>) -> bool {
+    match pid.map(str::trim).filter(|s| !s.is_empty()) {
+        None => true,
+        Some("root") => true,
+        Some(p) => known_root_id.is_some_and(|r| r == p),
+    }
+}
+
+fn resolve_delta_item_parent_path(
+    tx: &rusqlite::Transaction<'_>,
+    drive_id: &str,
+    item: &DriveItem,
+    has_explicit_parent_path: bool,
+    known_root_id: Option<&str>,
+    existing: Option<&(Option<String>, String)>,
+) -> Result<String> {
+    if has_explicit_parent_path {
+        return Ok(normalize_parent_path(&item.parent_path));
+    }
+    if is_root_parent_id(item.parent_id.as_deref(), known_root_id) {
+        return Ok(String::new());
+    }
+    if let Some(pid) = item
+        .parent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let parent_row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT parent_path, name FROM drive_items WHERE drive_id = ?1 AND id = ?2 LIMIT 1",
+                params![drive_id, pid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((pp, name)) = parent_row {
+            return Ok(item_display_path(&pp, &name));
+        }
+        if let Some((old_pid, old_pp)) = existing {
+            if old_pid.as_deref() == Some(pid) && !old_pp.is_empty() {
+                return Ok(old_pp.clone());
+            }
+        }
+        // Keep subfolder items out of root listing (`parent_path = ''`) when parent folder is uncached.
+        return Ok(format!("/__parent/{pid}"));
+    }
+    Ok(String::new())
+}
+
+/// Applies a single `driveItem: delta` page in one SQLite transaction.
+/// Only advances `sync_cursors` when `commit_cursor` is `Some(...)` (i.e. final page).
+pub fn apply_delta_page(
+    conn: &mut Connection,
+    drive_id: &str,
+    changes: &[DriveDeltaChange],
+    known_root_id: Option<&str>,
+    commit_cursor: Option<&SyncCursor>,
+) -> Result<DeltaApplyOutcome> {
+    let tx = conn.transaction()?;
+    let mut outcome = DeltaApplyOutcome::default();
+    let mut effective_root_id = known_root_id.map(str::to_string);
+
+    for ch in changes {
+        if let DriveDeltaChange::Root { id } = ch {
+            if !id.trim().is_empty() {
+                effective_root_id = Some(id.clone());
+                outcome.detected_root_id = Some(id.clone());
+            }
+        }
+    }
+
+    for ch in changes {
+        match ch {
+            DriveDeltaChange::Root { .. } => {}
+            DriveDeltaChange::Upserted {
+                item,
+                has_explicit_parent_path,
+            } => {
+                let existing: Option<(Option<String>, String)> = tx
+                    .query_row(
+                        "SELECT parent_id, parent_path FROM drive_items WHERE drive_id = ?1 AND id = ?2 LIMIT 1",
+                        params![drive_id, item.id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+
+                if let Some((ref old_pid, ref old_pp)) = existing {
+                    if old_pp.is_empty()
+                        || old_pp == "/"
+                        || is_root_parent_id(old_pid.as_deref(), effective_root_id.as_deref())
+                    {
+                        outcome.affected_root = true;
+                    }
+                    if let Some(pid) = old_pid.as_deref().filter(|s| !s.is_empty()) {
+                        outcome.affected_parent_ids.insert(pid.to_string());
+                    }
+                }
+
+                let mut resolved = item.clone();
+                if resolved.drive_id.trim().is_empty() {
+                    resolved.drive_id = drive_id.to_string();
+                }
+                resolved.parent_path = resolve_delta_item_parent_path(
+                    &tx,
+                    drive_id,
+                    &resolved,
+                    *has_explicit_parent_path,
+                    effective_root_id.as_deref(),
+                    existing.as_ref(),
+                )?;
+
+                if resolved.parent_path.is_empty()
+                    || is_root_parent_id(
+                        resolved.parent_id.as_deref(),
+                        effective_root_id.as_deref(),
+                    )
+                {
+                    outcome.affected_root = true;
+                }
+                if let Some(pid) = resolved.parent_id.as_deref().filter(|s| !s.is_empty()) {
+                    outcome.affected_parent_ids.insert(pid.to_string());
+                }
+
+                upsert_drive_items_tx(&tx, std::slice::from_ref(&resolved))?;
+                outcome.upserted_count += 1;
+            }
+            DriveDeltaChange::Deleted { id } => {
+                let existing: Option<(Option<String>, String, i32)> = tx
+                    .query_row(
+                        "SELECT parent_id, parent_path, is_folder FROM drive_items WHERE drive_id = ?1 AND id = ?2 LIMIT 1",
+                        params![drive_id, id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                if let Some((old_pid, old_pp, is_folder)) = existing {
+                    if old_pp.is_empty()
+                        || old_pp == "/"
+                        || is_root_parent_id(old_pid.as_deref(), effective_root_id.as_deref())
+                    {
+                        outcome.affected_root = true;
+                    }
+                    if let Some(pid) = old_pid.as_deref().filter(|s| !s.is_empty()) {
+                        outcome.affected_parent_ids.insert(pid.to_string());
+                    }
+                    if is_folder != 0 {
+                        outcome.affected_parent_ids.insert(id.clone());
+                    }
+                } else {
+                    // Deleted item may not have been cached yet, or could be an uncached root entry.
+                    outcome.affected_root = true;
+                }
+                delete_item_and_descendants_tx(&tx, drive_id, id)?;
+                outcome.deleted_count += 1;
+            }
+        }
+    }
+
+    if let Some(cursor) = commit_cursor {
+        upsert_sync_cursor(&tx, cursor)?;
+    }
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// Atomically reconciles a bounded full-drive resync snapshot (e.g. after HTTP `410 Gone`),
+/// pruning stale items missing from the snapshot and advancing `sync_cursors` in one transaction.
+pub fn replace_drive_items_from_resync(
+    conn: &mut Connection,
+    drive_id: &str,
+    changes: &[DriveDeltaChange],
+    known_root_id: Option<&str>,
+    commit_cursor: &SyncCursor,
+) -> Result<DeltaApplyOutcome> {
+    let tx = conn.transaction()?;
+    let mut outcome = DeltaApplyOutcome {
+        affected_root: true,
+        ..Default::default()
+    };
+    let mut effective_root_id = known_root_id.map(str::to_string);
+    let mut live_ids: HashSet<String> = HashSet::new();
+
+    // Delta can return the same ID more than once. Its last state wins,
+    // including a tombstone that follows an earlier live item.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut latest: Vec<&DriveDeltaChange> = changes
+        .iter()
+        .rev()
+        .filter(|change| {
+            let id = match change {
+                DriveDeltaChange::Root { id } | DriveDeltaChange::Deleted { id } => id,
+                DriveDeltaChange::Upserted { item, .. } => &item.id,
+            };
+            seen.insert(id.as_str())
+        })
+        .collect();
+    latest.reverse();
+
+    for ch in latest.iter().copied() {
+        if let DriveDeltaChange::Root { id } = ch {
+            if !id.trim().is_empty() {
+                effective_root_id = Some(id.clone());
+                outcome.detected_root_id = Some(id.clone());
+            }
+        }
+    }
+
+    // Apply live items in order (folders first where possible, then remaining items)
+    for ch in latest.iter().copied() {
+        if let DriveDeltaChange::Upserted {
+            item,
+            has_explicit_parent_path,
+        } = ch
+        {
+            if item.is_folder {
+                let mut resolved = item.clone();
+                if resolved.drive_id.trim().is_empty() {
+                    resolved.drive_id = drive_id.to_string();
+                }
+                resolved.parent_path = resolve_delta_item_parent_path(
+                    &tx,
+                    drive_id,
+                    &resolved,
+                    *has_explicit_parent_path,
+                    effective_root_id.as_deref(),
+                    None,
+                )?;
+                if let Some(pid) = resolved.parent_id.as_deref().filter(|s| !s.is_empty()) {
+                    outcome.affected_parent_ids.insert(pid.to_string());
+                }
+                live_ids.insert(resolved.id.clone());
+                upsert_drive_items_tx(&tx, std::slice::from_ref(&resolved))?;
+                outcome.upserted_count += 1;
+            }
+        }
+    }
+    for ch in latest.iter().copied() {
+        if let DriveDeltaChange::Upserted {
+            item,
+            has_explicit_parent_path,
+        } = ch
+        {
+            if !item.is_folder {
+                let mut resolved = item.clone();
+                if resolved.drive_id.trim().is_empty() {
+                    resolved.drive_id = drive_id.to_string();
+                }
+                resolved.parent_path = resolve_delta_item_parent_path(
+                    &tx,
+                    drive_id,
+                    &resolved,
+                    *has_explicit_parent_path,
+                    effective_root_id.as_deref(),
+                    None,
+                )?;
+                if let Some(pid) = resolved.parent_id.as_deref().filter(|s| !s.is_empty()) {
+                    outcome.affected_parent_ids.insert(pid.to_string());
+                }
+                live_ids.insert(resolved.id.clone());
+                upsert_drive_items_tx(&tx, std::slice::from_ref(&resolved))?;
+                outcome.upserted_count += 1;
+            }
+        }
+    }
+
+    // Prune any previously cached items in this drive missing from the authoritative snapshot
+    let existing_ids: Vec<(i64, String, Option<String>)> = {
+        let mut stmt =
+            tx.prepare_cached("SELECT rowid, id, parent_id FROM drive_items WHERE drive_id = ?1")?;
+        let mapped = stmt.query_map([drive_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (rowid, id, pid) in existing_ids {
+        if !live_ids.contains(&id) {
+            if let Some(p) = pid.filter(|s| !s.is_empty()) {
+                outcome.affected_parent_ids.insert(p);
+            }
+            tx.execute("DELETE FROM drive_items_fts WHERE rowid = ?1", [rowid])?;
+            tx.execute("DELETE FROM drive_items WHERE drive_id = ?1 AND id = ?2", params![drive_id, id])?;
+            tx.execute("DELETE FROM drive_item_lists WHERE drive_id = ?1 AND item_id = ?2", params![drive_id, id])?;
+            outcome.deleted_count += 1;
+        }
+    }
+
+    upsert_sync_cursor(&tx, commit_cursor)?;
+    tx.commit()?;
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------

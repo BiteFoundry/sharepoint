@@ -1,6 +1,6 @@
 [package]
 name = "sharepoint-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Unified Microsoft SharePoint & OneDrive terminal client & AI agent toolkit — Sites, Document Libraries & Personal Files (CLI, TUI, HTTP API, MCP)"
 license = "MIT"
@@ -40,6 +40,7 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 unicode-width = "0.2"

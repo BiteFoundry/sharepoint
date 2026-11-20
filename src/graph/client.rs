@@ -113,6 +113,15 @@ impl From<GraphUser> for UserProfile {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum GraphGetOrGone<T> {
+    Ok(T),
+    Gone {
+        location: Option<String>,
+        detail: String,
+    },
+}
+
 #[derive(Clone)]
 enum RequestBody {
     Empty,
@@ -192,6 +201,59 @@ impl GraphClient {
 
     pub async fn get_json<T: DeserializeOwned>(&self, path_or_url: &str) -> Result<T> {
         self.get_json_with_headers(path_or_url, &[]).await
+    }
+
+    pub(crate) fn resolve_delta_url(&self, path_or_url: &str) -> Result<String> {
+        let base = reqwest::Url::parse(&self.config.graph_base_url)
+            .context("Invalid Graph API base URL")?;
+        let resolved = reqwest::Url::parse(&self.resolve_url(path_or_url))
+            .context("Invalid Graph delta URL")?;
+        if resolved.origin() != base.origin()
+            || !resolved.username().is_empty()
+            || resolved.password().is_some()
+        {
+            anyhow::bail!("Graph delta URL does not belong to the configured Graph origin");
+        }
+        Ok(resolved.into())
+    }
+
+    /// Executes a Graph GET request that preserves HTTP `410 Gone` and its `Location` header
+    /// for `driveItem: delta` resync handling.
+    pub(crate) async fn get_json_or_gone<T: DeserializeOwned>(
+        &self,
+        path_or_url: &str,
+    ) -> Result<GraphGetOrGone<T>> {
+        let url = self.resolve_delta_url(path_or_url)?;
+        let resp = self
+            .execute_with_retry_inner(
+                Method::GET,
+                &url,
+                RequestBody::Empty,
+                &[],
+                true,
+                STANDARD_REQUEST_TIMEOUT,
+                true,
+            )
+            .await?;
+        if resp.status() == StatusCode::GONE {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let err_body = resp.text().await.unwrap_or_default();
+            let detail = format_graph_error(StatusCode::GONE, &err_body);
+            return Ok(GraphGetOrGone::Gone { location, detail });
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .context("Failed to read Graph response body")?;
+        let parsed = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to deserialize Graph JSON ({url})"))?;
+        Ok(GraphGetOrGone::Ok(parsed))
     }
 
     /// Executes a Graph GET request with extra headers, including 401 refresh-retry and 429/502/503/504 backoff.
@@ -627,6 +689,20 @@ impl GraphClient {
         use_bearer: bool,
         timeout: Duration,
     ) -> Result<reqwest::Response> {
+        self.execute_with_retry_inner(method, url, body, extra_headers, use_bearer, timeout, false)
+            .await
+    }
+
+    async fn execute_with_retry_inner(
+        &self,
+        method: Method,
+        url: &str,
+        body: RequestBody,
+        extra_headers: &[(&str, String)],
+        use_bearer: bool,
+        timeout: Duration,
+        allow_gone: bool,
+    ) -> Result<reqwest::Response> {
         let mut unauthorized_retried = false;
         let mut throttle_attempt = 0usize;
         let mut transport_retried = false;
@@ -704,6 +780,10 @@ impl GraphClient {
                 )
                 .await;
                 continue;
+            }
+
+            if allow_gone && status == StatusCode::GONE {
+                return Ok(resp);
             }
 
             if !status.is_success() {

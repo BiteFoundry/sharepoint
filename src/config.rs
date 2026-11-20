@@ -304,8 +304,8 @@ impl Default for AppConfig {
             .and_then(|s| ImageProtocolPreference::parse_str(&s))
             .unwrap_or_default(),
             download_dir: String::new(),
-            active_poll_ms: 15_000,
-            background_poll_ms: 60_000,
+            active_poll_ms: 10_000,
+            background_poll_ms: 300_000,
             token_file: first_non_empty_env(&["SHAREPOINT_TOKEN_FILE", "ONEDRIVE_TOKEN_FILE"])
                 .unwrap_or_default(),
             token_refresh_cmd: first_non_empty_env(&[
