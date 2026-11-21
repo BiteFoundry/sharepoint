@@ -2,12 +2,14 @@
 
 # `@bitefoundry/sharepoint`
 
-**Unified Microsoft SharePoint & OneDrive terminal client, CLI, HTTP API, and MCP server — powered by Rust, Ratatui, and local SQLite FTS5.**
+**Browse SharePoint and OneDrive files, inspect version history, and edit SharePoint list rows from the terminal.**
 
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fsharepoint?style=flat-square&color=038387&label=npm)](https://www.npmjs.com/package/@bitefoundry/sharepoint)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-2b3137?style=flat-square)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-dea584?style=flat-square)](https://github.com/BiteFoundry/sharepoint/blob/master/Cargo.toml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](package.json)
+[![License: MIT](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](LICENSE)
+
+[BiteFoundry](https://bitefoundry.dev/#app-sharepoint) · [Latest release notes](https://github.com/BiteFoundry/sharepoint/releases/latest)
 
 <br />
 
@@ -41,6 +43,12 @@ sharepoint login
 sharepoint           # SharePoint sites and document libraries
 bitefoundry-onedrive # Personal OneDrive, including My Files, Recent, and Shared
 ```
+
+```sh
+sharepoint info FILE_ID --drive DRIVE_ID --json
+```
+
+Read file metadata from a specific drive. For version history, add `--versions` while online. When paging list rows, reuse the same site, list, and field selection. For full detail, add `--full` in the CLI or pass `compact: false` to `get_file_info` in MCP.
 
 Build both commands with `cargo install --locked --path .` from a checkout. Both executables are also available in the same GitHub release archive. [Install and upgrade](docs/NPM.md)
 
