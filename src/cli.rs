@@ -1,6 +1,7 @@
 //! CLI parser, command dispatcher, and shared domain helpers for SharePoint and OneDrive.
 
 use std::{
+    ffi::OsString,
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -510,13 +511,182 @@ pub fn try_fast_help_or_version() -> Option<Result<()>> {
     None
 }
 
+fn is_hyphen_literal_value(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('-') else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    if s == "-h" {
+        return false;
+    }
+    if s.contains('\n') || s.contains('\r') {
+        return true;
+    }
+    if let Some(after_double) = rest.strip_prefix('-') {
+        if after_double.is_empty() {
+            return false;
+        }
+        return !after_double.as_bytes()[0].is_ascii_alphanumeric();
+    }
+    true
+}
+
+fn normalize_hyphen_option_arg(
+    args: Vec<OsString>,
+    target_flag: &str,
+    other_value_flags: &[&str],
+) -> Vec<OsString> {
+    let mut out = Vec::with_capacity(args.len());
+    out.push(args[0].clone());
+    out.push(args[1].clone());
+
+    let mut i = 2;
+    while i < args.len() {
+        let token = &args[i];
+        let Some(text) = token.to_str() else {
+            out.push(token.clone());
+            i += 1;
+            continue;
+        };
+        if text == "--" {
+            out.extend_from_slice(&args[i..]);
+            break;
+        }
+        if other_value_flags.contains(&text) {
+            out.push(token.clone());
+            if let Some(next) = args.get(i + 1) {
+                out.push(next.clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if text == target_flag {
+            if let Some(next) = args.get(i + 1) {
+                if next.to_str().is_some_and(is_hyphen_literal_value) {
+                    let mut combined =
+                        OsString::with_capacity(target_flag.len() + 1 + next.len());
+                    combined.push(target_flag);
+                    combined.push("=");
+                    combined.push(next);
+                    out.push(combined);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        out.push(token.clone());
+        i += 1;
+    }
+    out
+}
+
+fn normalize_single_hyphen_positional(
+    args: Vec<OsString>,
+    value_flags: &[&str],
+) -> Vec<OsString> {
+    let mut out = Vec::with_capacity(args.len() + 1);
+    out.push(args[0].clone());
+    out.push(args[1].clone());
+
+    let mut deferred_positional: Option<OsString> = None;
+    let mut seen_positional = false;
+    let mut saw_double_dash = false;
+
+    let mut i = 2;
+    while i < args.len() {
+        let token = &args[i];
+        let Some(text) = token.to_str() else {
+            seen_positional = true;
+            out.push(token.clone());
+            i += 1;
+            continue;
+        };
+        if text == "--" {
+            saw_double_dash = true;
+            out.push(token.clone());
+            if let Some(pos) = deferred_positional.take() {
+                out.push(pos);
+            }
+            out.extend_from_slice(&args[i + 1..]);
+            break;
+        }
+        if value_flags.contains(&text) {
+            out.push(token.clone());
+            if let Some(next) = args.get(i + 1) {
+                out.push(next.clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if text.starts_with('-') {
+            if !seen_positional && is_hyphen_literal_value(text) {
+                deferred_positional = Some(token.clone());
+                seen_positional = true;
+            } else {
+                out.push(token.clone());
+            }
+            i += 1;
+            continue;
+        }
+        seen_positional = true;
+        out.push(token.clone());
+        i += 1;
+    }
+
+    if let Some(pos) = deferred_positional {
+        if !saw_double_dash {
+            out.push(OsString::from("--"));
+        }
+        out.push(pos);
+    }
+    out
+}
+
+fn normalize_hyphen_text_args(args: Vec<OsString>) -> Vec<OsString> {
+    if args.len() < 3 {
+        return args;
+    }
+    let Some(subcmd) = args[1].to_str() else {
+        return args;
+    };
+    match subcmd {
+        "mv" => normalize_hyphen_option_arg(args, "--name", &["--drive", "--site", "--parent"]),
+        "upload" | "up" => normalize_hyphen_option_arg(
+            args,
+            "--name",
+            &["--drive", "--site", "--item-id", "--if-match", "--conflict"],
+        ),
+        "mkdir" => normalize_single_hyphen_positional(args, &["--drive", "--site", "--parent"]),
+        "search" => {
+            normalize_single_hyphen_positional(args, &["--drive", "--site", "--limit", "--top"])
+        }
+        _ => args,
+    }
+}
+
+pub fn parse_cli_from<I, T>(args: I, bin_name: &'static str) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let normalized = normalize_hyphen_text_args(args.into_iter().map(Into::into).collect());
+    let mut matches = Cli::command()
+        .name(bin_name)
+        .bin_name(bin_name)
+        .try_get_matches_from(normalized)?;
+    Cli::from_arg_matches_mut(&mut matches)
+}
+
 pub async fn run_from_env() -> Result<()> {
     let persona = Persona::detect();
-    let mut matches = Cli::command()
-        .name(persona.bin_name())
-        .bin_name(persona.bin_name())
-        .get_matches();
-    let cli = Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit());
+    let cli = parse_cli_from(std::env::args_os(), persona.bin_name())
+        .unwrap_or_else(|err| err.exit());
     run_cli(cli, persona).await
 }
 
@@ -2307,5 +2477,237 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_hyphen_filenames_search_and_negative_json_for_both_launchers() {
+        for bin in ["sharepoint", "bitefoundry-onedrive"] {
+            for sample in ["-report.md", "- 목록 항목", "- first\n- second"] {
+                let mv = parse_cli_from([bin, "mv", "item-1", "--name", sample, "--json"], bin)
+                    .unwrap();
+                assert!(matches!(
+                    mv.command,
+                    Some(Command::Mv {
+                        ref item_or_path,
+                        ref name,
+                        json: true,
+                        ..
+                    }) if item_or_path == "item-1" && name.as_deref() == Some(sample)
+                ));
+
+                for upload_cmd in ["upload", "up"] {
+                    let up = parse_cli_from(
+                        [bin, upload_cmd, "test.txt", "--name", sample, "--json"],
+                        bin,
+                    )
+                    .unwrap();
+                    assert!(matches!(
+                        up.command,
+                        Some(Command::Upload {
+                            ref local_path,
+                            ref name,
+                            json: true,
+                            ..
+                        }) if local_path == Path::new("test.txt") && name.as_deref() == Some(sample)
+                    ));
+                }
+
+                let mk = parse_cli_from(
+                    [bin, "mkdir", sample, "--parent", "/Archive", "--json"],
+                    bin,
+                )
+                .unwrap();
+                assert!(matches!(
+                    mk.command,
+                    Some(Command::Mkdir {
+                        ref name,
+                        ref parent,
+                        json: true,
+                        ..
+                    }) if name == sample && parent.as_deref() == Some("/Archive")
+                ));
+
+                let sr = parse_cli_from(
+                    [bin, "search", sample, "--remote", "--top", "15", "--json"],
+                    bin,
+                )
+                .unwrap();
+                assert!(matches!(
+                    sr.command,
+                    Some(Command::Search {
+                        ref query,
+                        remote: true,
+                        limit: 15,
+                        json: true,
+                        ..
+                    }) if query == sample
+                ));
+            }
+
+            // Control case: lists set-field --value-json -4 keeps JSON number -4.
+            let list_num = parse_cli_from(
+                [
+                    bin,
+                    "lists",
+                    "set-field",
+                    "--site-id",
+                    "site",
+                    "--list-id",
+                    "list",
+                    "--item-id",
+                    "item",
+                    "--field",
+                    "score",
+                    "--value-json",
+                    "-4",
+                    "--json",
+                ],
+                bin,
+            )
+            .unwrap();
+            assert!(matches!(
+                list_num.command,
+                Some(Command::Lists {
+                    json: true,
+                    action: ListAction::SetField { ref value_json, .. },
+                }) if value_json == &json!(-4)
+            ));
+        }
+    }
+
+    #[test]
+    fn preserves_equals_positional_separator_known_flags_missing_values_and_help() {
+        use clap::error::ErrorKind;
+
+        // Equals syntax accepts explicit flag-looking text.
+        for literal in ["-report.md", "--json", "--dry-run", "--help", "-h"] {
+            let eq = format!("--name={literal}");
+            let mv = parse_cli_from(["sharepoint", "mv", "id", &eq], "sharepoint").unwrap();
+            assert!(matches!(
+                mv.command,
+                Some(Command::Mv { ref name, json: false, .. }) if name.as_deref() == Some(literal)
+            ));
+            let up =
+                parse_cli_from(["sharepoint", "upload", "test.txt", &eq], "sharepoint").unwrap();
+            assert!(matches!(
+                up.command,
+                Some(Command::Upload { ref name, json: false, .. }) if name.as_deref() == Some(literal)
+            ));
+        }
+
+        // Positional "--" accepts explicit flag-looking text.
+        for literal in ["-report.md", "- 목록 항목", "--json", "--dry-run", "--help", "-h"] {
+            let mk =
+                parse_cli_from(["sharepoint", "mkdir", "--", literal], "sharepoint").unwrap();
+            assert!(matches!(
+                mk.command,
+                Some(Command::Mkdir { ref name, json: false, .. }) if name == literal
+            ));
+            let sr =
+                parse_cli_from(["sharepoint", "search", "--", literal], "sharepoint").unwrap();
+            assert!(matches!(
+                sr.command,
+                Some(Command::Search { ref query, json: false, .. }) if query == literal
+            ));
+        }
+
+        // Known flags and unknown long flags must NOT be swallowed as separate values.
+        for bad_args in [
+            vec!["sharepoint", "mv", "id", "--name"],
+            vec!["sharepoint", "mv", "id", "--name", "--json"],
+            vec!["sharepoint", "mv", "id", "--name", "--parent", "/Archive"],
+            vec!["sharepoint", "mv", "id", "--name", "--dry-run"],
+            vec!["sharepoint", "mv", "--parent", "--name", "-report.md", "id"],
+            vec!["sharepoint", "mv", "id", "--parent", "-archive"],
+            vec!["sharepoint", "upload", "test.txt", "--name"],
+            vec!["sharepoint", "upload", "test.txt", "--name", "--json"],
+            vec!["sharepoint", "upload", "test.txt", "--name", "--conflict", "replace"],
+            vec!["sharepoint", "upload", "test.txt", "--name", "--dry-run"],
+            vec!["sharepoint", "upload", "test.txt", "--conflict", "-bad"],
+            vec!["sharepoint", "mkdir", "--json"],
+            vec!["sharepoint", "mkdir", "--dry-run"],
+            vec!["sharepoint", "mkdir", "-report.md", "--dry-run"],
+            vec!["sharepoint", "mkdir", "--parent", "-bad", "GoodName"],
+            vec!["sharepoint", "search", "--json"],
+            vec!["sharepoint", "search", "--remote"],
+            vec!["sharepoint", "search", "--dry-run"],
+            vec!["sharepoint", "search", "--limit", "-1", "query"],
+            vec![
+                "sharepoint",
+                "lists",
+                "set-field",
+                "--site-id",
+                "s",
+                "--list-id",
+                "l",
+                "--item-id",
+                "i",
+                "--field",
+                "f",
+                "--value-json",
+                "--json",
+            ],
+        ] {
+            let err = parse_cli_from(bad_args.clone(), "sharepoint")
+                .expect_err(&format!("expected parse failure for {bad_args:?}"));
+            assert_ne!(
+                err.kind(),
+                ErrorKind::DisplayHelp,
+                "unexpected help exit for {bad_args:?}: {err}"
+            );
+        }
+
+        // Missing value followed by -h / --help must never parse as a literal filename.
+        for help_after_name in [
+            vec!["sharepoint", "mv", "id", "--name", "--help"],
+            vec!["sharepoint", "mv", "id", "--name", "-h"],
+            vec!["sharepoint", "upload", "test.txt", "--name", "--help"],
+            vec!["sharepoint", "upload", "test.txt", "--name", "-h"],
+        ] {
+            assert!(
+                parse_cli_from(help_after_name.clone(), "sharepoint").is_err(),
+                "must not swallow help flag in {help_after_name:?}"
+            );
+        }
+
+        // Actual help invocations (standalone and trailing --help after hyphen values).
+        for help_args in [
+            vec!["sharepoint", "mv", "--help"],
+            vec!["sharepoint", "mv", "-h"],
+            vec!["sharepoint", "mv", "id", "--name", "-report.md", "--help"],
+            vec!["sharepoint", "upload", "--help"],
+            vec!["sharepoint", "upload", "-h"],
+            vec!["sharepoint", "upload", "test.txt", "--name", "-report.md", "--help"],
+            vec!["sharepoint", "mkdir", "--help"],
+            vec!["sharepoint", "mkdir", "-h"],
+            vec!["sharepoint", "mkdir", "-report.md", "--help"],
+            vec!["sharepoint", "search", "--help"],
+            vec!["sharepoint", "search", "-h"],
+            vec!["sharepoint", "search", "- 목록 항목", "--help"],
+            vec![
+                "sharepoint",
+                "lists",
+                "set-field",
+                "--site-id",
+                "site",
+                "--list-id",
+                "list",
+                "--item-id",
+                "item",
+                "--field",
+                "score",
+                "--value-json",
+                "-4",
+                "--help",
+            ],
+        ] {
+            let err = parse_cli_from(help_args.clone(), "sharepoint")
+                .expect_err(&format!("expected DisplayHelp for {help_args:?}"));
+            assert_eq!(
+                err.kind(),
+                ErrorKind::DisplayHelp,
+                "expected DisplayHelp for {help_args:?}, got: {err}"
+            );
+        }
     }
 }
