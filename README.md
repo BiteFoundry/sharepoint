@@ -6,12 +6,12 @@
 
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fsharepoint?style=flat-square&color=038387&label=npm)](https://www.npmjs.com/package/@bitefoundry/sharepoint)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-2b3137?style=flat-square)](docs/NPM.md)
-[![Built with Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-dea584?style=flat-square)](Cargo.toml)
+[![Built with Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-dea584?style=flat-square)](https://github.com/BiteFoundry/sharepoint/blob/master/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](package.json)
 
 <br />
 
-![Microsoft SharePoint & OneDrive TUI Demo](assets/demo.gif)
+![Microsoft SharePoint & OneDrive TUI Demo](https://raw.githubusercontent.com/BiteFoundry/sharepoint/master/assets/demo.gif)
 
 </div>
 
@@ -24,7 +24,7 @@
 | **Minimal-Chrome 3-Pane TUI** | Dual-persona explorer (`sharepoint`/`sp` & `onedrive`/`od`) with collapsible Sites, Document Libraries & OneDrive sidebar, sorted file list, live Inspector (metadata, version history, Markdown/YAML/JSON/code preview), Link Extractor (`u`), File Picker with `zoxide` (`Ctrl+F`), Context Menu (`.`), and 6 themes. |
 | **High-Res Terminal Images** | Inline Inspector thumbnails & fullscreen HD previews (`v` / `Alt+v`) with 80ms protocol probing for **Kitty**, **iTerm2**, **Sixel** (Floyd-Steinberg dithering), and **24-bit Unicode Half-Blocks** + `Ctrl+V` instant clipboard PNG upload. |
 | **Local SQLite FTS5 + IPC Daemon** | WAL-mode SQLite cache with 4-reader pool, hybrid local FTS5 + remote Graph search (`/`), streaming chunked uploads (`> 4 MiB`), and a shared background sync daemon (`sharepoint daemon start`). |
-| **4-in-1 Agent Interface** | Interactive **TUI**, scriptable `--json` **CLI**, local **HTTP JSON API** (`sharepoint serve`, port `8790`), and stdio **MCP Server** (`sharepoint mcp`, 16 tools). |
+| **4-in-1 Agent Interface** | Interactive **TUI**, scriptable `--json` **CLI**, local **HTTP JSON API** (`sharepoint serve`, port `8790`), and stdio **MCP Server** (`sharepoint mcp`, 19 tools). |
 
 ---
 
@@ -69,17 +69,49 @@ onedrive            # Personal OneDrive: My Files, Recent, Shared (alias: od)
 
 ## CLI, HTTP API & MCP
 
-### CLI (`--json` on every command)
+### CLI
 
 ```sh
 sharepoint sites --json
 sharepoint drives --site "Acme Engineering" --json
-onedrive ls /Projects/Platform-v4 --json
+onedrive ls /Projects/Platform-v4 --json --compact
+onedrive info /Projects/Platform-v4/deploy-pipeline.yaml --versions --versions-limit 5 --json --compact
 onedrive cat /Projects/Platform-v4/deploy-pipeline.yaml
 sharepoint upload ./q4-architecture-deck.pdf /RFCs --site "Acme Engineering" --json
 sharepoint share /api-gateway-rfc.md --site "Acme Engineering" --type view --scope organization --json
 sharepoint search "gateway" --remote --json
 ```
+
+`sharepoint --help` and `onedrive --help` list the commands that support `--json`.
+For `ls` and `info`, `--json --compact` returns the drive and item IDs, name,
+file or folder flag, byte size, and modification time. Compact `info` also includes the eTag.
+`info --versions` reads all available history by default. `--versions-limit` caps
+history and stops fetching pages once the cap is reached. An online history lookup
+reports Graph errors, including permission denials.
+
+`cat` reads UTF-8 with an optional BOM and UTF-16LE or UTF-16BE with a BOM. Its
+byte limit applies to the original file, and plain output preserves line endings.
+Use `download` for binary files. To replace a file conditionally, pass its item ID
+and eTag to `upload --item-id <ITEM_ID> --if-match <ETAG>`. Conditional
+replacement uses an upload session at any file size.
+
+### SharePoint List rows
+
+Use `sites --json` to find the site ID. With the list ID, discover its column
+names, then select one or more columns by passing `--field` for each name.
+
+```sh
+sharepoint lists columns --site-id "$SITE_ID" --list-id "$LIST_ID" --json
+sharepoint lists items --site-id "$SITE_ID" --list-id "$LIST_ID" \
+  --field ReviewStatus --field Quantity --json
+sharepoint lists set-field --site-id "$SITE_ID" --list-id "$LIST_ID" \
+  --item-id 17 --field ReviewStatus --value-json '"Ready"' --if-match '"row-etag"' --json
+```
+
+`items` follows Graph pagination and returns each row's `id`, `e_tag` when
+available, and `fields`. `set-field` accepts a typed JSON value such as
+`"Ready"`, `false`, or `0`. Pass the row's current `e_tag` as `--if-match` to
+apply the update conditionally. Graph returns `412` for stale ETags. [List rows](https://learn.microsoft.com/en-us/graph/api/listitem-list?view=graph-rest-1.0) · [Update list fields](https://learn.microsoft.com/en-us/graph/api/listitem-update?view=graph-rest-1.0)
 
 ### Local HTTP API (`sharepoint serve`)
 
@@ -117,11 +149,11 @@ Full tool catalog & schemas: [docs/MCP.md](docs/MCP.md).
 
 | Package | Commands | Workspace Coverage |
 | --- | --- | --- |
-| [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams`, `tm` | Microsoft Teams chats, channels, threads & meetings |
-| [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook`, `mail`, `cal` | Microsoft Outlook mail, calendar & contacts |
+| [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams` | Microsoft Teams chats, channels, threads & meetings |
+| [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook` | Microsoft Outlook mail, calendar & contacts |
 | [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote`, `note` | Microsoft OneNote notebooks, sections, pages & XHTML/Markdown |
 | **`@bitefoundry/sharepoint`** | `sharepoint`, `sp`, `onedrive`, `od` | Microsoft SharePoint sites, document libraries & OneDrive files |
-| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `jira`, `confluence` | Atlassian Jira issues, boards, sprints & Confluence pages |
+| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Atlassian Jira issues, boards, sprints & Confluence pages |
 | [`@bitefoundry/notion`](https://www.npmjs.com/package/@bitefoundry/notion) | `notion`, `nt` | Notion pages, databases, blocks & Markdown sync |
 
 ---

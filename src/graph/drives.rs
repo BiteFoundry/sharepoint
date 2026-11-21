@@ -1100,14 +1100,29 @@ impl GraphClient {
         drive_id: &str,
         item_id: &str,
     ) -> Result<Vec<DriveItemVersion>> {
+        self.list_item_versions_with_limit(drive_id, item_id, None)
+            .await
+    }
+
+    pub async fn list_item_versions_with_limit(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<DriveItemVersion>> {
         let enc_drive = urlencoding::encode(drive_id.trim());
         let enc_item = urlencoding::encode(item_id.trim());
+        let limit = limit.unwrap_or(usize::MAX);
         let mut out = Vec::new();
         let mut next: Option<String> =
             Some(format!("/drives/{enc_drive}/items/{enc_item}/versions"));
         while let Some(url) = next {
+            let remaining = limit - out.len();
+            if remaining == 0 {
+                break;
+            }
             let page: GraphListPage<GraphVersion> = self.get_json(&url).await?;
-            out.extend(page.value.into_iter().map(|v| DriveItemVersion {
+            out.extend(page.value.into_iter().take(remaining).map(|v| DriveItemVersion {
                 id: v.id,
                 last_modified_at: v.last_modified_date_time,
                 last_modified_by: v.last_modified_by.and_then(|u| u.display_label()),

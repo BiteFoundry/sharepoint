@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod drives;
+pub mod lists;
 pub mod media;
 pub mod socketio;
 

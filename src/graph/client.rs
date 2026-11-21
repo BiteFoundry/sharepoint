@@ -343,17 +343,7 @@ impl GraphClient {
         path_or_url: &str,
         body: &B,
     ) -> Result<()> {
-        let url = self.resolve_url(path_or_url);
-        let json_val = serde_json::to_value(body)?;
-        self.execute_with_retry(
-            Method::PATCH,
-            &url,
-            RequestBody::Json(json_val),
-            &[],
-            true,
-            STANDARD_REQUEST_TIMEOUT,
-        )
-        .await?;
+        self.patch_json_response(path_or_url, body, &[]).await?;
         Ok(())
     }
 
@@ -363,18 +353,7 @@ impl GraphClient {
         path_or_url: &str,
         body: &B,
     ) -> Result<Option<T>> {
-        let url = self.resolve_url(path_or_url);
-        let json_val = serde_json::to_value(body)?;
-        let resp = self
-            .execute_with_retry(
-                Method::PATCH,
-                &url,
-                RequestBody::Json(json_val),
-                &[],
-                true,
-                STANDARD_REQUEST_TIMEOUT,
-            )
-            .await?;
+        let resp = self.patch_json_response(path_or_url, body, &[]).await?;
         let bytes = resp
             .bytes()
             .await
@@ -382,9 +361,31 @@ impl GraphClient {
         if bytes.iter().all(|b| b.is_ascii_whitespace()) {
             return Ok(None);
         }
-        let parsed = serde_json::from_slice(&bytes)
-            .with_context(|| format!("Failed to deserialize Graph PATCH JSON ({url})"))?;
+        let parsed = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "Failed to deserialize Graph PATCH JSON ({})",
+                self.resolve_url(path_or_url)
+            )
+        })?;
         Ok(Some(parsed))
+    }
+
+    pub(crate) async fn patch_json_response<B: Serialize + ?Sized>(
+        &self,
+        path_or_url: &str,
+        body: &B,
+        extra_headers: &[(&str, String)],
+    ) -> Result<reqwest::Response> {
+        let url = self.resolve_url(path_or_url);
+        self.execute_with_retry(
+            Method::PATCH,
+            &url,
+            RequestBody::Json(serde_json::to_value(body)?),
+            extra_headers,
+            true,
+            STANDARD_REQUEST_TIMEOUT,
+        )
+        .await
     }
 
     pub async fn post_empty(&self, path_or_url: &str) -> Result<()> {

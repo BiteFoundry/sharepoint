@@ -6,8 +6,8 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
-use serde_json::json;
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use serde_json::{json, Value};
 
 use crate::{
     auth::{
@@ -17,6 +17,7 @@ use crate::{
     config::{self, AppConfig, Persona},
     graph::{
         drives::{ConflictBehavior, UploadOptions},
+        media::decode_text_file,
         GraphClient,
     },
     img_preview,
@@ -37,6 +38,11 @@ const ENV_AFTER_HELP: &str = "\
 Dual-Persona Launchers:
   sharepoint / sp                       Boot into SharePoint Sites & Document Libraries
   onedrive / od                         Boot directly into Personal OneDrive (SHAREPOINT_PERSONA=onedrive)
+
+JSON Output (--json):
+  login, logout, whoami, doctor, sites, drives, ls, tree, info, cat, download,
+  upload, mkdir, mv, rm, search, share, recent, shared, update, lists items/columns/set-field,
+  daemon start/status/stop/restart
 
 Environment Variables:
   SHAREPOINT_PERSONA=<sharepoint|onedrive> Override default persona
@@ -137,6 +143,14 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Read SharePoint List rows and columns, or update one field
+    Lists {
+        /// Print JSON output
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        action: ListAction,
+    },
     /// List files and folders inside a OneDrive or SharePoint drive
     Ls {
         /// Optional folder path (e.g. /Projects/Q4) or folder item ID
@@ -157,6 +171,9 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
+        /// Return compact drive and item fields in JSON
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
     /// Print a recursive directory tree for a OneDrive or SharePoint folder
     Tree {
@@ -183,12 +200,18 @@ pub enum Command {
         /// Also fetch and display version history
         #[arg(long)]
         versions: bool,
+        /// Fetch at most this many versions with --versions (default: all)
+        #[arg(long, requires = "versions")]
+        versions_limit: Option<usize>,
         #[arg(long)]
         offline: bool,
         #[arg(long)]
         json: bool,
+        /// Return compact item fields, including its eTag, in JSON
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
-    /// Print text/Markdown/JSON/YAML/CSV/code file contents up to a safe byte cap
+    /// Print UTF-8 or BOM-marked UTF-16 text up to a byte cap
     Cat {
         /// Item ID or path
         item_or_path: String,
@@ -217,7 +240,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Upload a local file (auto-selects simple PUT < 4 MiB or resumable chunked session >= 4 MiB)
+    /// Upload a local file (session for files >= 4 MiB or conditional replacement)
     #[command(visible_alias = "up")]
     Upload {
         /// Local file path to upload
@@ -234,7 +257,7 @@ pub enum Command {
         /// Optional exact target item ID for conditional replacement
         #[arg(long = "item-id", value_name = "ITEM_ID")]
         item_id: Option<String>,
-        /// Optional ETag precondition (`If-Match`) for conditional upload
+        /// ETag precondition (`If-Match`) for replacement via an upload session at any size
         #[arg(long = "if-match", value_name = "ETAG")]
         if_match: Option<String>,
         /// Conflict behavior when target file already exists (`replace`, `fail`, `rename`)
@@ -407,6 +430,54 @@ pub enum Command {
     },
 }
 
+#[derive(Args, Debug)]
+pub struct ListTarget {
+    /// SharePoint site ID
+    #[arg(long)]
+    site_id: String,
+    /// SharePoint list ID
+    #[arg(long)]
+    list_id: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ListAction {
+    /// List rows and their field values across all Graph pages
+    Items {
+        #[command(flatten)]
+        target: ListTarget,
+        /// Internal column name to return. Repeat to select multiple fields
+        #[arg(long = "field")]
+        fields: Vec<String>,
+    },
+    /// Discover column names, display names, and read-only flags
+    Columns {
+        #[command(flatten)]
+        target: ListTarget,
+    },
+    /// Set one column by its internal name
+    SetField {
+        #[command(flatten)]
+        target: ListTarget,
+        /// Row ID
+        #[arg(long)]
+        item_id: String,
+        /// Internal column name
+        #[arg(long)]
+        field: String,
+        /// JSON value such as '"Ready"', false, or 0
+        #[arg(long, value_name = "JSON", allow_hyphen_values = true, value_parser = parse_list_field_value)]
+        value_json: Value,
+        /// Apply only if this row ETag is current
+        #[arg(long, value_name = "ETAG")]
+        if_match: Option<String>,
+    },
+}
+
+fn parse_list_field_value(input: &str) -> std::result::Result<Value, serde_json::Error> {
+    serde_json::from_str(input)
+}
+
 #[derive(Subcommand, Debug)]
 pub enum DaemonAction {
     Start {
@@ -440,8 +511,12 @@ pub fn try_fast_help_or_version() -> Option<Result<()>> {
 }
 
 pub async fn run_from_env() -> Result<()> {
-    let cli = Cli::parse();
     let persona = Persona::detect();
+    let mut matches = Cli::command()
+        .name(persona.bin_name())
+        .bin_name(persona.bin_name())
+        .get_matches();
+    let cli = Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|err| err.exit());
     run_cli(cli, persona).await
 }
 
@@ -600,6 +675,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::Lists { json, action }) => run_list_action(&config, action, json).await,
         Some(Command::Ls {
             path_or_id,
             drive,
@@ -609,6 +685,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             offline,
             cached,
             json: as_json,
+            compact,
         }) => {
             let (_, graph, storage) = init_runtime(&config, offline).await?;
             let target_drive = resolver::resolve_target_drive(
@@ -632,14 +709,9 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             )
             .await?;
             if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "drive": target_drive,
-                        "path": path_or_id.unwrap_or_else(|| "/".to_string()),
-                        "items": items,
-                    }))?
-                );
+                let mut output = folder_listing_json(&target_drive, &items, compact);
+                output["path"] = json!(path_or_id.as_deref().unwrap_or("/"));
+                println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
                 println!(
                     "{} ({})",
@@ -717,8 +789,10 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             drive,
             site,
             versions,
+            versions_limit,
             offline,
             json: as_json,
+            compact,
         }) => {
             let (_, graph, storage) = init_runtime(&config, offline).await?;
             let target_drive = resolver::resolve_target_drive(
@@ -734,21 +808,24 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 resolver::resolve_item(&graph, &storage, &target_drive.id, &item_or_path, offline)
                     .await?;
             let vers = if versions && !offline {
-                graph
-                    .list_item_versions(item.effective_drive_id(), item.effective_item_id())
+                match graph
+                    .list_item_versions_with_limit(
+                        item.effective_drive_id(),
+                        item.effective_item_id(),
+                        versions_limit,
+                    )
                     .await
-                    .unwrap_or_default()
+                {
+                    Ok(versions) => versions,
+                    Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+                }
             } else {
                 Vec::new()
             };
             if as_json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "item": item,
-                        "versions": vers,
-                    }))?
-                );
+                let mut output = file_info_json(&item, compact);
+                output["versions"] = json!(vers);
+                println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
                 println!("Name:      {}", item.name);
                 println!("ID:        {}", item.id);
@@ -814,7 +891,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     max_bytes,
                 )
                 .await?;
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let text = decode_text_file(&bytes)?;
             if as_json {
                 println!(
                     "{}",
@@ -831,10 +908,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     }))?
                 );
             } else {
-                print!("{text}");
-                if !text.ends_with('\n') {
-                    println!();
-                }
+                io::stdout().lock().write_all(text.as_bytes())?;
             }
             Ok(())
         }
@@ -1399,6 +1473,82 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
     }
 }
 
+async fn run_list_action(config: &AppConfig, action: ListAction, as_json: bool) -> Result<()> {
+    let (_, graph, _) = init_runtime(config, false).await?;
+    let outcome: Result<()> = async {
+        match action {
+            ListAction::Items { target, fields } => {
+                let items = graph
+                    .list_items(&target.site_id, &target.list_id, &fields)
+                    .await?;
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({ "items": items }))?
+                    );
+                } else {
+                    for item in items {
+                        println!(
+                            "{}  {}  {}",
+                            item.id,
+                            item.e_tag.as_deref().unwrap_or(""),
+                            serde_json::to_string(&item.fields)?
+                        );
+                    }
+                }
+            }
+            ListAction::Columns { target } => {
+                let columns = graph.list_columns(&target.site_id, &target.list_id).await?;
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({ "columns": columns }))?
+                    );
+                } else {
+                    for column in columns {
+                        let display = column.display_name.as_deref().unwrap_or(&column.name);
+                        let access = if column.read_only == Some(true) {
+                            "  (read-only)"
+                        } else {
+                            ""
+                        };
+                        println!("{}  {display}{access}", column.name);
+                    }
+                }
+            }
+            ListAction::SetField {
+                target,
+                item_id,
+                field,
+                value_json,
+                if_match,
+            } => {
+                let update = graph
+                    .update_list_item_field(
+                        &target.site_id,
+                        &target.list_id,
+                        &item_id,
+                        &field,
+                        value_json,
+                        if_match.as_deref(),
+                    )
+                    .await?;
+                if as_json {
+                    println!("{}", serde_json::to_string_pretty(&update)?);
+                } else {
+                    println!("Updated {} on row {}.", update.field, update.item_id);
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(err) => Err(wrap_graph_permission_error(&graph, err).await),
+    }
+}
+
 pub async fn init_runtime(
     config: &AppConfig,
     allow_unauthenticated: bool,
@@ -1633,6 +1783,37 @@ pub async fn fetch_drives(
     }
     let _ = storage.upsert_drives(&all);
     Ok(all)
+}
+
+pub(crate) fn folder_listing_json(drive: &DriveInfo, items: &[DriveItem], compact: bool) -> Value {
+    if compact {
+        let items: Vec<_> = items.iter().map(compact_drive_item).collect();
+        json!({ "drive": { "id": drive.id }, "items": items })
+    } else {
+        json!({ "drive": drive, "items": items })
+    }
+}
+
+pub(crate) fn file_info_json(item: &DriveItem, compact: bool) -> Value {
+    let item = if compact {
+        let mut summary = compact_drive_item(item);
+        summary["e_tag"] = json!(item.e_tag);
+        summary
+    } else {
+        json!(item)
+    };
+    json!({ "item": item })
+}
+
+fn compact_drive_item(item: &DriveItem) -> Value {
+    json!({
+        "drive_id": item.drive_id,
+        "id": item.id,
+        "name": item.name,
+        "is_folder": item.is_folder,
+        "size": item.size,
+        "last_modified_at": item.last_modified_at,
+    })
 }
 
 pub async fn fetch_folder_items(
@@ -2091,6 +2272,18 @@ pub fn normalize_download_dir(config: &AppConfig, override_dir: Option<&str>) ->
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn compact_and_version_limit_require_their_output_options() {
+        assert!(Cli::try_parse_from(["sharepoint", "ls", "--compact"]).is_err());
+        assert!(Cli::try_parse_from(["sharepoint", "info", "file", "--versions-limit", "2"]).is_err());
+        let parsed = Cli::try_parse_from([
+            "onedrive", "info", "file", "--json", "--compact", "--versions", "--versions-limit", "2",
+        ]).unwrap();
+        assert!(matches!(parsed.command, Some(Command::Info {
+            json: true, compact: true, versions: true, versions_limit: Some(2), ..
+        })));
+    }
 
     #[test]
     fn parses_all_sharepoint_onedrive_cli_subcommands() {

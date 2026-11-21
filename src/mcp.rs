@@ -1,5 +1,5 @@
 //! Model Context Protocol (MCP) server over stdio (newline-delimited JSON-RPC 2.0)
-//! exposing 16 OneDrive & SharePoint agent tools.
+//! exposing OneDrive & SharePoint agent tools.
 
 use std::{io::Write, path::PathBuf};
 
@@ -14,6 +14,7 @@ use crate::{
     config::{AppConfig, Persona},
     graph::{
         drives::{ConflictBehavior, UploadOptions},
+        media::decode_text_file,
         GraphClient,
     },
     resolver,
@@ -252,6 +253,56 @@ async fn call_tool(
             .await?;
             Ok(json!({ "drives": drives }))
         }
+        "list_items" | "list_columns" | "update_list_item_field" => {
+            let site_id = str_arg("site_id").ok_or_else(|| "site_id is required".to_string())?;
+            let list_id = str_arg("list_id").ok_or_else(|| "list_id is required".to_string())?;
+            match name {
+                "list_items" => {
+                    let fields = match args.get("fields") {
+                        Some(fields) => serde_json::from_value::<Vec<String>>(fields.clone())
+                            .map_err(|_| {
+                                "fields must be an array of internal column names".to_string()
+                            })?,
+                        None => Vec::new(),
+                    };
+                    let items =
+                        map_graph_err(graph, graph.list_items(&site_id, &list_id, &fields).await)
+                            .await?;
+                    Ok(json!({ "items": items }))
+                }
+                "list_columns" => {
+                    let columns =
+                        map_graph_err(graph, graph.list_columns(&site_id, &list_id).await).await?;
+                    Ok(json!({ "columns": columns }))
+                }
+                _ => {
+                    let item_id =
+                        str_arg("item_id").ok_or_else(|| "item_id is required".to_string())?;
+                    let field = str_arg("field").ok_or_else(|| "field is required".to_string())?;
+                    let value = args
+                        .get("value")
+                        .cloned()
+                        .ok_or_else(|| "value is required".to_string())?;
+                    let if_match = args
+                        .get("if_match")
+                        .map(|tag| {
+                            tag.as_str()
+                                .ok_or_else(|| "if_match must be an ETag string".to_string())
+                        })
+                        .transpose()?;
+                    let update = map_graph_err(
+                        graph,
+                        graph
+                            .update_list_item_field(
+                                &site_id, &list_id, &item_id, &field, value, if_match,
+                            )
+                            .await,
+                    )
+                    .await?;
+                    Ok(json!(update))
+                }
+            }
+        }
         "list_files" => {
             let drive_q = str_arg("drive");
             let site_q = str_arg("site");
@@ -286,7 +337,7 @@ async fn call_tool(
                 .await,
             )
             .await?;
-            Ok(json!({ "drive": drive, "items": items }))
+            Ok(cli::folder_listing_json(&drive, &items, bool_arg("compact")))
         }
         "get_file_info" => {
             let item_q = str_arg("item_id")
@@ -313,7 +364,7 @@ async fn call_tool(
                 resolver::resolve_item(graph, storage, &drive.id, &item_q, offline).await,
             )
             .await?;
-            Ok(json!({ "item": item }))
+            Ok(cli::file_info_json(&item, bool_arg("compact")))
         }
         "read_text_file" => {
             let item_q = str_arg("item_id")
@@ -340,6 +391,9 @@ async fn call_tool(
                 resolver::resolve_item(graph, storage, &drive.id, &item_q, false).await,
             )
             .await?;
+            if item.is_folder {
+                return Err(format!("'{}' is a folder, not a file.", item.name));
+            }
             let bytes = map_graph_err(
                 graph,
                 graph
@@ -361,7 +415,7 @@ async fn call_tool(
                 "e_tag": item.e_tag,
                 "c_tag": item.c_tag,
                 "size_bytes": bytes.len(),
-                "content": String::from_utf8_lossy(&bytes),
+                "content": decode_text_file(&bytes).map_err(|err| format!("{err:#}"))?,
             }))
         }
         "download_file" => {
@@ -754,6 +808,15 @@ async fn call_tool(
             let item_q = str_arg("item_id")
                 .or_else(|| str_arg("path"))
                 .ok_or_else(|| "item_id or path is required".to_string())?;
+            let limit = args
+                .get("limit")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|limit| usize::try_from(limit).ok())
+                        .ok_or_else(|| "limit must be a non-negative integer".to_string())
+                })
+                .transpose()?;
             let drive_q = str_arg("drive");
             let site_q = str_arg("site");
             let drive = map_graph_err(
@@ -777,7 +840,11 @@ async fn call_tool(
             let versions = map_graph_err(
                 graph,
                 graph
-                    .list_item_versions(item.effective_drive_id(), item.effective_item_id())
+                    .list_item_versions_with_limit(
+                        item.effective_drive_id(),
+                        item.effective_item_id(),
+                        limit,
+                    )
                     .await,
             )
             .await?;
@@ -792,11 +859,11 @@ pub fn tool_catalog() -> Vec<Value> {
         tool_def("whoami", "Show current Microsoft 365 user identity, persona, and OAuth scope diagnostics", json!({ "type": "object", "properties": {} })),
         tool_def("list_sites", "List followed and discovered SharePoint sites", json!({ "type": "object", "properties": { "search": { "type": "string" }, "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
         tool_def("list_drives", "List Personal OneDrive and SharePoint document libraries", json!({ "type": "object", "properties": { "site": { "type": "string" }, "offline": { "type": "boolean" } } })),
-        tool_def("list_files", "List files and folders inside a OneDrive or SharePoint drive", json!({ "type": "object", "properties": { "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" }, "path": { "type": "string" }, "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
-        tool_def("get_file_info", "Get detailed metadata for a file or folder by item_id or path", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "offline": { "type": "boolean" } } })),
-        tool_def("read_text_file", "Read text/Markdown/JSON/YAML/CSV/code file content up to a safe byte cap", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "max_bytes": { "type": "integer" } } })),
+        tool_def("list_files", "List files and folders inside a OneDrive or SharePoint drive", json!({ "type": "object", "properties": { "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" }, "path": { "type": "string" }, "limit": { "type": "integer" }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Return the drive ID and core item fields" } } })),
+        tool_def("get_file_info", "Get detailed metadata for a file or folder by item_id or path", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Return core item fields and eTag" } } })),
+        tool_def("read_text_file", "Read UTF-8 or BOM-marked UTF-16 text up to the original byte cap. Use download_file for binary files.", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "max_bytes": { "type": "integer" } } })),
         tool_def("download_file", "Download a OneDrive or SharePoint file to local disk, returning { ok, path, file_name, mime_type, size_bytes, is_image }", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "dir": { "type": "string" } } })),
-        tool_def("upload_file", "Upload a local file, base64 bytes, or text content into OneDrive or SharePoint (auto simple < 4 MiB or chunked >= 4 MiB)", json!({ "type": "object", "properties": { "local_path": { "type": "string" }, "file_name": { "type": "string" }, "content_base64": { "type": "string" }, "content_text": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" }, "item_id": { "type": "string" }, "if_match": { "type": "string" }, "conflict_behavior": { "type": "string", "enum": ["replace", "fail", "rename"] } } })),
+        tool_def("upload_file", "Upload a local file, base64 bytes, or text content. Files at least 4 MiB and conditional replacements use an upload session.", json!({ "type": "object", "properties": { "local_path": { "type": "string" }, "file_name": { "type": "string" }, "content_base64": { "type": "string" }, "content_text": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" }, "item_id": { "type": "string" }, "if_match": { "type": "string", "description": "eTag precondition for replacement via an upload session at any size" }, "conflict_behavior": { "type": "string", "enum": ["replace", "fail", "rename"] } } })),
         tool_def("create_folder", "Create a new folder inside OneDrive or a SharePoint document library", json!({ "type": "object", "required": ["name"], "properties": { "name": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" } } })),
         tool_def("move_or_rename_item", "Rename and/or move a OneDrive or SharePoint item to another folder", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "new_name": { "type": "string" }, "new_parent_id": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" } } })),
         tool_def("delete_item", "Delete a OneDrive or SharePoint file or folder (requires confirm: true)", json!({ "type": "object", "required": ["confirm"], "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "confirm": { "type": "boolean" } } })),
@@ -804,7 +871,26 @@ pub fn tool_catalog() -> Vec<Value> {
         tool_def("create_share_link", "Create a SharePoint/OneDrive sharing link (view, edit, or embed)", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "type": { "type": "string" }, "scope": { "type": "string" }, "expires": { "type": "string" } } })),
         tool_def("list_recent", "List recently accessed OneDrive files", json!({ "type": "object", "properties": { "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
         tool_def("list_shared_with_me", "List files shared with the signed-in user", json!({ "type": "object", "properties": { "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
-        tool_def("list_versions", "List version history for a OneDrive or SharePoint file", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" } } })),
+        tool_def("list_versions", "List version history for a OneDrive or SharePoint file", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "limit": { "type": "integer", "minimum": 0, "description": "Maximum versions to fetch. Omit to read the full history." } } })),
+        tool_def("list_items", "Read rows and field values from a SharePoint List across all pages", json!({
+            "type": "object", "required": ["site_id", "list_id"], "properties": {
+                "site_id": { "type": "string" }, "list_id": { "type": "string" },
+                "fields": { "type": "array", "items": { "type": "string" }, "description": "Internal column names to select" }
+            }
+        })),
+        tool_def("list_columns", "Discover the internal column names for a SharePoint List", json!({
+            "type": "object", "required": ["site_id", "list_id"], "properties": {
+                "site_id": { "type": "string" }, "list_id": { "type": "string" }
+            }
+        })),
+        tool_def("update_list_item_field", "Set one SharePoint List field by internal name with a JSON value and optional row ETag", json!({
+            "type": "object", "required": ["site_id", "list_id", "item_id", "field", "value"], "properties": {
+                "site_id": { "type": "string" }, "list_id": { "type": "string" }, "item_id": { "type": "string" },
+                "field": { "type": "string", "description": "Exact internal column name from list_columns" },
+                "value": { "description": "Typed JSON value, including false, zero, or null where the column permits it" },
+                "if_match": { "type": "string", "description": "Apply only if this row ETag is current" }
+            }
+        })),
     ]
 }
 
@@ -924,6 +1010,9 @@ mod tests {
             "list_recent",
             "list_shared_with_me",
             "list_versions",
+            "list_items",
+            "list_columns",
+            "update_list_item_field",
         ] {
             assert!(names.contains(&required), "missing MCP tool: {required}");
         }

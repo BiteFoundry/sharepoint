@@ -43,6 +43,7 @@ struct MockGraphState {
     redirect_saw_auth: Arc<AtomicBool>,
     chunk_saw_auth: Arc<AtomicBool>,
     deleted_items: Arc<Mutex<Vec<String>>>,
+    version_pages: Arc<AtomicUsize>,
 }
 
 async fn start_mock_graph() -> (String, MockGraphState, tokio::task::JoinHandle<()>) {
@@ -57,6 +58,7 @@ async fn start_mock_graph() -> (String, MockGraphState, tokio::task::JoinHandle<
         redirect_saw_auth: Arc::new(AtomicBool::new(false)),
         chunk_saw_auth: Arc::new(AtomicBool::new(false)),
         deleted_items: Arc::new(Mutex::new(Vec::new())),
+        version_pages: Arc::new(AtomicUsize::new(0)),
     };
 
     let app = Router::new()
@@ -231,6 +233,7 @@ async fn start_mock_graph() -> (String, MockGraphState, tokio::task::JoinHandle<
                     "size": 25,
                     "file": { "mimeType": if item_id == "item-img" { "image/png" } else { "text/markdown" } },
                     "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" },
+                    "eTag": "\"mock-etag\"",
                     "webUrl": format!("https://contoso.sharepoint.com/items/{item_id}")
                 }))
             })
@@ -251,22 +254,14 @@ async fn start_mock_graph() -> (String, MockGraphState, tokio::task::JoinHandle<
         )
         .route(
             "/v1.0/drives/{drive_id}/items/{item_id}/versions",
-            get(|| async {
+            get(|State(st): State<MockGraphState>, Path((drive_id, item_id)): Path<(String, String)>, Query(query): Query<std::collections::HashMap<String, String>>| async move {
+                st.version_pages.fetch_add(1, Ordering::SeqCst);
+                if query.contains_key("page") {
+                    return Json(json!({ "value": [{ "id": "1.0", "size": 12 }] }));
+                }
                 Json(json!({
-                    "value": [
-                        {
-                            "id": "2.0",
-                            "size": 25,
-                            "lastModifiedDateTime": "2026-11-19T11:00:00Z",
-                            "lastModifiedBy": { "user": { "displayName": "Jane Doe" } }
-                        },
-                        {
-                            "id": "1.0",
-                            "size": 12,
-                            "lastModifiedDateTime": "2026-11-18T11:00:00Z",
-                            "lastModifiedBy": { "user": { "displayName": "Jane Doe" } }
-                        }
-                    ]
+                    "value": [{ "id": "2.0", "size": 25 }],
+                    "@odata.nextLink": format!("{}/drives/{drive_id}/items/{item_id}/versions?page=2", st.base_url)
                 }))
             }),
         )
@@ -564,8 +559,18 @@ async fn e2e_onedrive_sharepoint_pagination_uploads_downloads_and_fts5() {
         .unwrap();
     assert_eq!(renamed.name, "GUIDE.md");
 
+    let versions = graph
+        .list_item_versions_with_limit("drv-me", "item-readme", Some(1))
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].id, "2.0");
+    assert_eq!(mock_state.version_pages.load(Ordering::SeqCst), 1);
+
     let versions = graph.list_item_versions("drv-me", "item-readme").await.unwrap();
-    assert_eq!(versions.len(), 2);
+    let ids: Vec<_> = versions.iter().map(|v| v.id.as_str()).collect();
+    assert_eq!(ids, ["2.0", "1.0"]);
+    assert_eq!(mock_state.version_pages.load(Ordering::SeqCst), 3);
 
     let share = graph
         .create_share_link("drv-me", "item-readme", "view", "organization", None)
@@ -673,6 +678,22 @@ async fn e2e_http_api_and_mcp_tools_parity() {
     .await
     .unwrap();
     assert!(list_tools["result"]["tools"].as_array().unwrap().len() >= 15);
+
+    let compact_info = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_file_info","arguments":{"drive":"me","item_id":"item-readme","compact":true}}}"#,
+    )
+    .await
+    .unwrap();
+    let compact = &compact_info["result"]["structuredContent"];
+    assert_eq!(compact, &json!({ "item": {
+        "drive_id": "drv-me", "id": "item-readme", "name": "README.md", "is_folder": false,
+        "size": 25, "last_modified_at": null, "e_tag": "\"mock-etag\""
+    } }));
+    let text = compact_info["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(&serde_json::from_str::<Value>(text).unwrap(), compact);
 
     // read_text_file
     let read_res = mcp::handle_rpc_line(
