@@ -279,7 +279,11 @@ pub enum SyncCommand {
     RefreshAll,
     SyncSites,
     SyncSiteDrives { site_id: String, site_name: Option<String> },
-    SyncFolder { drive_id: String, parent_id: Option<String> },
+    SyncFolder {
+        drive_id: String,
+        parent_id: Option<String>,
+        reuse_startup_root: bool,
+    },
     SyncRecent,
     SyncShared,
     FocusGained,
@@ -487,6 +491,7 @@ pub fn spawn_sync_engine(
             let mut backoff = ErrorBackoffState::new(active_poll_ms);
             let mut tracker = PeriodicBackoffTracker::default();
             let mut rt = DriveSyncRuntime::default();
+            let mut startup_root = None;
 
             loop {
                 tokio::select! {
@@ -569,20 +574,29 @@ pub fn spawn_sync_engine(
                                     busy: true,
                                     summary: "Syncing OneDrive & SharePoint...".to_string(),
                                 });
-                                sync_core_discovery(&graph, &storage, &event_tx, &shared, &mut backoff, &mut rt).await;
+                                let discovered_root = sync_core_discovery(&graph, &storage, &event_tx, &shared, &mut backoff, &mut rt).await;
+                                let is_startup = matches!(cmd, SyncCommand::Bootstrap);
+                                if is_startup {
+                                    startup_root = discovered_root;
+                                }
                                 let focus = focus_rx.borrow().clone();
                                 match focus.view_kind {
                                     FocusViewKind::Folder => {
                                         if let Some(did) = focus.active_drive_id {
-                                            let _ = sync_drive_delta_once(
-                                                &graph,
-                                                &storage,
-                                                &event_tx,
-                                                &mut rt,
-                                                &did,
-                                                focus.active_parent_id.as_deref(),
-                                            )
-                                            .await;
+                                            let discovery_handled_root = is_startup
+                                                && focus.active_parent_id.is_none()
+                                                && startup_root.as_ref().is_some_and(|(id, _)| *id == did);
+                                            if !discovery_handled_root {
+                                                let _ = sync_drive_delta_once(
+                                                    &graph,
+                                                    &storage,
+                                                    &event_tx,
+                                                    &mut rt,
+                                                    &did,
+                                                    focus.active_parent_id.as_deref(),
+                                                )
+                                                .await;
+                                            }
                                         }
                                     }
                                     FocusViewKind::Recent => {
@@ -643,13 +657,20 @@ pub fn spawn_sync_engine(
                                     let _ = event_tx.send(CoreEvent::DrivesUpdated { site_id, drives });
                                 }
                             }
-                            SyncCommand::SyncFolder { drive_id, parent_id } => {
-                                let result = match storage.get_sync_cursor(&drive_cursor_scope_key(&drive_id)) {
-                                    Ok(None) if !rt.delta_unsupported_drives.contains(&drive_id) => {
-                                        bootstrap_drive_with_delta(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref()).await
-                                    }
-                                    Ok(_) => sync_folder_once(&graph, &storage, &event_tx, &drive_id, parent_id.as_deref()).await,
-                                    Err(err) => Err(err),
+                            SyncCommand::SyncFolder { drive_id, parent_id, reuse_startup_root } => {
+                                let initial_result = startup_root.as_ref()
+                                    .filter(|(id, _)| reuse_startup_root && parent_id.is_none() && *id == drive_id)
+                                    .map(|(_, loaded)| *loaded);
+                                let result = match initial_result {
+                                    Some(true) => Ok(()),
+                                    Some(false) => sync_folder_once(&graph, &storage, &event_tx, &drive_id, None).await,
+                                    None => match storage.get_sync_cursor(&drive_cursor_scope_key(&drive_id)) {
+                                        Ok(None) if !rt.delta_unsupported_drives.contains(&drive_id) => {
+                                            bootstrap_drive_with_delta(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref()).await
+                                        }
+                                        Ok(_) => sync_folder_once(&graph, &storage, &event_tx, &drive_id, parent_id.as_deref()).await,
+                                        Err(err) => Err(err),
+                                    },
                                 };
                                 if let Err(err) = result {
                                     let _ = event_tx.send(CoreEvent::SyncError(format!("List folder: {err:#}")));
@@ -1399,31 +1420,37 @@ async fn sync_core_discovery(
     shared: &Arc<SyncSharedState>,
     backoff: &mut ErrorBackoffState,
     rt: &mut DriveSyncRuntime,
-) {
+) -> Option<(String, bool)> {
     if let Ok(me) = graph.get_me().await {
         let _ = event_tx.send(CoreEvent::ProfileLoaded(me));
     }
 
-    match graph.get_my_drive().await {
+    let root_load = match graph.get_my_drive().await {
         Ok(drive) => {
             let _ = storage.upsert_drives(std::slice::from_ref(&drive));
             let _ = event_tx.send(CoreEvent::MyDriveLoaded(drive.clone()));
-            if storage.get_sync_cursor(&drive_cursor_scope_key(&drive.id)).is_ok_and(|cursor| cursor.is_none())
+            let root_load = if storage.get_sync_cursor(&drive_cursor_scope_key(&drive.id)).is_ok_and(|cursor| cursor.is_none())
                 && !rt.delta_unsupported_drives.contains(&drive.id)
             {
-                let _ = bootstrap_drive_with_delta(graph, storage, event_tx, rt, &drive.id, None).await;
-            }
+                let loaded = bootstrap_drive_with_delta(graph, storage, event_tx, rt, &drive.id, None).await.is_ok();
+                Some((drive.id, loaded))
+            } else {
+                None
+            };
             shared.clear_auth_pause();
             backoff.record_success();
+            root_load
         }
         Err(err) => {
             handle_poll_error(&err, shared, backoff, event_tx);
+            None
         }
-    }
+    };
 
     sync_sites_once(graph, storage, event_tx).await;
     sync_virtual_list_once(graph, storage, event_tx, rt, VirtualListKind::Recent).await;
     sync_virtual_list_once(graph, storage, event_tx, rt, VirtualListKind::SharedWithMe).await;
+    root_load
 }
 
 async fn sync_virtual_list_once(

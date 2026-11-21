@@ -90,7 +90,9 @@ impl ImagePreviewOverlay {
             | Action::OpenImagePreview
             | Action::Input('q')
             | Action::Input('v') => OverlayOutcome::Close,
-            Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
+            Action::Quit | Action::QuitConfirm | Action::LoadPreviewImage => {
+                OverlayOutcome::NotHandled
+            }
             Action::MoveUp | Action::Input('k') => {
                 self.scroll_y = self.scroll_y.saturating_sub(2);
                 OverlayOutcome::Handled

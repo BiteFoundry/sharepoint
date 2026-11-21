@@ -1,11 +1,11 @@
 //! Application state (`AppState`), UI-only state (`UiState`), and async UI task messages (`UiMsg`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bitefoundry_html::{is_safe_raster_image, sniff_content_kind, ContentKind, NativeHtmlServer};
+use bitefoundry_html::{sniff_content_kind, ContentKind, NativeHtmlServer};
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
@@ -156,7 +156,7 @@ pub enum UiMsg {
     },
     ImageBytesFetched {
         cache_key: String,
-        bytes: Arc<[u8]>,
+        result: Result<Arc<[u8]>, String>,
     },
     ImageDecoded {
         cache_key: String,
@@ -167,7 +167,7 @@ pub enum UiMsg {
         item_id: String,
         title: String,
         html: String,
-        cache_key: String,
+        cache_keys: Vec<String>,
     },
     HtmlPreviewReady {
         drive_id: String,
@@ -305,6 +305,20 @@ impl Default for UiState {
     }
 }
 
+const MAX_RAW_IMAGE_ENTRIES: usize = 8;
+
+struct ImageDecodeRequest {
+    cache_key: String,
+    cols: u16,
+    rows: u16,
+    caps: TerminalGraphicsCaps,
+}
+
+struct PendingImageDownload {
+    item: DriveItem,
+    decodes: Vec<ImageDecodeRequest>,
+}
+
 pub struct AppState {
     pub config: AppConfig,
     pub persona: Persona,
@@ -336,7 +350,7 @@ pub struct AppState {
     pub item_versions: HashMap<String, Vec<DriveItemVersion>>,
     pub created_share_links: HashMap<String, String>,
     pub preview_errors: HashMap<String, String>,
-    pub raw_image_bytes: HashMap<String, Arc<[u8]>>,
+    raw_image_bytes: VecDeque<(String, Arc<[u8]>)>,
     pub rendered_images: HashMap<String, RenderedTerminalImage>,
     pub inflight_previews: HashSet<String>,
     /// Maps `txt:{drive_id}:{item_id}` -> revision currently being downloaded so inspector & overlays share one fetch.
@@ -344,7 +358,7 @@ pub struct AppState {
     /// Tracks `txt:{drive_id}:{item_id}` keys whose in-flight download should also update/open an HTML preview overlay.
     pub pending_html_overlay_fetches: HashSet<String>,
     /// Deduplicates raw image byte downloads across inline and modal views for the same item revision.
-    pub inflight_raw_images: HashSet<String>,
+    inflight_raw_images: HashMap<String, PendingImageDownload>,
     pub search_results: Vec<DriveItem>,
     pub active_selected_id: Option<String>,
     /// Lazy localhost Axum HTML server (`0 MB` idle until `o` is pressed).
@@ -395,12 +409,12 @@ impl AppState {
             item_versions: HashMap::new(),
             created_share_links: HashMap::new(),
             preview_errors: HashMap::new(),
-            raw_image_bytes: HashMap::new(),
+            raw_image_bytes: VecDeque::new(),
             rendered_images: HashMap::new(),
             inflight_previews: HashSet::new(),
             inflight_text_revisions: HashMap::new(),
             pending_html_overlay_fetches: HashSet::new(),
-            inflight_raw_images: HashSet::new(),
+            inflight_raw_images: HashMap::new(),
             search_results: Vec::new(),
             active_selected_id: None,
             html_server: NativeHtmlServer::new(),
@@ -547,7 +561,8 @@ impl AppState {
             let rev_key = Self::item_revision_key(&item);
             let drive_item_prefix = format!("{}:{}:", item.effective_drive_id(), item.effective_item_id());
             self.item_versions.retain(|k, _| !k.starts_with(&drive_item_prefix));
-            self.raw_image_bytes.retain(|k, _| !k.starts_with(&drive_item_prefix));
+            self.raw_image_bytes
+                .retain(|(k, _)| !k.starts_with(&drive_item_prefix));
             self.rendered_images.retain(|k, _| {
                 !k.starts_with(&format!("inline:{drive_item_prefix}"))
                     && !k.starts_with(&format!("modal:{drive_item_prefix}"))
@@ -558,7 +573,6 @@ impl AppState {
             self.inflight_previews.remove(&tkey);
             self.inflight_text_revisions.remove(&tkey);
             self.pending_html_overlay_fetches.remove(&tkey);
-            self.inflight_raw_images.retain(|k| !k.starts_with(&drive_item_prefix));
             self.inflight_previews.remove(&format!("ver:{rev_key}"));
         }
     }
@@ -857,6 +871,10 @@ impl AppState {
     }
 
     pub fn load_active_folder(&mut self, ui: &mut UiState) {
+        self.load_folder(ui, false);
+    }
+
+    fn load_folder(&mut self, ui: &mut UiState, reuse_startup_root: bool) {
         let tx = self.ui_tx.clone();
         let graph = self.graph.clone();
         let storage = self.storage.clone();
@@ -947,7 +965,11 @@ impl AppState {
             }
         }
 
-        self.sync_ctrl.request(crate::sync::SyncCommand::SyncFolder { drive_id, parent_id });
+        self.sync_ctrl.request(crate::sync::SyncCommand::SyncFolder {
+            drive_id,
+            parent_id,
+            reuse_startup_root,
+        });
     }
 
     pub fn ensure_inspector_loaded(&mut self, ui: &UiState) {
@@ -1007,159 +1029,110 @@ impl AppState {
         rows: u16,
         caps: TerminalGraphicsCaps,
     ) {
-        if self.rendered_images.contains_key(&cache_key) {
+        if self.rendered_images.contains_key(&cache_key)
+            || !self.inflight_previews.insert(cache_key.clone())
+        {
             return;
         }
-        if !self.inflight_previews.insert(cache_key.clone()) {
-            return;
-        }
-        let tx = self.ui_tx.clone();
-        let did = item.effective_drive_id().to_string();
-        let item_id = item.id.clone();
+
+        let decode = ImageDecodeRequest {
+            cache_key,
+            cols,
+            rows,
+            caps,
+        };
         let raw_cache_key = Self::item_revision_key(item);
-        let item_name = item.name.clone();
-        let item_mime = item.mime_type.clone();
-
-        if let Some(raw) = self.raw_image_bytes.get(&raw_cache_key).cloned() {
-            tokio::task::spawn_blocking(move || {
-                match sniff_content_kind(item_mime.as_deref(), Some(&item_name), Some(&raw)) {
-                    ContentKind::Html => {
-                        let _ = tx.send(UiMsg::HtmlContentSniffed {
-                            drive_id: did,
-                            item_id,
-                            title: item_name,
-                            html: String::from_utf8_lossy(&raw).into_owned(),
-                            cache_key,
-                        });
-                        return;
-                    }
-                    ContentKind::Svg => {
-                        let _ = tx.send(UiMsg::PreviewFailed {
-                            drive_id: did,
-                            item_id,
-                            revision: None,
-                            inflight_key: Some(cache_key),
-                            error: "SVG vector image (image/svg+xml) cannot be raster-decoded — press o to open in browser".into(),
-                        });
-                        return;
-                    }
-                    kind if kind != ContentKind::RasterImage => {
-                        let _ = tx.send(UiMsg::PreviewFailed {
-                            drive_id: did,
-                            item_id,
-                            revision: None,
-                            inflight_key: Some(cache_key),
-                            error: format!("Unsupported image response ({kind:?}); refusing raster decode"),
-                        });
-                        return;
-                    }
-                    _ => {}
-                }
-                match img_preview::decode_and_render_for_protocol(&raw, cols, rows, (18, 20, 26), caps) {
-                    Ok(rendered) => {
-                        let _ = tx.send(UiMsg::ImageDecoded {
-                            cache_key,
-                            rendered,
-                        });
-                    }
-                    Err(err) => {
-                        let _ = tx.send(UiMsg::PreviewFailed {
-                            drive_id: did,
-                            item_id,
-                            revision: None,
-                            inflight_key: Some(cache_key),
-                            error: format!("{err:#}"),
-                        });
-                    }
-                }
-            });
+        if let Some((_, bytes)) = self.raw_image_bytes.iter().find(|(key, _)| key == &raw_cache_key) {
+            let kind = sniff_content_kind(item.mime_type.as_deref(), Some(&item.name), Some(bytes));
+            self.spawn_image_decodes(item.clone(), Arc::clone(bytes), kind, vec![decode]);
             return;
         }
 
-        if !self.inflight_raw_images.insert(raw_cache_key.clone()) {
-            // Another decode (e.g. inline vs modal) is already downloading this exact revision;
-            // allow re-requesting decode once `ImageBytesFetched` lands.
-            self.inflight_previews.remove(&cache_key);
+        if let Some(pending) = self.inflight_raw_images.get_mut(&raw_cache_key) {
+            pending.decodes.push(decode);
             return;
         }
+        self.inflight_raw_images.insert(
+            raw_cache_key.clone(),
+            PendingImageDownload {
+                item: item.clone(),
+                decodes: vec![decode],
+            },
+        );
 
+        let tx = self.ui_tx.clone();
         let graph = self.graph.clone();
+        let did = item.effective_drive_id().to_string();
         let iid = item.effective_item_id().to_string();
         let dl = item.download_url.clone();
         tokio::spawn(async move {
-            match graph
+            let result = graph
                 .download_item_bytes(&did, &iid, dl.as_deref(), 16 * 1024 * 1024)
                 .await
-            {
-                Ok(bytes) => {
-                    let kind = sniff_content_kind(item_mime.as_deref(), Some(&item_name), Some(&bytes));
-                    if kind == ContentKind::Html {
-                        let _ = tx.send(UiMsg::HtmlContentSniffed {
-                            drive_id: did,
-                            item_id,
-                            title: item_name,
-                            html: String::from_utf8_lossy(&bytes).into_owned(),
-                            cache_key,
-                        });
-                        return;
+                .map(Arc::from)
+                .map_err(|err| format!("{err:#}"));
+            let _ = tx.send(UiMsg::ImageBytesFetched {
+                cache_key: raw_cache_key,
+                result,
+            });
+        });
+    }
+
+    pub(crate) fn cache_raw_image(&mut self, cache_key: String, bytes: Arc<[u8]>) {
+        if bytes.len() > img_preview::MAX_IMAGE_CACHE_BYTES {
+            return;
+        }
+        self.raw_image_bytes.retain(|(key, _)| key != &cache_key);
+        let mut total_bytes: usize = self.raw_image_bytes.iter().map(|(_, raw)| raw.len()).sum();
+        while self.raw_image_bytes.len() >= MAX_RAW_IMAGE_ENTRIES
+            || total_bytes + bytes.len() > img_preview::MAX_IMAGE_CACHE_BYTES
+        {
+            let (_, evicted) = self.raw_image_bytes.pop_front().expect("cache has entries to evict");
+            total_bytes -= evicted.len();
+        }
+        self.raw_image_bytes.push_back((cache_key, bytes));
+    }
+
+    fn spawn_image_decodes(
+        &self,
+        item: DriveItem,
+        bytes: Arc<[u8]>,
+        kind: ContentKind,
+        decodes: Vec<ImageDecodeRequest>,
+    ) {
+        let tx = self.ui_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let drive_id = item.effective_drive_id().to_string();
+            if kind == ContentKind::Html {
+                let _ = tx.send(UiMsg::HtmlContentSniffed {
+                    drive_id,
+                    item_id: item.id,
+                    title: item.name,
+                    html: String::from_utf8_lossy(&bytes).into_owned(),
+                    cache_keys: decodes.into_iter().map(|decode| decode.cache_key).collect(),
+                });
+                return;
+            }
+            for ImageDecodeRequest { cache_key, cols, rows, caps } in decodes {
+                let result = match kind {
+                    ContentKind::RasterImage => {
+                        img_preview::decode_and_render_for_protocol(&bytes, cols, rows, (18, 20, 26), caps)
+                            .map_err(|err| format!("{err:#}"))
                     }
-                    if kind == ContentKind::Svg {
-                        let _ = tx.send(UiMsg::PreviewFailed {
-                            drive_id: did,
-                            item_id,
-                            revision: None,
-                            inflight_key: Some(cache_key),
-                            error: "SVG vector image (image/svg+xml) cannot be raster-decoded — press o to open in browser".into(),
-                        });
-                        return;
-                    }
-                    if !is_safe_raster_image(item_mime.as_deref(), Some(&item_name), Some(&bytes)) {
-                        let _ = tx.send(UiMsg::PreviewFailed {
-                            drive_id: did,
-                            item_id,
-                            revision: None,
-                            inflight_key: Some(cache_key),
-                            error: format!("Unsupported image response ({kind:?}); refusing raster decode"),
-                        });
-                        return;
-                    }
-                    let arc: Arc<[u8]> = Arc::from(bytes);
-                    let _ = tx.send(UiMsg::ImageBytesFetched {
-                        cache_key: raw_cache_key,
-                        bytes: Arc::clone(&arc),
-                    });
-                    let decode_tx = tx.clone();
-                    let decode_did = did.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        match img_preview::decode_and_render_for_protocol(&arc, cols, rows, (18, 20, 26), caps) {
-                            Ok(rendered) => {
-                                let _ = decode_tx.send(UiMsg::ImageDecoded {
-                                    cache_key,
-                                    rendered,
-                                });
-                            }
-                            Err(err) => {
-                                let _ = decode_tx.send(UiMsg::PreviewFailed {
-                                    drive_id: decode_did,
-                                    item_id,
-                                    revision: None,
-                                    inflight_key: Some(cache_key),
-                                    error: format!("{err:#}"),
-                                });
-                            }
-                        }
-                    })
-                    .await;
-                }
-                Err(err) => {
-                    let _ = tx.send(UiMsg::PreviewFailed {
-                        drive_id: did,
-                        item_id,
+                    ContentKind::Svg => Err("SVG vector image (image/svg+xml) cannot be raster-decoded — press o to open in browser".into()),
+                    _ => Err(format!("Unsupported image response ({kind:?}); refusing raster decode")),
+                };
+                let msg = match result {
+                    Ok(rendered) => UiMsg::ImageDecoded { cache_key, rendered },
+                    Err(error) => UiMsg::PreviewFailed {
+                        drive_id: drive_id.clone(),
+                        item_id: item.id.clone(),
                         revision: None,
                         inflight_key: Some(cache_key),
-                        error: format!("{err:#}"),
-                    });
-                }
+                        error,
+                    },
+                };
+                let _ = tx.send(msg);
             }
         });
     }
@@ -1236,7 +1209,7 @@ impl AppState {
                 let first_load = self.my_drive.is_none();
                 self.my_drive = Some(drive);
                 if first_load && matches!(self.active_source, ActiveViewSource::OneDriveRoot) {
-                    self.load_active_folder(ui);
+                    self.load_folder(ui, self.folder_stack.is_empty());
                 }
             }
             CoreEvent::SitesUpdated(sites) => {
@@ -1358,6 +1331,7 @@ impl AppState {
                 drives,
                 pins,
             } => {
+                let loaded_drive = self.my_drive.is_none() && my_drive.is_some();
                 if self.my_drive.is_none() {
                     self.my_drive = my_drive;
                 }
@@ -1386,11 +1360,15 @@ impl AppState {
                                     drive_id: d.id.clone(),
                                     label: d.display_label(),
                                 };
+                                self.load_active_folder(ui);
+                                return;
                             }
                         }
                     }
                 }
-                self.load_active_folder(ui);
+                if loaded_drive && matches!(self.active_source, ActiveViewSource::OneDriveRoot) {
+                    self.load_folder(ui, self.folder_stack.is_empty());
+                }
             }
             UiMsg::RecentLoaded(items) => {
                 if matches!(self.active_source, ActiveViewSource::Recent) {
@@ -1521,15 +1499,6 @@ impl AppState {
                     self.inflight_text_revisions.remove(&key);
                     self.pending_html_overlay_fetches.remove(&key);
                 }
-                if !is_text_req {
-                    if let Some(it) = self
-                        .current_items
-                        .iter()
-                        .find(|it| it.effective_drive_id() == drive_id && it.id == item_id)
-                    {
-                        self.inflight_raw_images.remove(&Self::item_revision_key(it));
-                    }
-                }
                 if is_text_req {
                     if self.is_active_text_item(&drive_id, &item_id) {
                         self.preview_errors.insert(
@@ -1547,14 +1516,29 @@ impl AppState {
                     self.preview_errors.insert(err_key, error);
                 }
             }
-            UiMsg::ImageBytesFetched { cache_key, bytes } => {
-                self.inflight_raw_images.remove(&cache_key);
-                if self.raw_image_bytes.len() >= 8 {
-                    self.raw_image_bytes.clear();
+            UiMsg::ImageBytesFetched { cache_key, result } => {
+                let Some(pending) = self.inflight_raw_images.remove(&cache_key) else {
+                    return;
+                };
+                match result {
+                    Ok(bytes) => {
+                        let kind = sniff_content_kind(
+                            pending.item.mime_type.as_deref(),
+                            Some(&pending.item.name),
+                            Some(&bytes),
+                        );
+                        if kind == ContentKind::RasterImage {
+                            self.cache_raw_image(cache_key, Arc::clone(&bytes));
+                        }
+                        self.spawn_image_decodes(pending.item, bytes, kind, pending.decodes);
+                    }
+                    Err(error) => {
+                        for decode in pending.decodes {
+                            self.inflight_previews.remove(&decode.cache_key);
+                        }
+                        self.preview_errors.insert(cache_key, error);
+                    }
                 }
-                self.raw_image_bytes.insert(cache_key, bytes);
-                // If an inline or modal image view was waiting on these bytes, trigger decode now.
-                self.ensure_inspector_loaded(ui);
             }
             UiMsg::ImageDecoded {
                 cache_key,
@@ -1571,9 +1555,11 @@ impl AppState {
                 item_id,
                 title,
                 html,
-                cache_key,
+                cache_keys,
             } => {
-                self.inflight_previews.remove(&cache_key);
+                for cache_key in cache_keys {
+                    self.inflight_previews.remove(&cache_key);
+                }
                 self.preview_errors.remove(&item_id);
                 if self.is_active_item(&drive_id, &item_id) {
                     self.set_text_preview(&drive_id, &item_id, html.clone());
@@ -1830,6 +1816,72 @@ mod tests {
             mime_type: Some(mime.into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn raw_image_cache_evicts_oldest_within_both_limits() {
+        let (mut app, _, _) = test_app_and_ui_with_base_url(None);
+        let budget = img_preview::MAX_IMAGE_CACHE_BYTES;
+        let large: Arc<[u8]> = Arc::from(vec![0; 5_942_323]);
+        for i in 0..9 {
+            let key = i.to_string();
+            app.cache_raw_image(key.clone(), Arc::clone(&large));
+            assert_eq!(app.raw_image_bytes.len(), 1);
+            assert_eq!(app.raw_image_bytes[0].0, key);
+        }
+
+        app.cache_raw_image("oversized".into(), Arc::from(vec![0; budget + 1]));
+        assert_eq!(app.raw_image_bytes.len(), 1);
+        assert_eq!(app.raw_image_bytes[0].0, "8");
+
+        for i in 0..MAX_RAW_IMAGE_ENTRIES {
+            app.cache_raw_image(format!("small-{i}"), Arc::from([0]));
+        }
+        assert_eq!(app.raw_image_bytes.len(), MAX_RAW_IMAGE_ENTRIES);
+        assert_eq!(app.raw_image_bytes.front().unwrap().0, "small-0");
+        app.cache_raw_image("small-0".into(), Arc::from([1]));
+        assert_eq!(app.raw_image_bytes.len(), MAX_RAW_IMAGE_ENTRIES);
+        assert_eq!(app.raw_image_bytes.front().unwrap().0, "small-1");
+        assert_eq!(app.raw_image_bytes.back().unwrap().1.as_ref(), &[1]);
+    }
+
+    #[tokio::test]
+    async fn hd_overlay_decodes_current_cached_image_and_cycles() {
+        let (mut app, mut ui, mut rx) = test_app_and_ui_with_base_url(None);
+        ui.graphics_caps.protocol = TerminalImageProtocol::Halfblock;
+        for (width, name) in [(4, "a.png"), (8, "b.png")] {
+            let item = make_text_file("drive", name, name, "image/png");
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_pixel(width, 4, image::Rgba([80, 90, 100, 255]))
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            app.cache_raw_image(AppState::item_revision_key(&item), Arc::from(png.into_inner()));
+            app.current_items.push(item);
+        }
+        app.active_selected_id = Some("a.png".into());
+        for (action, expected_name, width) in [
+            (Action::OpenImagePreview, "a.png", 4),
+            (Action::Input(']'), "b.png", 8),
+            (Action::Input('['), "a.png", 4),
+        ] {
+            dispatch(action, &mut app, &mut ui);
+            let Some(Overlay::ImagePreview(overlay)) = ui.overlays.last() else {
+                panic!("expected HD overlay");
+            };
+            let item = overlay.current().unwrap();
+            assert_eq!(item.name, expected_name);
+            let (cols, rows) = overlay.target_dimensions(ui.term_width, ui.term_height);
+            let key = app.modal_image_cache_key(item, cols, rows, ui.graphics_caps.protocol);
+            if !app.rendered_images.contains_key(&key) {
+                let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                app.apply_ui_msg(msg, &mut ui);
+            }
+            assert_eq!(app.rendered_images[&key].width_px, width);
+        }
+        assert!(app.inflight_raw_images.is_empty());
     }
 
     fn draw_inspector_frame(app: &AppState, ui: &mut UiState) -> String {

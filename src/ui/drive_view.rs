@@ -1062,7 +1062,7 @@ mod tests {
         };
         app.current_items = vec![fake_png.clone()];
         app.active_selected_id = Some(fake_png.id.clone());
-        app.raw_image_bytes.insert(
+        app.cache_raw_image(
             AppState::item_revision_key(&fake_png),
             std::sync::Arc::from(b"<!DOCTYPE html><html><body><h1>Sign In</h1></body></html>".as_slice()),
         );
@@ -1089,7 +1089,7 @@ mod tests {
             mime_type: Some("image/png".into()),
             ..Default::default()
         };
-        app.raw_image_bytes.insert(
+        app.cache_raw_image(
             AppState::item_revision_key(&fake_svg),
             std::sync::Arc::from(b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>".as_slice()),
         );
