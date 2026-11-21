@@ -18,7 +18,7 @@ sharepoint serve --port 8790 --api-key my-secret
 - `GET /v1/items?drive=&site=&parent_id=&path=&limit=` — list folder contents
 - `GET /v1/items/{id}?drive=&site=` — item metadata
 - `GET /v1/items/{id}/children` — list child items
-- `GET /v1/items/{id}/content?max_bytes=` — text/code preview
+- `GET /v1/items/{id}/content?max_bytes=` — UTF-8 / BOM UTF-16 text preview (`415` for binary or unsupported encodings; use `POST /v1/download` for raw bytes)
 - `GET /v1/items/{id}/versions` — version history
 - `POST /v1/items/folder` — create folder (`{ drive?, site?, parent_id?, name }`)
 - `POST /v1/items/upload` — upload (`{ drive?, site?, parent_id?, local_path?, file_name?, content_base64?, content_text? }`)

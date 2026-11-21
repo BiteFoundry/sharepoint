@@ -120,11 +120,19 @@ pub async fn resolve_site(
 }
 
 pub fn resolve_drive_from_slice(drives: &[DriveInfo], query: &str) -> Result<DriveInfo> {
+    resolve_drive_from_slice_inner(drives, query, true)
+}
+
+fn resolve_drive_from_slice_inner(
+    drives: &[DriveInfo],
+    query: &str,
+    allow_personal_alias: bool,
+) -> Result<DriveInfo> {
     let q = query.trim();
     if q.is_empty() {
         bail!("Drive name or ID is empty.");
     }
-    if is_personal_drive_alias(q) {
+    if allow_personal_alias && is_personal_drive_alias(q) {
         if let Some(personal) = drives.iter().find(|d| d.is_personal_onedrive()) {
             return Ok(personal.clone());
         }
@@ -190,12 +198,6 @@ pub async fn resolve_target_drive(
     let dq = drive_query.map(str::trim).filter(|s| !s.is_empty());
     let sq = site_query.map(str::trim).filter(|s| !s.is_empty());
 
-    if let Some(d_str) = dq {
-        if is_personal_drive_alias(d_str) {
-            return resolve_personal_drive(graph, storage, offline).await;
-        }
-    }
-
     if let Some(s_str) = sq {
         let site = if offline {
             let cached = storage.list_sites()?;
@@ -213,12 +215,18 @@ pub async fn resolve_target_drive(
             fetched
         };
         if let Some(d_str) = dq {
-            return resolve_drive_from_slice(&drives, d_str);
+            return resolve_drive_from_slice_inner(&drives, d_str, false);
         }
         return drives
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("No document libraries found for site '{}'", site.effective_name()));
+    }
+
+    if let Some(d_str) = dq {
+        if is_personal_drive_alias(d_str) {
+            return resolve_personal_drive(graph, storage, offline).await;
+        }
     }
 
     if let Some(d_str) = dq {
@@ -327,22 +335,31 @@ pub async fn resolve_item(
     }
 
     if !looks_like_path {
-        if let Ok(item) = graph.get_item(drive_id, raw).await {
+        match graph.get_item(drive_id, raw).await {
+            Ok(item) => {
+                if item.drive_id == drive_id || item.effective_drive_id() == drive_id {
+                    let _ = storage.upsert_drive_items(std::slice::from_ref(&item));
+                    return Ok(item);
+                }
+            }
+            Err(err) if crate::graph::is_graph_not_found_error(&err) => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    match graph.get_item_by_path(drive_id, raw).await {
+        Ok(item) => {
             if item.drive_id == drive_id || item.effective_drive_id() == drive_id {
                 let _ = storage.upsert_drive_items(std::slice::from_ref(&item));
                 return Ok(item);
             }
+            bail!("Drive item not found in drive '{drive_id}': {raw}")
         }
-    }
-
-    if let Ok(item) = graph.get_item_by_path(drive_id, raw).await {
-        if item.drive_id == drive_id || item.effective_drive_id() == drive_id {
-            let _ = storage.upsert_drive_items(std::slice::from_ref(&item));
-            return Ok(item);
+        Err(err) if crate::graph::is_graph_not_found_error(&err) => {
+            bail!("Drive item not found in drive '{drive_id}': {raw}")
         }
+        Err(err) => Err(err),
     }
-
-    bail!("Drive item not found in drive '{drive_id}': {raw}")
 }
 
 /// Resolves a drive item for mutating operations (delete, move/rename, target folder).

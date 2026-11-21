@@ -1154,6 +1154,7 @@ async fn e2e_sync_fixes_write_targeting_conditional_upload_partial_limit_and_off
                 StatusCode::NOT_FOUND.into_response()
             }),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(st.clone());
 
     let server = tokio::spawn(async move {
@@ -1413,6 +1414,2905 @@ async fn e2e_sync_fixes_write_targeting_conditional_upload_partial_limit_and_off
     assert_eq!(offline_eng.len(), 1);
     assert_eq!(offline_eng[0].id, "site-eng");
     assert!(!offline_eng[0].is_followed);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_sharepoint_sp_02_small_and_large_upload_with_item_id_target_exact_item() {
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use tokio::process::Command;
+
+    #[derive(Clone)]
+    struct Sp02State {
+        base_url: String,
+        items: Arc<Mutex<HashMap<(String, String), Value>>>,
+        contents: Arc<Mutex<HashMap<(String, String), Vec<u8>>>>,
+        sessions: Arc<Mutex<HashMap<String, (String, String, Vec<u8>)>>>,
+        requests: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+
+    let mut init_items = HashMap::new();
+    init_items.insert(
+        ("drv-me".to_string(), "item-root-same".to_string()),
+        json!({
+            "id": "item-root-same",
+            "name": "replacement.txt",
+            "size": 21,
+            "eTag": "\"etag-root-1\"",
+            "file": { "mimeType": "text/plain" },
+            "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+        }),
+    );
+    init_items.insert(
+        ("drv-me".to_string(), "item-nested".to_string()),
+        json!({
+            "id": "item-nested",
+            "name": "replacement.txt",
+            "size": 15,
+            "eTag": "\"etag-nested-1\"",
+            "file": { "mimeType": "text/plain" },
+            "parentReference": { "driveId": "drv-me", "id": "fld-sub", "path": "/drive/root:/Sub" }
+        }),
+    );
+
+    let root_original = b"ORIGINAL_ROOT_CONTENT".to_vec();
+    let root_original_hash = hex::encode(Sha256::digest(&root_original));
+    let mut init_contents = HashMap::new();
+    init_contents.insert(
+        ("drv-me".to_string(), "item-root-same".to_string()),
+        root_original.clone(),
+    );
+    init_contents.insert(
+        ("drv-me".to_string(), "item-nested".to_string()),
+        b"OLD_NESTED_DATA".to_vec(),
+    );
+
+    let st = Sp02State {
+        base_url: base_url.clone(),
+        items: Arc::new(Mutex::new(init_items)),
+        contents: Arc::new(Mutex::new(init_contents)),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/drive",
+            get(|State(s): State<Sp02State>| async move {
+                s.requests
+                    .lock()
+                    .await
+                    .push(("GET".into(), "/v1.0/me/drive".into(), None));
+                Json(json!({
+                    "id": "drv-me",
+                    "name": "OneDrive",
+                    "driveType": "business"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}",
+            get(|State(s): State<Sp02State>, Path((drive_id, item_id)): Path<(String, String)>| async move {
+                s.requests.lock().await.push((
+                    "GET".into(),
+                    format!("/v1.0/drives/{drive_id}/items/{item_id}"),
+                    None,
+                ));
+                match s.items.lock().await.get(&(drive_id, item_id)).cloned() {
+                    Some(v) => (StatusCode::OK, Json(v)).into_response(),
+                    None => (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "error": { "code": "itemNotFound", "message": "Item does not exist" } })),
+                    )
+                        .into_response(),
+                }
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}/content",
+            put(|State(s): State<Sp02State>, Path((drive_id, item_id)): Path<(String, String)>, headers: HeaderMap, body: Bytes| async move {
+                let if_match = headers.get("if-match").and_then(|v| v.to_str().ok()).map(str::to_string);
+                let req_num = {
+                    let mut reqs = s.requests.lock().await;
+                    reqs.push((
+                        "PUT".into(),
+                        format!("/v1.0/drives/{drive_id}/items/{item_id}/content"),
+                        if_match,
+                    ));
+                    reqs.len()
+                };
+                let mut items = s.items.lock().await;
+                let Some(existing) = items.get(&(drive_id.clone(), item_id.clone())).cloned() else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "error": { "code": "itemNotFound", "message": "Item does not exist" } })),
+                    )
+                        .into_response();
+                };
+                let mut updated = existing;
+                updated["size"] = json!(body.len());
+                updated["eTag"] = json!(format!("\"etag-put-{req_num}\""));
+                items.insert((drive_id.clone(), item_id.clone()), updated.clone());
+                s.contents.lock().await.insert((drive_id, item_id), body.to_vec());
+                (StatusCode::OK, Json(updated)).into_response()
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}/createUploadSession",
+            post(|State(s): State<Sp02State>, Path((drive_id, item_id)): Path<(String, String)>, headers: HeaderMap| async move {
+                let if_match = headers.get("if-match").and_then(|v| v.to_str().ok()).map(str::to_string);
+                let req_num = {
+                    let mut reqs = s.requests.lock().await;
+                    reqs.push((
+                        "POST".into(),
+                        format!("/v1.0/drives/{drive_id}/items/{item_id}/createUploadSession"),
+                        if_match.clone(),
+                    ));
+                    reqs.len()
+                };
+                let items = s.items.lock().await;
+                let Some(existing) = items.get(&(drive_id.clone(), item_id.clone())) else {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "error": { "code": "itemNotFound", "message": "Item does not exist" } })),
+                    )
+                        .into_response();
+                };
+                if let Some(ref expected) = if_match {
+                    if existing["eTag"].as_str().unwrap_or("") != expected {
+                        return (
+                            StatusCode::PRECONDITION_FAILED,
+                            Json(json!({ "error": { "code": "resourceModified" } })),
+                        )
+                            .into_response();
+                    }
+                }
+                let sid = format!("sess-{req_num}");
+                s.sessions
+                    .lock()
+                    .await
+                    .insert(sid.clone(), (drive_id, item_id, Vec::new()));
+                let upload_url = format!("{}/upload-session/{sid}", s.base_url.trim_end_matches("/v1.0"));
+                (StatusCode::OK, Json(json!({ "uploadUrl": upload_url }))).into_response()
+            }),
+        )
+        .route(
+            "/upload-session/{sid}",
+            put(|State(s): State<Sp02State>, Path(sid): Path<String>, headers: HeaderMap, body: Bytes| async move {
+                let req_num = {
+                    let mut reqs = s.requests.lock().await;
+                    reqs.push(("PUT".into(), format!("/upload-session/{sid}"), None));
+                    reqs.len()
+                };
+                let range = headers
+                    .get("content-range")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let total: usize = range
+                    .split('/')
+                    .nth(1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut sessions = s.sessions.lock().await;
+                let Some((drive_id, item_id, buf)) = sessions.get_mut(&sid) else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                buf.extend_from_slice(&body);
+                if buf.len() >= total && total > 0 {
+                    let final_bytes = buf.clone();
+                    let d = drive_id.clone();
+                    let id = item_id.clone();
+                    drop(sessions);
+                    let mut items = s.items.lock().await;
+                    let mut updated = items.get(&(d.clone(), id.clone())).cloned().unwrap();
+                    updated["size"] = json!(final_bytes.len());
+                    updated["eTag"] = json!(format!("\"etag-sess-{req_num}\""));
+                    items.insert((d.clone(), id.clone()), updated.clone());
+                    s.contents.lock().await.insert((d, id), final_bytes);
+                    (StatusCode::OK, Json(updated)).into_response()
+                } else {
+                    (StatusCode::ACCEPTED, Json(json!({ "nextExpectedRanges": [] }))).into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/{*tail}",
+            put(|State(s): State<Sp02State>, Path((drive_id, tail)): Path<(String, String)>, body: Bytes| async move {
+                let req_num = {
+                    let mut reqs = s.requests.lock().await;
+                    reqs.push(("PUT".into(), format!("/v1.0/drives/{drive_id}/{tail}"), None));
+                    reqs.len()
+                };
+                if tail.starts_with("root:/") && tail.ends_with(":/content") {
+                    let name = tail.trim_start_matches("root:/").trim_end_matches(":/content");
+                    let mut items = s.items.lock().await;
+                    let existing_id = items
+                        .iter()
+                        .find(|((d, _), v)| {
+                            d == &drive_id
+                                && v["name"].as_str().unwrap_or("").eq_ignore_ascii_case(name)
+                                && v["parentReference"]["path"].as_str().unwrap_or("").ends_with("root:")
+                        })
+                        .map(|((_, id), _)| id.clone());
+                    let id = existing_id.unwrap_or_else(|| format!("item-new-{req_num}"));
+                    let updated = json!({
+                        "id": id,
+                        "name": name,
+                        "size": body.len(),
+                        "eTag": format!("\"etag-path-{req_num}\""),
+                        "file": { "mimeType": "text/plain" },
+                        "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                    });
+                    items.insert((drive_id.clone(), id.clone()), updated.clone());
+                    s.contents.lock().await.insert((drive_id, id), body.to_vec());
+                    return (StatusCode::OK, Json(updated)).into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            }),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
+        .with_state(st.clone());
+
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let profile = tempdir().unwrap();
+    let workdir = tempdir().unwrap();
+    let small_file = workdir.path().join("replacement.txt");
+    let small_payload = b"0123456789abcdef";
+    assert_eq!(small_payload.len(), 16);
+    std::fs::write(&small_file, small_payload).unwrap();
+
+    let run_cli = |args: Vec<String>| {
+        let profile_path = profile.path().to_path_buf();
+        let base_url = base_url.clone();
+        async move {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_sharepoint"));
+            cmd.kill_on_drop(true);
+            for (k, _) in std::env::vars_os() {
+                let u = k.to_string_lossy().to_ascii_uppercase();
+                if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+                    .iter()
+                    .any(|p| u.starts_with(p))
+                {
+                    cmd.env_remove(k);
+                }
+            }
+            cmd.env("SHAREPOINT_GRAPH_BASE_URL", &base_url)
+                .env("SHAREPOINT_ACCESS_TOKEN", "sp02-test-token")
+                .env("SHAREPOINT_DISABLE_KEYRING", "1")
+                .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+                .env("SHAREPOINT_AUTO_DAEMON", "0")
+                .env("SHAREPOINT_CONFIG_DIR", profile_path.join("config"))
+                .env("SHAREPOINT_DATA_DIR", profile_path.join("data"))
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .args(&args)
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1. 16-byte upload with --item-id item-nested (without --if-match) MUST update item-nested only!
+    let out_small = run_cli(vec![
+        "upload".into(),
+        small_file.to_string_lossy().into_owned(),
+        "--drive".into(),
+        "me".into(),
+        "--item-id".into(),
+        "item-nested".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(
+        out_small.status.success(),
+        "small --item-id upload failed: stderr={}",
+        String::from_utf8_lossy(&out_small.stderr)
+    );
+    let small_json: Value = serde_json::from_slice(&out_small.stdout).unwrap();
+    assert_eq!(small_json["id"], "item-nested", "small upload must return nested item ID");
+    assert_eq!(
+        st.contents
+            .lock()
+            .await
+            .get(&("drv-me".into(), "item-nested".into()))
+            .unwrap()
+            .as_slice(),
+        small_payload,
+        "nested item content must be updated by 16-byte upload"
+    );
+    let root_after_small = st
+        .contents
+        .lock()
+        .await
+        .get(&("drv-me".into(), "item-root-same".into()))
+        .unwrap()
+        .clone();
+    assert_eq!(
+        hex::encode(Sha256::digest(&root_after_small)),
+        root_original_hash,
+        "same-named root file hash must remain unchanged"
+    );
+    assert!(
+        st.requests
+            .lock()
+            .await
+            .iter()
+            .any(|(m, p, _)| m == "PUT" && p == "/v1.0/drives/drv-me/items/item-nested/content"),
+        "16-byte --item-id upload must PUT /drives/drv-me/items/item-nested/content"
+    );
+
+    // 2. >= 4 MiB upload with --item-id item-nested uses ID-targeted createUploadSession on same item
+    let large_file = workdir.path().join("replacement.txt");
+    let large_payload = vec![b'Z'; 4 * 1024 * 1024 + 1024];
+    std::fs::write(&large_file, &large_payload).unwrap();
+    let reqs_before_large = st.requests.lock().await.len();
+    let out_large = run_cli(vec![
+        "upload".into(),
+        large_file.to_string_lossy().into_owned(),
+        "--drive".into(),
+        "me".into(),
+        "--item-id".into(),
+        "item-nested".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(
+        out_large.status.success(),
+        "large --item-id upload failed: stderr={}",
+        String::from_utf8_lossy(&out_large.stderr)
+    );
+    let large_json: Value = serde_json::from_slice(&out_large.stdout).unwrap();
+    assert_eq!(large_json["id"], "item-nested");
+    assert_eq!(
+        st.contents
+            .lock()
+            .await
+            .get(&("drv-me".into(), "item-nested".into()))
+            .unwrap()
+            .len(),
+        large_payload.len()
+    );
+    assert!(
+        st.requests.lock().await[reqs_before_large..]
+            .iter()
+            .any(|(m, p, _)| m == "POST"
+                && p == "/v1.0/drives/drv-me/items/item-nested/createUploadSession"),
+        "large --item-id upload must use items/item-nested/createUploadSession"
+    );
+    let root_after_large = st
+        .contents
+        .lock()
+        .await
+        .get(&("drv-me".into(), "item-root-same".into()))
+        .unwrap()
+        .clone();
+    assert_eq!(
+        hex::encode(Sha256::digest(&root_after_large)),
+        root_original_hash,
+        "root file hash must remain unchanged after large --item-id upload"
+    );
+
+    // 3. Regression control: nonexistent --item-id fails with 404 and does NOT create path-based file
+    std::fs::write(&small_file, b"missing-id-bytes").unwrap();
+    let items_before_missing = st.items.lock().await.len();
+    let reqs_before_missing = st.requests.lock().await.len();
+    let out_missing = run_cli(vec![
+        "upload".into(),
+        small_file.to_string_lossy().into_owned(),
+        "--drive".into(),
+        "me".into(),
+        "--item-id".into(),
+        "item-does-not-exist".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(!out_missing.status.success(), "missing --item-id must fail");
+    assert!(
+        String::from_utf8_lossy(&out_missing.stderr).contains("404"),
+        "expected 404 error, got: {}",
+        String::from_utf8_lossy(&out_missing.stderr)
+    );
+    assert_eq!(
+        st.items.lock().await.len(),
+        items_before_missing,
+        "missing --item-id must not create any new item"
+    );
+    assert!(
+        !st.requests.lock().await[reqs_before_missing..]
+            .iter()
+            .any(|(m, p, _)| m == "PUT" && p.contains("root:/")),
+        "missing --item-id must not fall back to path-based PUT"
+    );
+
+    // 4. Regression control: upload without --item-id still uses filename/parent path policy
+    let fresh_file = workdir.path().join("fresh.txt");
+    std::fs::write(&fresh_file, b"fresh-content").unwrap();
+    let out_fresh = run_cli(vec![
+        "upload".into(),
+        fresh_file.to_string_lossy().into_owned(),
+        "--drive".into(),
+        "me".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(out_fresh.status.success());
+    let fresh_json: Value = serde_json::from_slice(&out_fresh.stdout).unwrap();
+    assert_eq!(fresh_json["name"], "fresh.txt");
+    assert!(
+        st.requests
+            .lock()
+            .await
+            .iter()
+            .any(|(m, p, _)| m == "PUT" && p == "/v1.0/drives/drv-me/root:/fresh.txt:/content"),
+        "upload without --item-id must still use path-based PUT"
+    );
+
+    // 5. Regression control: conditional --item-id + --if-match keeps upload-session preflight branch
+    let current_nested_etag = st
+        .items
+        .lock()
+        .await
+        .get(&("drv-me".into(), "item-nested".into()))
+        .unwrap()["eTag"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reqs_before_cond = st.requests.lock().await.len();
+    let out_cond = run_cli(vec![
+        "upload".into(),
+        small_file.to_string_lossy().into_owned(),
+        "--drive".into(),
+        "me".into(),
+        "--item-id".into(),
+        "item-nested".into(),
+        "--if-match".into(),
+        current_nested_etag.clone(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(
+        out_cond.status.success(),
+        "conditional --item-id + --if-match upload failed: {}",
+        String::from_utf8_lossy(&out_cond.stderr)
+    );
+    assert!(
+        st.requests.lock().await[reqs_before_cond..]
+            .iter()
+            .any(|(m, p, im)| m == "POST"
+                && p == "/v1.0/drives/drv-me/items/item-nested/createUploadSession"
+                && im.as_deref() == Some(current_nested_etag.as_str())),
+        "conditional upload must continue using createUploadSession with If-Match"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_sharepoint_sp_05_copy_upload_preserves_original_download_baseline() {
+    use std::collections::HashMap;
+    use tokio::process::Command;
+
+    #[derive(Clone)]
+    struct Sp05State {
+        base_url: String,
+        items: Arc<Mutex<HashMap<(String, String), Value>>>,
+        contents: Arc<Mutex<HashMap<(String, String), Vec<u8>>>>,
+        sessions: Arc<Mutex<HashMap<String, (String, String, Vec<u8>)>>>,
+        requests: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+        next_seq: Arc<AtomicUsize>,
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+
+    let mut init_items = HashMap::new();
+    init_items.insert(
+        ("drv-me".into(), "fld-a".into()),
+        json!({
+            "id": "fld-a",
+            "name": "FolderA",
+            "size": 0,
+            "folder": { "childCount": 1 },
+            "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+        }),
+    );
+    init_items.insert(
+        ("drv-me".into(), "fld-b".into()),
+        json!({
+            "id": "fld-b",
+            "name": "FolderB",
+            "size": 0,
+            "folder": { "childCount": 0 },
+            "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+        }),
+    );
+    init_items.insert(
+        ("drv-me".into(), "item-spec-orig".into()),
+        json!({
+            "id": "item-spec-orig",
+            "name": "spec.md",
+            "size": 11,
+            "eTag": "\"spec-v1\"",
+            "cTag": "\"spec-ctag-v1\"",
+            "file": { "mimeType": "text/markdown" },
+            "parentReference": { "driveId": "drv-me", "id": "fld-a", "path": "/drive/root:/FolderA" }
+        }),
+    );
+
+    let mut init_contents = HashMap::new();
+    init_contents.insert(
+        ("drv-me".into(), "item-spec-orig".into()),
+        b"ORIGINAL_V1".to_vec(),
+    );
+
+    let st = Sp05State {
+        base_url: base_url.clone(),
+        items: Arc::new(Mutex::new(init_items)),
+        contents: Arc::new(Mutex::new(init_contents)),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        requests: Arc::new(Mutex::new(Vec::new())),
+        next_seq: Arc::new(AtomicUsize::new(1)),
+    };
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/drive",
+            get(|| async {
+                Json(json!({
+                    "id": "drv-me",
+                    "name": "OneDrive",
+                    "driveType": "business"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}",
+            get(|Path(drive_id): Path<String>| async move {
+                Json(json!({
+                    "id": drive_id,
+                    "name": "OtherLib",
+                    "driveType": "documentLibrary"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}",
+            get(|State(s): State<Sp05State>, Path((drive_id, item_id)): Path<(String, String)>| async move {
+                s.requests.lock().await.push((
+                    "GET".into(),
+                    format!("/v1.0/drives/{drive_id}/items/{item_id}"),
+                    None,
+                ));
+                match s.items.lock().await.get(&(drive_id, item_id)).cloned() {
+                    Some(v) => (StatusCode::OK, Json(v)).into_response(),
+                    None => (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "error": { "code": "itemNotFound" } })),
+                    )
+                        .into_response(),
+                }
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}/content",
+            get(|State(s): State<Sp05State>, Path((drive_id, item_id)): Path<(String, String)>| async move {
+                match s.contents.lock().await.get(&(drive_id, item_id)).cloned() {
+                    Some(data) => ([(header::CONTENT_TYPE, "text/markdown")], data).into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}/createUploadSession",
+            post(|State(s): State<Sp05State>, Path((drive_id, item_id)): Path<(String, String)>, headers: HeaderMap| async move {
+                let if_match = headers.get("if-match").and_then(|v| v.to_str().ok()).map(str::to_string);
+                s.requests.lock().await.push((
+                    "POST".into(),
+                    format!("/v1.0/drives/{drive_id}/items/{item_id}/createUploadSession"),
+                    if_match.clone(),
+                ));
+                let items = s.items.lock().await;
+                let Some(existing) = items.get(&(drive_id.clone(), item_id.clone())) else {
+                    return (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "itemNotFound" } }))).into_response();
+                };
+                if let Some(ref expected) = if_match {
+                    if existing["eTag"].as_str().unwrap_or("") != expected {
+                        return (
+                            StatusCode::PRECONDITION_FAILED,
+                            Json(json!({ "error": { "code": "resourceModified" } })),
+                        )
+                            .into_response();
+                    }
+                }
+                let seq = s.next_seq.fetch_add(1, Ordering::SeqCst);
+                let sid = format!("sess-{seq}");
+                s.sessions
+                    .lock()
+                    .await
+                    .insert(sid.clone(), (drive_id, item_id, Vec::new()));
+                let upload_url = format!("{}/upload-session/{sid}", s.base_url.trim_end_matches("/v1.0"));
+                (StatusCode::OK, Json(json!({ "uploadUrl": upload_url }))).into_response()
+            }),
+        )
+        .route(
+            "/upload-session/{sid}",
+            put(|State(s): State<Sp05State>, Path(sid): Path<String>, body: Bytes| async move {
+                let Some((drive_id, item_id, _)) = s.sessions.lock().await.remove(&sid) else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                let seq = s.next_seq.fetch_add(1, Ordering::SeqCst);
+                let mut items = s.items.lock().await;
+                let mut updated = items.get(&(drive_id.clone(), item_id.clone())).cloned().unwrap();
+                updated["size"] = json!(body.len());
+                updated["eTag"] = json!(format!("\"spec-sess-{seq}\""));
+                updated["cTag"] = json!(format!("\"spec-ctag-sess-{seq}\""));
+                items.insert((drive_id.clone(), item_id.clone()), updated.clone());
+                s.contents.lock().await.insert((drive_id, item_id), body.to_vec());
+                (StatusCode::OK, Json(updated)).into_response()
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/{*tail}",
+            get(|State(s): State<Sp05State>, Path((drive_id, tail)): Path<(String, String)>| async move {
+                s.requests.lock().await.push((
+                    "GET".into(),
+                    format!("/v1.0/drives/{drive_id}/{tail}"),
+                    None,
+                ));
+                if tail.starts_with("root:/") && tail.ends_with(':') {
+                    let rel = tail.trim_start_matches("root:/").trim_end_matches(':');
+                    let norm = format!("/{}", rel.trim_matches('/'));
+                    let items = s.items.lock().await;
+                    for ((d, _), v) in items.iter() {
+                        if d != &drive_id {
+                            continue;
+                        }
+                        let pp = v["parentReference"]["path"].as_str().unwrap_or("");
+                        let ptail = pp.split("root:").nth(1).unwrap_or("").trim_end_matches('/');
+                        let name = v["name"].as_str().unwrap_or("");
+                        let full = if ptail.is_empty() {
+                            format!("/{name}")
+                        } else {
+                            format!("{ptail}/{name}")
+                        };
+                        if full.eq_ignore_ascii_case(&norm) {
+                            return (StatusCode::OK, Json(v.clone())).into_response();
+                        }
+                    }
+                }
+                (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "itemNotFound" } }))).into_response()
+            })
+            .put(|State(s): State<Sp05State>, Path((drive_id, tail)): Path<(String, String)>, body: Bytes| async move {
+                s.requests.lock().await.push((
+                    "PUT".into(),
+                    format!("/v1.0/drives/{drive_id}/{tail}"),
+                    None,
+                ));
+                let seq = s.next_seq.fetch_add(1, Ordering::SeqCst);
+                if tail.starts_with("items/") && tail.ends_with(":/content") {
+                    let inner = tail.trim_start_matches("items/").trim_end_matches(":/content");
+                    if let Some((parent_id, name)) = inner.split_once(":/") {
+                        let mut items = s.items.lock().await;
+                        let parent_path = items
+                            .get(&(drive_id.clone(), parent_id.to_string()))
+                            .map(|p| {
+                                let pp = p["parentReference"]["path"].as_str().unwrap_or("/drive/root:");
+                                let pname = p["name"].as_str().unwrap_or("");
+                                if pp.ends_with("root:") {
+                                    format!("/drive/root:/{pname}")
+                                } else {
+                                    format!("{pp}/{pname}")
+                                }
+                            })
+                            .unwrap_or_else(|| "/drive/root:".into());
+                        let existing_id = items
+                            .iter()
+                            .find(|((d, _), v)| {
+                                d == &drive_id
+                                    && v["parentReference"]["id"].as_str() == Some(parent_id)
+                                    && v["name"].as_str().unwrap_or("").eq_ignore_ascii_case(name)
+                            })
+                            .map(|((_, id), _)| id.clone());
+                        let id = existing_id.unwrap_or_else(|| format!("item-copy-{seq}"));
+                        let updated = json!({
+                            "id": id,
+                            "name": name,
+                            "size": body.len(),
+                            "eTag": format!("\"etag-put-{seq}\""),
+                            "cTag": format!("\"ctag-put-{seq}\""),
+                            "file": { "mimeType": "text/markdown" },
+                            "parentReference": { "driveId": drive_id, "id": parent_id, "path": parent_path }
+                        });
+                        items.insert((drive_id.clone(), id.clone()), updated.clone());
+                        s.contents.lock().await.insert((drive_id, id), body.to_vec());
+                        return (StatusCode::CREATED, Json(updated)).into_response();
+                    }
+                }
+                if tail.starts_with("root:/") && tail.ends_with(":/content") {
+                    let name = tail.trim_start_matches("root:/").trim_end_matches(":/content");
+                    let id = format!("item-other-drv-{seq}");
+                    let updated = json!({
+                        "id": id,
+                        "name": name,
+                        "size": body.len(),
+                        "eTag": format!("\"etag-other-{seq}\""),
+                        "file": { "mimeType": "text/markdown" },
+                        "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                    });
+                    s.items.lock().await.insert((drive_id.clone(), id.clone()), updated.clone());
+                    s.contents.lock().await.insert((drive_id, id), body.to_vec());
+                    return (StatusCode::CREATED, Json(updated)).into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            }),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
+        .with_state(st.clone());
+
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let profile = tempdir().unwrap();
+    let dl_dir = tempdir().unwrap();
+    let run_cli = |args: Vec<String>| {
+        let profile_path = profile.path().to_path_buf();
+        let base_url = base_url.clone();
+        async move {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_sharepoint"));
+            cmd.kill_on_drop(true);
+            for (k, _) in std::env::vars_os() {
+                let u = k.to_string_lossy().to_ascii_uppercase();
+                if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+                    .iter()
+                    .any(|p| u.starts_with(p))
+                {
+                    cmd.env_remove(k);
+                }
+            }
+            cmd.env("SHAREPOINT_GRAPH_BASE_URL", &base_url)
+                .env("SHAREPOINT_ACCESS_TOKEN", "sp05-test-token")
+                .env("SHAREPOINT_DISABLE_KEYRING", "1")
+                .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+                .env("SHAREPOINT_AUTO_DAEMON", "0")
+                .env("SHAREPOINT_CONFIG_DIR", profile_path.join("config"))
+                .env("SHAREPOINT_DATA_DIR", profile_path.join("data"))
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .args(&args)
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1. Download original /FolderA/spec.md
+    let out_dl = run_cli(vec![
+        "download".into(),
+        "/FolderA/spec.md".into(),
+        "--drive".into(),
+        "me".into(),
+        "--dir".into(),
+        dl_dir.path().to_string_lossy().into_owned(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(out_dl.status.success(), "download failed: {}", String::from_utf8_lossy(&out_dl.stderr));
+    let dl_json: Value = serde_json::from_slice(&out_dl.stdout).unwrap();
+    let local_path = std::path::PathBuf::from(dl_json["path"].as_str().unwrap());
+    assert_eq!(dl_json["item_id"], "item-spec-orig");
+
+    // 2. Edit locally and upload copy to /FolderB, then another copy by name, then to another drive
+    std::fs::write(&local_path, b"LOCAL_STALE_EDIT").unwrap();
+    let out_copy_folder = run_cli(vec![
+        "upload".into(),
+        local_path.to_string_lossy().into_owned(),
+        "/FolderB".into(),
+        "--drive".into(),
+        "me".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(out_copy_folder.status.success());
+    let copy_json: Value = serde_json::from_slice(&out_copy_folder.stdout).unwrap();
+    let copy_id = copy_json["id"].as_str().unwrap().to_string();
+    assert_ne!(copy_id, "item-spec-orig");
+
+    let out_copy_name = run_cli(vec![
+        "upload".into(),
+        local_path.to_string_lossy().into_owned(),
+        "/FolderA".into(),
+        "--name".into(),
+        "spec-copy.md".into(),
+        "--drive".into(),
+        "me".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(out_copy_name.status.success());
+
+    let out_copy_drive = run_cli(vec![
+        "upload".into(),
+        local_path.to_string_lossy().into_owned(),
+        "--drive".into(),
+        "drv-other".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(out_copy_drive.status.success());
+
+    // 3. Server colleague edits original /FolderA/spec.md
+    {
+        let mut items = st.items.lock().await;
+        let orig = items.get_mut(&("drv-me".into(), "item-spec-orig".into())).unwrap();
+        orig["eTag"] = json!("\"spec-v2-server\"");
+        orig["cTag"] = json!("\"spec-ctag-v2-server\"");
+        orig["size"] = json!(23);
+        st.contents
+            .lock()
+            .await
+            .insert(("drv-me".into(), "item-spec-orig".into()), b"SERVER EDIT BY COLLEAGUE".to_vec());
+    }
+
+    // 4. Re-upload local file to original location /FolderA -> MUST fail with 412 conflict!
+    let out_reupload = run_cli(vec![
+        "upload".into(),
+        local_path.to_string_lossy().into_owned(),
+        "/FolderA".into(),
+        "--drive".into(),
+        "me".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(
+        !out_reupload.status.success(),
+        "re-upload after copy upload must detect 412 conflict instead of overwriting colleague edit; stdout={}",
+        String::from_utf8_lossy(&out_reupload.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out_reupload.stderr).contains("412"),
+        "expected 412 conflict error, got: {}",
+        String::from_utf8_lossy(&out_reupload.stderr)
+    );
+    // Server original preserved, copy has local content, baseline item_id & eTag unchanged
+    assert_eq!(
+        st.contents
+            .lock()
+            .await
+            .get(&("drv-me".into(), "item-spec-orig".into()))
+            .unwrap()
+            .as_slice(),
+        b"SERVER EDIT BY COLLEAGUE"
+    );
+    assert_eq!(
+        st.contents
+            .lock()
+            .await
+            .get(&("drv-me".into(), copy_id.clone()))
+            .unwrap()
+            .as_slice(),
+        b"LOCAL_STALE_EDIT"
+    );
+    let db_path = profile.path().join("data").join("default").join("cache.db");
+    let storage = Storage::open(&db_path).unwrap();
+    let baseline = storage.get_download_baseline(&local_path).unwrap().unwrap();
+    assert_eq!(baseline.drive_id, "drv-me");
+    assert_eq!(baseline.item_id, "item-spec-orig");
+    assert_eq!(baseline.e_tag.as_deref(), Some("\"spec-v1\""));
+
+    // 5. Regression control: explicit re-download sets baseline to v2; normal updates advance eTag twice
+    let dl_dir2 = tempdir().unwrap();
+    let out_dl2 = run_cli(vec![
+        "download".into(),
+        "/FolderA/spec.md".into(),
+        "--drive".into(),
+        "me".into(),
+        "--dir".into(),
+        dl_dir2.path().to_string_lossy().into_owned(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(out_dl2.status.success());
+    let local_path2 = std::path::PathBuf::from(
+        serde_json::from_slice::<Value>(&out_dl2.stdout).unwrap()["path"]
+            .as_str()
+            .unwrap(),
+    );
+    std::fs::write(&local_path2, b"MERGED_EDIT_1").unwrap();
+    let out_ok1 = run_cli(vec![
+        "upload".into(),
+        local_path2.to_string_lossy().into_owned(),
+        "/FolderA".into(),
+        "--drive".into(),
+        "me".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(
+        out_ok1.status.success(),
+        "first clean update of original failed: {}",
+        String::from_utf8_lossy(&out_ok1.stderr)
+    );
+    let ok1_etag = serde_json::from_slice::<Value>(&out_ok1.stdout).unwrap()["e_tag"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let baseline2 = storage.get_download_baseline(&local_path2).unwrap().unwrap();
+    assert_eq!(baseline2.item_id, "item-spec-orig");
+    assert_eq!(baseline2.e_tag.as_deref(), Some(ok1_etag.as_str()));
+
+    std::fs::write(&local_path2, b"MERGED_EDIT_2").unwrap();
+    let out_ok2 = run_cli(vec![
+        "upload".into(),
+        local_path2.to_string_lossy().into_owned(),
+        "/FolderA".into(),
+        "--drive".into(),
+        "me".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(
+        out_ok2.status.success(),
+        "second clean update of original using refreshed baseline eTag failed: {}",
+        String::from_utf8_lossy(&out_ok2.stderr)
+    );
+    assert_eq!(
+        st.contents
+            .lock()
+            .await
+            .get(&("drv-me".into(), "item-spec-orig".into()))
+            .unwrap()
+            .as_slice(),
+        b"MERGED_EDIT_2"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_sharepoint_sp_03_explicit_site_resolves_site_drives_named_personal_or_my() {
+    use tokio::process::Command;
+
+    #[derive(Clone)]
+    struct Sp03State {
+        me_drive_calls: Arc<AtomicUsize>,
+        upload_paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    let st = Sp03State {
+        me_drive_calls: Arc::new(AtomicUsize::new(0)),
+        upload_paths: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/drive",
+            get(|State(s): State<Sp03State>| async move {
+                s.me_drive_calls.fetch_add(1, Ordering::SeqCst);
+                Json(json!({
+                    "id": "drv-me",
+                    "name": "OneDrive",
+                    "driveType": "business"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/followedSites",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "site-acme",
+                        "name": "acme-engineering",
+                        "displayName": "Acme Engineering",
+                        "webUrl": "https://synthetic.sharepoint.test/sites/acme-engineering"
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/sites",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "site-acme",
+                        "name": "acme-engineering",
+                        "displayName": "Acme Engineering",
+                        "webUrl": "https://synthetic.sharepoint.test/sites/acme-engineering"
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/sites/{site_id}/drives",
+            get(|Path(site_id): Path<String>| async move {
+                if site_id == "site-acme" {
+                    Json(json!({
+                        "value": [
+                            {
+                                "id": "drv-eng-personal",
+                                "name": "Personal",
+                                "driveType": "documentLibrary"
+                            },
+                            {
+                                "id": "drv-eng-my",
+                                "name": "My",
+                                "driveType": "documentLibrary"
+                            },
+                            {
+                                "id": "drv-eng-docs",
+                                "name": "Documents",
+                                "driveType": "documentLibrary"
+                            }
+                        ]
+                    }))
+                } else {
+                    Json(json!({ "value": [] }))
+                }
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/root/children",
+            get(|Path(drive_id): Path<String>| async move {
+                let name = match drive_id.as_str() {
+                    "drv-eng-personal" => "site-personal-handbook.md",
+                    "drv-eng-my" => "site-my-checklist.md",
+                    "drv-me" => "my-private-budget.xlsx",
+                    _ => "other.txt",
+                };
+                Json(json!({
+                    "value": [{
+                        "id": format!("item-{drive_id}"),
+                        "name": name,
+                        "size": 10,
+                        "file": { "mimeType": "text/plain" },
+                        "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/{*tail}",
+            put(|State(s): State<Sp03State>, Path((drive_id, tail)): Path<(String, String)>, body: Bytes| async move {
+                s.upload_paths
+                    .lock()
+                    .await
+                    .push(format!("/v1.0/drives/{drive_id}/{tail}"));
+                let name = tail.trim_start_matches("root:/").trim_end_matches(":/content");
+                (
+                    StatusCode::CREATED,
+                    Json(json!({
+                        "id": format!("up-{drive_id}"),
+                        "name": name,
+                        "size": body.len(),
+                        "file": { "mimeType": "text/plain" },
+                        "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                    })),
+                )
+            }),
+        )
+        .with_state(st.clone());
+
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let profile = tempdir().unwrap();
+    let workdir = tempdir().unwrap();
+    let upload_file = workdir.path().join("note.txt");
+    std::fs::write(&upload_file, b"hello site library").unwrap();
+
+    let run_cli = |args: Vec<String>| {
+        let profile_path = profile.path().to_path_buf();
+        let base_url = base_url.clone();
+        async move {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_sharepoint"));
+            cmd.kill_on_drop(true);
+            for (k, _) in std::env::vars_os() {
+                let u = k.to_string_lossy().to_ascii_uppercase();
+                if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+                    .iter()
+                    .any(|p| u.starts_with(p))
+                {
+                    cmd.env_remove(k);
+                }
+            }
+            cmd.env("SHAREPOINT_GRAPH_BASE_URL", &base_url)
+                .env("SHAREPOINT_ACCESS_TOKEN", "sp03-test-token")
+                .env("SHAREPOINT_DISABLE_KEYRING", "1")
+                .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+                .env("SHAREPOINT_AUTO_DAEMON", "0")
+                .env("SHAREPOINT_CONFIG_DIR", profile_path.join("config"))
+                .env("SHAREPOINT_DATA_DIR", profile_path.join("data"))
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .args(&args)
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1. --site "Acme Engineering" --drive Personal -> site library drv-eng-personal, 0 /me/drive calls
+    let ls_personal = run_cli(vec![
+        "ls".into(),
+        "--site".into(),
+        "Acme Engineering".into(),
+        "--drive".into(),
+        "Personal".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(ls_personal.status.success(), "ls Personal failed: {}", String::from_utf8_lossy(&ls_personal.stderr));
+    let ls_personal_json: Value = serde_json::from_slice(&ls_personal.stdout).unwrap();
+    assert_eq!(ls_personal_json["drive"]["id"], "drv-eng-personal");
+    assert_eq!(ls_personal_json["items"][0]["name"], "site-personal-handbook.md");
+    assert_eq!(st.me_drive_calls.load(Ordering::SeqCst), 0, "must not query /me/drive when --site is given");
+
+    // 2. --site "Acme Engineering" --drive My -> site library drv-eng-my, 0 /me/drive calls
+    let ls_my = run_cli(vec![
+        "ls".into(),
+        "--site".into(),
+        "Acme Engineering".into(),
+        "--drive".into(),
+        "My".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(ls_my.status.success());
+    let ls_my_json: Value = serde_json::from_slice(&ls_my.stdout).unwrap();
+    assert_eq!(ls_my_json["drive"]["id"], "drv-eng-my");
+    assert_eq!(ls_my_json["items"][0]["name"], "site-my-checklist.md");
+    assert_eq!(st.me_drive_calls.load(Ordering::SeqCst), 0);
+
+    // 3. upload with --site and --drive Personal / My -> targets site drives, 0 /me/drive calls
+    let up_personal = run_cli(vec![
+        "upload".into(),
+        upload_file.to_string_lossy().into_owned(),
+        "--site".into(),
+        "Acme Engineering".into(),
+        "--drive".into(),
+        "Personal".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(up_personal.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&up_personal.stdout).unwrap()["drive_id"],
+        "drv-eng-personal"
+    );
+
+    let up_my = run_cli(vec![
+        "upload".into(),
+        upload_file.to_string_lossy().into_owned(),
+        "--site".into(),
+        "Acme Engineering".into(),
+        "--drive".into(),
+        "My".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(up_my.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&up_my.stdout).unwrap()["drive_id"],
+        "drv-eng-my"
+    );
+    assert_eq!(st.me_drive_calls.load(Ordering::SeqCst), 0);
+
+    // 4. Unmatched alias inside explicit site (e.g. --site "Acme Engineering" --drive OneDrive) fails with 0 /me/drive calls
+    let ls_missing = run_cli(vec![
+        "ls".into(),
+        "--site".into(),
+        "Acme Engineering".into(),
+        "--drive".into(),
+        "OneDrive".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(!ls_missing.status.success(), "non-existent library inside --site must fail");
+    assert_eq!(st.me_drive_calls.load(Ordering::SeqCst), 0);
+
+    // 5. Regression control: exact drive ID and unique prefix "Pers" inside site continue working
+    let ls_id = run_cli(vec![
+        "ls".into(),
+        "--site".into(),
+        "Acme Engineering".into(),
+        "--drive".into(),
+        "drv-eng-personal".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(ls_id.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&ls_id.stdout).unwrap()["drive"]["id"], "drv-eng-personal");
+
+    let ls_prefix = run_cli(vec![
+        "ls".into(),
+        "--site".into(),
+        "Acme Engineering".into(),
+        "--drive".into(),
+        "Pers".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(ls_prefix.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&ls_prefix.stdout).unwrap()["drive"]["id"], "drv-eng-personal");
+    assert_eq!(st.me_drive_calls.load(Ordering::SeqCst), 0);
+
+    // 6. Regression control: without --site, me / onedrive aliases still resolve personal OneDrive
+    let ls_me = run_cli(vec!["ls".into(), "--drive".into(), "me".into(), "--json".into()]).await;
+    assert!(ls_me.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&ls_me.stdout).unwrap()["drive"]["id"], "drv-me");
+    assert_eq!(st.me_drive_calls.load(Ordering::SeqCst), 1);
+
+    let ls_od = run_cli(vec!["ls".into(), "--drive".into(), "onedrive".into(), "--json".into()]).await;
+    assert!(ls_od.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&ls_od.stdout).unwrap()["drive"]["id"], "drv-me");
+
+    // 7. bitefoundry-onedrive entrypoint also resolves explicit --site library without touching /me/drive
+    let me_calls_before_od = st.me_drive_calls.load(Ordering::SeqCst);
+    let od_profile = tempdir().unwrap();
+    let mut od_cmd = Command::new(env!("CARGO_BIN_EXE_bitefoundry-onedrive"));
+    od_cmd.kill_on_drop(true);
+    for (k, _) in std::env::vars_os() {
+        let u = k.to_string_lossy().to_ascii_uppercase();
+        if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+            .iter()
+            .any(|p| u.starts_with(p))
+        {
+            od_cmd.env_remove(k);
+        }
+    }
+    let od_site_out = od_cmd
+        .env("SHAREPOINT_GRAPH_BASE_URL", &base_url)
+        .env("SHAREPOINT_ACCESS_TOKEN", "sp03-od-token")
+        .env("SHAREPOINT_DISABLE_KEYRING", "1")
+        .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+        .env("SHAREPOINT_AUTO_DAEMON", "0")
+        .env("SHAREPOINT_CONFIG_DIR", od_profile.path().join("config"))
+        .env("SHAREPOINT_DATA_DIR", od_profile.path().join("data"))
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .args(["ls", "--site", "Acme Engineering", "--drive", "Personal", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(od_site_out.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&od_site_out.stdout).unwrap()["drive"]["id"],
+        "drv-eng-personal"
+    );
+    assert_eq!(st.me_drive_calls.load(Ordering::SeqCst), me_calls_before_od);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_sharepoint_sp_04_move_to_root_resolves_actual_root_id_in_cli_and_mcp() {
+    use tokio::process::Command;
+
+    #[derive(Clone)]
+    struct Sp04State {
+        fail_root_get: Arc<AtomicBool>,
+        root_get_count: Arc<AtomicUsize>,
+        patches: Arc<Mutex<Vec<(String, Value)>>>,
+    }
+
+    let st = Sp04State {
+        fail_root_get: Arc::new(AtomicBool::new(false)),
+        root_get_count: Arc::new(AtomicUsize::new(0)),
+        patches: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+
+    let router = Router::new()
+        .route(
+            "/v1.0/drives/{drive_id}",
+            get(|Path(drive_id): Path<String>| async move {
+                Json(json!({
+                    "id": drive_id,
+                    "name": "Documents",
+                    "driveType": "documentLibrary"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/root",
+            get(|State(s): State<Sp04State>, Path(drive_id): Path<String>| async move {
+                s.root_get_count.fetch_add(1, Ordering::SeqCst);
+                if s.fail_root_get.load(Ordering::SeqCst) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": { "code": "generalException", "message": "root lookup failed" } })),
+                    )
+                        .into_response();
+                }
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": "root-real",
+                        "name": "root",
+                        "size": 0,
+                        "folder": { "childCount": 2 },
+                        "parentReference": { "driveId": drive_id }
+                    })),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}",
+            get(|Path((drive_id, item_id)): Path<(String, String)>| async move {
+                if item_id == "fld-dest" {
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "fld-dest",
+                            "name": "Dest",
+                            "size": 0,
+                            "folder": { "childCount": 0 },
+                            "parentReference": { "driveId": drive_id, "id": "root-real", "path": "/drive/root:" }
+                        })),
+                    )
+                        .into_response();
+                }
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": item_id,
+                        "name": "doc.md",
+                        "size": 12,
+                        "file": { "mimeType": "text/markdown" },
+                        "parentReference": { "driveId": drive_id, "id": "fld-sub", "path": "/drive/root:/Sub" }
+                    })),
+                )
+                    .into_response()
+            })
+            .patch(|State(s): State<Sp04State>, Path((drive_id, item_id)): Path<(String, String)>, Json(body): Json<Value>| async move {
+                s.patches.lock().await.push((item_id.clone(), body.clone()));
+                if body.pointer("/parentReference/id").and_then(Value::as_str) == Some("root") {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "code": "invalidRequest",
+                                "message": "Cannot use literal 'root' as parentReference.id"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                let parent_id = body
+                    .pointer("/parentReference/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("fld-sub");
+                let parent_path = if parent_id == "root-real" {
+                    "/drive/root:"
+                } else {
+                    "/drive/root:/Dest"
+                };
+                let name = body.get("name").and_then(Value::as_str).unwrap_or("doc.md");
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": item_id,
+                        "name": name,
+                        "size": 12,
+                        "file": { "mimeType": "text/markdown" },
+                        "parentReference": { "driveId": drive_id, "id": parent_id, "path": parent_path }
+                    })),
+                )
+                    .into_response()
+            }),
+        )
+        .with_state(st.clone());
+
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let profile = tempdir().unwrap();
+    let run_cli = |args: Vec<String>| {
+        let profile_path = profile.path().to_path_buf();
+        let base_url = base_url.clone();
+        async move {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_sharepoint"));
+            cmd.kill_on_drop(true);
+            for (k, _) in std::env::vars_os() {
+                let u = k.to_string_lossy().to_ascii_uppercase();
+                if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+                    .iter()
+                    .any(|p| u.starts_with(p))
+                {
+                    cmd.env_remove(k);
+                }
+            }
+            cmd.env("SHAREPOINT_GRAPH_BASE_URL", &base_url)
+                .env("SHAREPOINT_ACCESS_TOKEN", "sp04-test-token")
+                .env("SHAREPOINT_DISABLE_KEYRING", "1")
+                .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+                .env("SHAREPOINT_AUTO_DAEMON", "0")
+                .env("SHAREPOINT_CONFIG_DIR", profile_path.join("config"))
+                .env("SHAREPOINT_DATA_DIR", profile_path.join("data"))
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .args(&args)
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1. CLI `mv --parent /` fetches actual root ID ("root-real") and PATCHes with it
+    let cli_mv = run_cli(vec![
+        "mv".into(),
+        "item-cli-1".into(),
+        "--drive".into(),
+        "drv-sp".into(),
+        "--parent".into(),
+        "/".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(
+        cli_mv.status.success(),
+        "CLI mv --parent / failed: stderr={}",
+        String::from_utf8_lossy(&cli_mv.stderr)
+    );
+    assert_eq!(st.root_get_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        st.patches.lock().await.last(),
+        Some(&(
+            "item-cli-1".to_string(),
+            json!({ "parentReference": { "id": "root-real" } })
+        ))
+    );
+
+    // 2. MCP `move_or_rename_item` with `new_parent_id: "root"` resolves "root-real" and PATCHes with it
+    let (cfg, graph, storage) = make_graph_and_storage(&base_url);
+    let mcp_req = json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {
+            "name": "move_or_rename_item",
+            "arguments": {
+                "drive": "drv-sp",
+                "item_id": "item-mcp-1",
+                "new_parent_id": "root"
+            }
+        }
+    });
+    let mcp_resp = mcp::handle_rpc_line(&cfg, &graph, &storage, &mcp_req.to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        mcp_resp["result"]["isError"],
+        false,
+        "MCP move_or_rename_item root failed: {mcp_resp}"
+    );
+    assert_eq!(st.root_get_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        st.patches.lock().await.last(),
+        Some(&(
+            "item-mcp-1".to_string(),
+            json!({ "parentReference": { "id": "root-real" } })
+        ))
+    );
+
+    // 3. When GET /drives/{id}/root fails, 0 PATCH requests are sent (CLI and MCP)
+    st.fail_root_get.store(true, Ordering::SeqCst);
+    let patches_before_fail = st.patches.lock().await.len();
+    let cli_fail = run_cli(vec![
+        "mv".into(),
+        "item-cli-fail".into(),
+        "--drive".into(),
+        "drv-sp".into(),
+        "--parent".into(),
+        "/".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(!cli_fail.status.success());
+
+    let mcp_fail_req = json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "tools/call",
+        "params": {
+            "name": "move_or_rename_item",
+            "arguments": {
+                "drive": "drv-sp",
+                "item_id": "item-mcp-fail",
+                "new_parent_id": "root"
+            }
+        }
+    });
+    let mcp_fail = mcp::handle_rpc_line(&cfg, &graph, &storage, &mcp_fail_req.to_string())
+        .await
+        .unwrap();
+    assert_eq!(mcp_fail["result"]["isError"], true);
+    assert_eq!(
+        st.patches.lock().await.len(),
+        patches_before_fail,
+        "failed root GET must send 0 PATCH requests"
+    );
+
+    // 4. Regression control: normal folder ID move and rename-only do NOT call GET /root
+    st.fail_root_get.store(false, Ordering::SeqCst);
+    let root_gets_before_ctrl = st.root_get_count.load(Ordering::SeqCst);
+    let cli_folder = run_cli(vec![
+        "mv".into(),
+        "item-ctrl-1".into(),
+        "--drive".into(),
+        "drv-sp".into(),
+        "--parent".into(),
+        "fld-dest".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(cli_folder.status.success());
+    assert_eq!(
+        st.patches.lock().await.last(),
+        Some(&(
+            "item-ctrl-1".to_string(),
+            json!({ "parentReference": { "id": "fld-dest" } })
+        ))
+    );
+
+    let cli_rename = run_cli(vec![
+        "mv".into(),
+        "item-ctrl-2".into(),
+        "--drive".into(),
+        "drv-sp".into(),
+        "--name".into(),
+        "renamed.md".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(cli_rename.status.success());
+    assert_eq!(
+        st.patches.lock().await.last(),
+        Some(&(
+            "item-ctrl-2".to_string(),
+            json!({ "name": "renamed.md" })
+        ))
+    );
+    assert_eq!(
+        st.root_get_count.load(Ordering::SeqCst),
+        root_gets_before_ctrl,
+        "normal folder move and rename-only must not call GET /root"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_sharepoint_sp_11_exact_limit_200_completeness_and_cache_pruning() {
+    use sharepoint_cli::cli;
+
+    #[derive(Clone)]
+    struct Sp11State {
+        base_url: String,
+        mode: Arc<Mutex<String>>,
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+    let st = Sp11State {
+        base_url: base_url.clone(),
+        mode: Arc::new(Mutex::new("201_two_pages".into())),
+    };
+
+    let make_item = |i: usize| {
+        json!({
+            "id": format!("item-{i:03}"),
+            "name": format!("file-{i:03}.txt"),
+            "size": 10,
+            "file": { "mimeType": "text/plain" },
+            "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+        })
+    };
+
+    let router = Router::new()
+        .route(
+            "/v1.0/drives/{drive_id}/root/children",
+            get(move |State(s): State<Sp11State>, Path(drive_id): Path<String>, Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                let mode = s.mode.lock().await.clone();
+                let page = q.get("page").map(String::as_str).unwrap_or("1");
+                match (mode.as_str(), page) {
+                    ("201_two_pages", "1") => {
+                        let vals: Vec<Value> = (1..=200).map(make_item).collect();
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "value": vals,
+                                "@odata.nextLink": format!("{}/drives/{drive_id}/root/children?page=2", s.base_url)
+                            })),
+                        )
+                            .into_response()
+                    }
+                    ("201_two_pages", "2") => (
+                        StatusCode::OK,
+                        Json(json!({ "value": [make_item(201)] })),
+                    )
+                        .into_response(),
+                    ("200_final", _) => {
+                        let vals: Vec<Value> = (1..=200).map(make_item).collect();
+                        (StatusCode::OK, Json(json!({ "value": vals }))).into_response()
+                    }
+                    ("200_with_next", "1") => {
+                        let vals: Vec<Value> = (1..=200).map(make_item).collect();
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "value": vals,
+                                "@odata.nextLink": format!("{}/drives/{drive_id}/root/children?page=2", s.base_url)
+                            })),
+                        )
+                            .into_response()
+                    }
+                    ("mid_page_5", _) => {
+                        let vals: Vec<Value> = (1..=5).map(make_item).collect();
+                        (StatusCode::OK, Json(json!({ "value": vals }))).into_response()
+                    }
+                    ("page2_fails", "1") => {
+                        let vals: Vec<Value> = (1..=100).map(make_item).collect();
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "value": vals,
+                                "@odata.nextLink": format!("{}/drives/{drive_id}/root/children?page=2", s.base_url)
+                            })),
+                        )
+                            .into_response()
+                    }
+                    ("page2_fails", "2") => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": { "code": "generalException", "message": "page 2 failed" } })),
+                    )
+                        .into_response(),
+                    _ => (StatusCode::OK, Json(json!({ "value": [] }))).into_response(),
+                }
+            }),
+        )
+        .with_state(st.clone());
+
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    let (_cfg, graph, storage) = make_graph_and_storage(&base_url);
+
+    // 1. Seed 201 items into cache
+    let all_201 = cli::fetch_folder_items(&graph, &storage, "drv-me", None, 250, false, false, false)
+        .await
+        .unwrap();
+    assert_eq!(all_201.len(), 201);
+    assert!(storage.get_drive_item("drv-me", "item-201").unwrap().is_some());
+
+    // 2. Server reduces to 200 items with NO nextLink; ls --limit 200 must prune deleted item-201!
+    *st.mode.lock().await = "200_final".into();
+    let page_200 = cli::fetch_folder_items(&graph, &storage, "drv-me", None, 200, false, false, false)
+        .await
+        .unwrap();
+    assert_eq!(page_200.len(), 200);
+    let offline_after_200 =
+        cli::fetch_folder_items(&graph, &storage, "drv-me", None, 300, false, true, false)
+            .await
+            .unwrap();
+    assert_eq!(
+        offline_after_200.len(),
+        200,
+        "exact limit=200 without nextLink must prune deleted 201st item"
+    );
+    assert!(
+        storage.get_drive_item("drv-me", "item-201").unwrap().is_none(),
+        "deleted item-201 must be absent from cache"
+    );
+
+    // 3. Re-seed 201 items, then server returns 200 items WITH nextLink -> must preserve item-201
+    *st.mode.lock().await = "201_two_pages".into();
+    assert_eq!(
+        cli::fetch_folder_items(&graph, &storage, "drv-me", None, 250, false, false, false)
+            .await
+            .unwrap()
+            .len(),
+        201
+    );
+    *st.mode.lock().await = "200_with_next".into();
+    let partial_200 =
+        cli::fetch_folder_items(&graph, &storage, "drv-me", None, 200, false, false, false)
+            .await
+            .unwrap();
+    assert_eq!(partial_200.len(), 200);
+    let offline_with_next =
+        cli::fetch_folder_items(&graph, &storage, "drv-me", None, 300, false, true, false)
+            .await
+            .unwrap();
+    assert_eq!(
+        offline_with_next.len(),
+        201,
+        "200 items with nextLink must preserve unfetched 201st cached item"
+    );
+
+    // 4. Regression control: mid-page limit (3 of 5) preserves uncollected items
+    *st.mode.lock().await = "mid_page_5".into();
+    let mid = cli::fetch_folder_items(&graph, &storage, "drv-me", None, 3, false, false, false)
+        .await
+        .unwrap();
+    assert_eq!(mid.len(), 3);
+    assert_eq!(
+        cli::fetch_folder_items(&graph, &storage, "drv-me", None, 300, false, true, false)
+            .await
+            .unwrap()
+            .len(),
+        201,
+        "mid-page limit must not delete cached siblings"
+    );
+
+    // 5. Regression control: page 2 error preserves existing cache
+    *st.mode.lock().await = "page2_fails".into();
+    let page2_err = cli::fetch_folder_items(&graph, &storage, "drv-me", None, 200, false, false, false)
+        .await
+        .expect_err("page 2 failure must return error");
+    assert!(format!("{page2_err:#}").contains("500"));
+    assert_eq!(
+        cli::fetch_folder_items(&graph, &storage, "drv-me", None, 300, false, true, false)
+            .await
+            .unwrap()
+            .len(),
+        201,
+        "failed second page must preserve cached items"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_sharepoint_sp_06_resolve_item_distinguishes_auth_server_errors_from_not_found() {
+    use tokio::process::Command;
+
+    #[derive(Clone)]
+    struct Sp06State {
+        remote_requests: Arc<AtomicUsize>,
+        write_requests: Arc<AtomicUsize>,
+    }
+
+    let st = Sp06State {
+        remote_requests: Arc::new(AtomicUsize::new(0)),
+        write_requests: Arc::new(AtomicUsize::new(0)),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+
+    let error_for_key = |key: &str| -> axum::response::Response {
+        match key {
+            "err-403" | "Secret403" => (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": { "code": "accessDenied", "message": "Access denied to resource" } })),
+            )
+                .into_response(),
+            "err-401" | "Secret401" => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": { "code": "InvalidAuthenticationToken", "message": "Token expired" } })),
+            )
+                .into_response(),
+            "err-500" | "Secret500" => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "code": "generalException", "message": "Upstream storage fault" } })),
+            )
+                .into_response(),
+            _ => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": { "code": "itemNotFound", "message": "Item not found" } })),
+            )
+                .into_response(),
+        }
+    };
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/drive",
+            get(|State(s): State<Sp06State>| async move {
+                s.remote_requests.fetch_add(1, Ordering::SeqCst);
+                Json(json!({ "id": "drv-me", "name": "OneDrive", "driveType": "business" }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}",
+            get(move |State(s): State<Sp06State>, Path((_drive_id, item_id)): Path<(String, String)>| async move {
+                s.remote_requests.fetch_add(1, Ordering::SeqCst);
+                error_for_key(&item_id)
+            })
+            .patch(|State(s): State<Sp06State>| async move {
+                s.write_requests.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            })
+            .delete(|State(s): State<Sp06State>| async move {
+                s.write_requests.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/{*tail}",
+            get(move |State(s): State<Sp06State>, Path((drive_id, tail)): Path<(String, String)>| async move {
+                s.remote_requests.fetch_add(1, Ordering::SeqCst);
+                if tail.starts_with("root:/") && tail.ends_with(':') {
+                    let rel = tail.trim_start_matches("root:/").trim_end_matches(':');
+                    if rel == "bare-file.md" {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "item-bare-real",
+                                "name": "bare-file.md",
+                                "size": 15,
+                                "file": { "mimeType": "text/markdown" },
+                                "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    return error_for_key(rel);
+                }
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": { "code": "itemNotFound" } })),
+                )
+                    .into_response()
+            }),
+        )
+        .with_state(st.clone());
+
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let profile = tempdir().unwrap();
+    let run_cli = |args: Vec<String>| {
+        let profile_path = profile.path().to_path_buf();
+        let base_url = base_url.clone();
+        async move {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_sharepoint"));
+            cmd.kill_on_drop(true);
+            for (k, _) in std::env::vars_os() {
+                let u = k.to_string_lossy().to_ascii_uppercase();
+                if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+                    .iter()
+                    .any(|p| u.starts_with(p))
+                {
+                    cmd.env_remove(k);
+                }
+            }
+            cmd.env("SHAREPOINT_GRAPH_BASE_URL", &base_url)
+                .env("SHAREPOINT_ACCESS_TOKEN", "sp06-test-token")
+                .env("SHAREPOINT_DISABLE_KEYRING", "1")
+                .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+                .env("SHAREPOINT_AUTO_DAEMON", "0")
+                .env("SHAREPOINT_CONFIG_DIR", profile_path.join("config"))
+                .env("SHAREPOINT_DATA_DIR", profile_path.join("data"))
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .args(&args)
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+
+    let (cfg, graph, storage) = make_graph_and_storage(&base_url);
+
+    // 1. CLI & MCP distinguish 403 accessDenied, 401, 500 vs real 404 on both ID and path lookups
+    for (target, expected_status, expected_code) in [
+        ("err-403", "403", "accessDenied"),
+        ("/Secret403", "403", "accessDenied"),
+        ("err-401", "401", "InvalidAuthenticationToken"),
+        ("/Secret401", "401", "InvalidAuthenticationToken"),
+        ("err-500", "500", "generalException"),
+        ("/Secret500", "500", "generalException"),
+    ] {
+        let cli_out = run_cli(vec![
+            "info".into(),
+            target.into(),
+            "--drive".into(),
+            "me".into(),
+            "--json".into(),
+        ])
+        .await;
+        assert!(!cli_out.status.success(), "CLI info {target} must fail");
+        let stderr = String::from_utf8_lossy(&cli_out.stderr);
+        assert!(
+            stderr.contains(expected_status) && stderr.contains(expected_code),
+            "CLI info {target} must surface {expected_status}/{expected_code}, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Drive item not found"),
+            "CLI info {target} must not disguise {expected_status} as not found: {stderr}"
+        );
+
+        let mcp_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_file_info",
+                "arguments": { "drive": "me", "item_id": target }
+            }
+        });
+        let mcp_resp = mcp::handle_rpc_line(&cfg, &graph, &storage, &mcp_req.to_string())
+            .await
+            .unwrap();
+        assert_eq!(mcp_resp["result"]["isError"], true);
+        let err_text = mcp_resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            err_text.contains(expected_status) && err_text.contains(expected_code),
+            "MCP get_file_info {target} must surface {expected_status}/{expected_code}, got: {err_text}"
+        );
+        assert!(
+            !err_text.contains("Drive item not found"),
+            "MCP get_file_info {target} must not mask {expected_status} as not found: {err_text}"
+        );
+    }
+
+    // Genuine 404 ends with Drive item not found
+    for missing in ["err-404", "/Missing404"] {
+        let cli_404 = run_cli(vec![
+            "info".into(),
+            missing.into(),
+            "--drive".into(),
+            "me".into(),
+            "--json".into(),
+        ])
+        .await;
+        assert!(!cli_404.status.success());
+        let stderr = String::from_utf8_lossy(&cli_404.stderr);
+        assert!(
+            stderr.contains("Drive item not found"),
+            "genuine 404 for {missing} should report Drive item not found, got: {stderr}"
+        );
+    }
+
+    // Failed write resolution sends 0 write requests
+    let rm_403 = run_cli(vec![
+        "rm".into(),
+        "err-403".into(),
+        "--drive".into(),
+        "me".into(),
+        "--yes".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(!rm_403.status.success());
+    assert!(String::from_utf8_lossy(&rm_403.stderr).contains("403"));
+    assert_eq!(st.write_requests.load(Ordering::SeqCst), 0);
+
+    // 2. Regression control: bare filename gets 404 on /items/{name}, succeeds on /root:/{name}:
+    let bare = run_cli(vec![
+        "info".into(),
+        "bare-file.md".into(),
+        "--drive".into(),
+        "me".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(
+        bare.status.success(),
+        "bare relative filename fallback failed: {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    let bare_json: Value = serde_json::from_slice(&bare.stdout).unwrap();
+    assert_eq!(bare_json["item"]["id"], "item-bare-real");
+
+    // 3. Regression control: offline cache miss sends 0 remote requests
+    let remote_before_offline = st.remote_requests.load(Ordering::SeqCst);
+    let off_miss = run_cli(vec![
+        "info".into(),
+        "/does-not-exist-offline.md".into(),
+        "--drive".into(),
+        "me".into(),
+        "--offline".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(!off_miss.status.success());
+    assert_eq!(
+        st.remote_requests.load(Ordering::SeqCst),
+        remote_before_offline,
+        "offline cache miss must send 0 remote requests"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_sharepoint_sp_07_http_content_uses_decode_text_file_and_returns_415_on_binary() {
+    use tokio::process::Command;
+
+    let utf16_text = "상태: 승인 완료\r\n다음 단계: 배포";
+    let utf16_bytes: Vec<u8> = [0xffu8, 0xfe]
+        .into_iter()
+        .chain(utf16_text.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let utf8_text = "상태: UTF-8 한글 정상\n두 번째 줄";
+    let utf8_bytes = utf8_text.as_bytes().to_vec();
+    let mut png_bytes = Vec::new();
+    let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]));
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+        .unwrap();
+    let big_bytes = vec![b'A'; 200];
+
+    #[derive(Clone)]
+    struct Sp07State {
+        utf16: Vec<u8>,
+        utf8: Vec<u8>,
+        png: Vec<u8>,
+        big: Vec<u8>,
+    }
+
+    let st = Sp07State {
+        utf16: utf16_bytes.clone(),
+        utf8: utf8_bytes.clone(),
+        png: png_bytes.clone(),
+        big: big_bytes.clone(),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+
+    let graph_app = Router::new()
+        .route(
+            "/v1.0/me/drive",
+            get(|| async {
+                Json(json!({ "id": "drv-me", "name": "OneDrive", "driveType": "business" }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}",
+            get(|State(s): State<Sp07State>, Path((drive_id, item_id)): Path<(String, String)>| async move {
+                let (name, mime, size) = match item_id.as_str() {
+                    "item-utf16" => ("korean-utf16.txt", "text/plain", s.utf16.len()),
+                    "item-utf8" => ("korean-utf8.txt", "text/plain", s.utf8.len()),
+                    "item-png" => ("logo.png", "image/png", s.png.len()),
+                    "item-big" => ("big.txt", "text/plain", s.big.len()),
+                    _ => return StatusCode::NOT_FOUND.into_response(),
+                };
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": item_id,
+                        "name": name,
+                        "size": size,
+                        "eTag": "\"etag-sp07\"",
+                        "file": { "mimeType": mime },
+                        "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                    })),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}/content",
+            get(|State(s): State<Sp07State>, Path((_drive_id, item_id)): Path<(String, String)>| async move {
+                match item_id.as_str() {
+                    "item-utf16" => ([(header::CONTENT_TYPE, "text/plain")], s.utf16).into_response(),
+                    "item-utf8" => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], s.utf8).into_response(),
+                    "item-png" => ([(header::CONTENT_TYPE, "image/png")], s.png).into_response(),
+                    "item-big" => ([(header::CONTENT_TYPE, "text/plain")], s.big).into_response(),
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        )
+        .with_state(st);
+
+    let graph_server = tokio::spawn(async move {
+        let _ = axum::serve(listener, graph_app).await;
+    });
+
+    let (cfg, graph, storage) = make_graph_and_storage(&base_url);
+    let api_router = serve::build_router(cfg, graph, storage, None);
+    let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api_listener.local_addr().unwrap();
+    let api_server = tokio::spawn(async move {
+        let _ = axum::serve(api_listener, api_router).await;
+    });
+
+    let profile = tempdir().unwrap();
+    let run_cli_cat = |item_id: &str| {
+        let profile_path = profile.path().to_path_buf();
+        let base_url = base_url.clone();
+        let item_id = item_id.to_string();
+        async move {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_sharepoint"));
+            cmd.kill_on_drop(true);
+            for (k, _) in std::env::vars_os() {
+                let u = k.to_string_lossy().to_ascii_uppercase();
+                if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+                    .iter()
+                    .any(|p| u.starts_with(p))
+                {
+                    cmd.env_remove(k);
+                }
+            }
+            cmd.env("SHAREPOINT_GRAPH_BASE_URL", &base_url)
+                .env("SHAREPOINT_ACCESS_TOKEN", "sp07-test-token")
+                .env("SHAREPOINT_DISABLE_KEYRING", "1")
+                .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+                .env("SHAREPOINT_AUTO_DAEMON", "0")
+                .env("SHAREPOINT_CONFIG_DIR", profile_path.join("config"))
+                .env("SHAREPOINT_DATA_DIR", profile_path.join("data"))
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .args(["cat", &item_id, "--drive", "me", "--json"])
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+
+    let http = reqwest::Client::new();
+
+    // 1. BOM UTF-16LE Korean file matches CLI cat and reports original byte count
+    let cli_utf16 = run_cli_cat("item-utf16").await;
+    assert!(cli_utf16.status.success());
+    let cli_utf16_json: Value = serde_json::from_slice(&cli_utf16.stdout).unwrap();
+
+    let http_utf16_resp = http
+        .get(format!("http://{api_addr}/v1/items/item-utf16/content?drive=me"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(http_utf16_resp.status(), StatusCode::OK);
+    let http_utf16: Value = http_utf16_resp.json().await.unwrap();
+    assert_eq!(http_utf16["ok"], true);
+    assert_eq!(http_utf16["content"], cli_utf16_json["content"]);
+    assert_eq!(http_utf16["content"], utf16_text);
+    assert_eq!(http_utf16["size_bytes"], utf16_bytes.len());
+
+    // 2. UTF-8 Korean file matches CLI cat
+    let cli_utf8 = run_cli_cat("item-utf8").await;
+    assert!(cli_utf8.status.success());
+    let cli_utf8_json: Value = serde_json::from_slice(&cli_utf8.stdout).unwrap();
+
+    let http_utf8_resp = http
+        .get(format!("http://{api_addr}/v1/items/item-utf8/content?drive=me"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(http_utf8_resp.status(), StatusCode::OK);
+    let http_utf8: Value = http_utf8_resp.json().await.unwrap();
+    assert_eq!(http_utf8["content"], cli_utf8_json["content"]);
+    assert_eq!(http_utf8["size_bytes"], utf8_bytes.len());
+
+    // 3. PNG binary returns HTTP 415 Unsupported Media Type with standard error JSON
+    let http_png_resp = http
+        .get(format!("http://{api_addr}/v1/items/item-png/content?drive=me"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        http_png_resp.status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "PNG preview must return HTTP 415"
+    );
+    let http_png_body: Value = http_png_resp.json().await.unwrap();
+    assert!(http_png_body.get("error").and_then(Value::as_str).is_some());
+    assert!(http_png_body.get("content").is_none());
+
+    // 4. Regression control: max_bytes enforced, metadata route works, POST /v1/download returns raw PNG bytes
+    let over_limit = http
+        .get(format!("http://{api_addr}/v1/items/item-big/content?drive=me&max_bytes=50"))
+        .send()
+        .await
+        .unwrap();
+    assert!(!over_limit.status().is_success());
+
+    let meta_resp = http
+        .get(format!("http://{api_addr}/v1/items/item-png?drive=me"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(meta_resp.status(), StatusCode::OK);
+    let meta_json: Value = meta_resp.json().await.unwrap();
+    assert_eq!(meta_json["item"]["mime_type"], "image/png");
+
+    let tmp_dl = tempdir().unwrap();
+    let dl_resp = http
+        .post(format!("http://{api_addr}/v1/download"))
+        .json(&json!({
+            "drive": "me",
+            "item_id": "item-png",
+            "dir": tmp_dl.path().to_string_lossy()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dl_resp.status(), StatusCode::OK);
+    let dl_json: Value = dl_resp.json().await.unwrap();
+    assert_eq!(dl_json["ok"], true);
+    assert_eq!(dl_json["is_image"], true);
+    let downloaded_bytes = std::fs::read(dl_json["path"].as_str().unwrap()).unwrap();
+    assert_eq!(downloaded_bytes, png_bytes);
+
+    api_server.abort();
+    graph_server.abort();
+}
+
+#[tokio::test]
+async fn regression_sharepoint_sp_10_remote_search_fresh_results_ranking_and_error_propagation() {
+    use sharepoint_cli::{cli, models::DriveItem};
+
+    #[derive(Clone)]
+    struct Sp10State {
+        search_mode: Arc<Mutex<String>>,
+        me_drive_mode: Arc<Mutex<String>>,
+        requests: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    let st = Sp10State {
+        search_mode: Arc::new(Mutex::new("fresh_hits".into())),
+        me_drive_mode: Arc::new(Mutex::new("ok".into())),
+        requests: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+
+    let router = Router::new()
+        .route(
+            "/v1.0/search/query",
+            post(|State(s): State<Sp10State>| async move {
+                s.requests
+                    .lock()
+                    .await
+                    .push(("POST".into(), "/v1.0/search/query".into()));
+                match s.search_mode.lock().await.as_str() {
+                    "fresh_hits" => (
+                        StatusCode::OK,
+                        Json(json!({
+                            "value": [{
+                                "hitsContainers": [{
+                                    "hits": [
+                                        {
+                                            "resource": {
+                                                "id": "item-new-remote",
+                                                "name": "report-brand-new.md",
+                                                "size": 512,
+                                                "eTag": "\"new-v1\"",
+                                                "file": { "mimeType": "text/markdown" },
+                                                "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+                                            }
+                                        },
+                                        {
+                                            "resource": {
+                                                "id": "item-1",
+                                                "name": "report-alpha-fresh.md",
+                                                "size": 999,
+                                                "eTag": "\"fresh-v2\"",
+                                                "file": { "mimeType": "text/markdown" },
+                                                "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+                                            }
+                                        }
+                                    ]
+                                }]
+                            }]
+                        })),
+                    )
+                        .into_response(),
+                    "empty_ok" => (
+                        StatusCode::OK,
+                        Json(json!({ "value": [{ "hitsContainers": [{ "hits": [] }] }] })),
+                    )
+                        .into_response(),
+                    "forbidden_403" => (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": { "code": "accessDenied", "message": "Search API forbidden" } })),
+                    )
+                        .into_response(),
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }),
+        )
+        .route(
+            "/v1.0/me/drive",
+            get(|State(s): State<Sp10State>| async move {
+                s.requests
+                    .lock()
+                    .await
+                    .push(("GET".into(), "/v1.0/me/drive".into()));
+                match s.me_drive_mode.lock().await.as_str() {
+                    "ok" => (
+                        StatusCode::OK,
+                        Json(json!({ "id": "drv-me", "name": "OneDrive", "driveType": "business" })),
+                    )
+                        .into_response(),
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": { "code": "generalException", "message": "Fallback drive error" } })),
+                    )
+                        .into_response(),
+                }
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/{*tail}",
+            get(|State(s): State<Sp10State>, Path((drive_id, tail)): Path<(String, String)>| async move {
+                s.requests
+                    .lock()
+                    .await
+                    .push(("GET".into(), format!("/v1.0/drives/{drive_id}/{tail}")));
+                if tail.contains("search(q=") {
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "value": [{
+                                "id": "item-fallback-1",
+                                "name": "report-fallback.md",
+                                "size": 77,
+                                "eTag": "\"fb-v1\"",
+                                "file": { "mimeType": "text/markdown" },
+                                "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                            }]
+                        })),
+                    )
+                        .into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            }),
+        )
+        .with_state(st.clone());
+
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let (_cfg, graph, storage) = make_graph_and_storage(&base_url);
+
+    // Seed 5 cached items including stale item-1
+    let cached: Vec<DriveItem> = (1..=5)
+        .map(|i| DriveItem {
+            id: format!("item-{i}"),
+            drive_id: "drv-me".into(),
+            parent_id: Some("root".into()),
+            parent_path: String::new(),
+            name: if i == 1 {
+                "report-alpha-stale.md".into()
+            } else {
+                format!("report-cached-{i}.md")
+            },
+            size: 10,
+            e_tag: Some("\"stale-v1\"".into()),
+            last_modified_at: Some(format!("2026-11-1{i}T00:00:00Z")),
+            ..Default::default()
+        })
+        .collect();
+    storage.upsert_drive_items(&cached).unwrap();
+
+    // 1. First remote search with limit=5 returns fresh item-1 fields AND new remote item immediately
+    let hits = cli::search_items_combined(&graph, &storage, "report", None, true, 5)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 5);
+    assert_eq!(
+        hits[0].id, "item-new-remote",
+        "new remote item must appear in first limit=5 response: {hits:?}"
+    );
+    assert_eq!(hits[1].id, "item-1");
+    assert_eq!(hits[1].name, "report-alpha-fresh.md");
+    assert_eq!(hits[1].size, 999);
+    assert_eq!(hits[1].e_tag.as_deref(), Some("\"fresh-v2\""));
+    assert_eq!(
+        hits.iter().filter(|i| i.id == "item-1").count(),
+        1,
+        "duplicate (drive_id, item_id) must appear only once with fresh remote object"
+    );
+
+    // 2. Cross-site 403 + personal fallback 500 MUST return error with both contexts (NOT Ok([]))
+    *st.search_mode.lock().await = "forbidden_403".into();
+    *st.me_drive_mode.lock().await = "error_500".into();
+    let err = cli::search_items_combined(&graph, &storage, "report", None, true, 5)
+        .await
+        .expect_err("double failure (403 + 500) must fail instead of returning empty list");
+    let err_str = format!("{err:#}");
+    assert!(
+        err_str.contains("403") && err_str.contains("500"),
+        "error must preserve both initial 403 context and fallback 500 error, got: {err_str}"
+    );
+
+    // 3. Regression control: cross-site 403 + working personal drive fallback succeeds
+    *st.me_drive_mode.lock().await = "ok".into();
+    let fb_hits = cli::search_items_combined(&graph, &storage, "report", None, true, 5)
+        .await
+        .unwrap();
+    assert_eq!(fb_hits[0].id, "item-fallback-1");
+
+    // 4. Regression control: remote 200 with 0 hits succeeds without invoking /me/drive fallback
+    *st.search_mode.lock().await = "empty_ok".into();
+    let reqs_before_empty = st.requests.lock().await.len();
+    let empty_remote = cli::search_items_combined(&graph, &storage, "nomatchxyz", None, true, 5)
+        .await
+        .unwrap();
+    assert!(empty_remote.is_empty());
+    assert!(
+        !st.requests.lock().await[reqs_before_empty..]
+            .iter()
+            .any(|(_, p)| p == "/v1.0/me/drive"),
+        "successful 0-hit cross-site search must not trigger personal drive fallback"
+    );
+
+    // 5. Regression control: local-only search sends 0 network requests
+    let reqs_before_local = st.requests.lock().await.len();
+    let local_hits = cli::search_items_combined(&graph, &storage, "report", None, false, 5)
+        .await
+        .unwrap();
+    assert!(!local_hits.is_empty());
+    assert_eq!(
+        st.requests.lock().await.len(),
+        reqs_before_local,
+        "local-only search must send 0 network requests"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_sharepoint_sp_12_tree_propagates_child_folder_errors_with_path_and_status() {
+    use tokio::process::Command;
+
+    #[derive(Clone)]
+    struct Sp12State {
+        restricted_forbidden: Arc<AtomicBool>,
+        child_requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    let st = Sp12State {
+        restricted_forbidden: Arc::new(AtomicBool::new(true)),
+        child_requests: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/drive",
+            get(|| async {
+                Json(json!({ "id": "drv-me", "name": "OneDrive", "driveType": "business" }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/root/children",
+            get(|Path(drive_id): Path<String>| async move {
+                Json(json!({
+                    "value": [
+                        {
+                            "id": "fld-empty",
+                            "name": "EmptyFolder",
+                            "size": 0,
+                            "folder": { "childCount": 0 },
+                            "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                        },
+                        {
+                            "id": "fld-restricted",
+                            "name": "Restricted",
+                            "size": 0,
+                            "folder": { "childCount": 2 },
+                            "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                        }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}/children",
+            get(|State(s): State<Sp12State>, Path((drive_id, item_id)): Path<(String, String)>| async move {
+                s.child_requests.lock().await.push(item_id.clone());
+                match item_id.as_str() {
+                    "fld-empty" => (StatusCode::OK, Json(json!({ "value": [] }))).into_response(),
+                    "fld-restricted" => {
+                        if s.restricted_forbidden.load(Ordering::SeqCst) {
+                            (
+                                StatusCode::FORBIDDEN,
+                                Json(json!({ "error": { "code": "accessDenied", "message": "Access denied" } })),
+                            )
+                                .into_response()
+                        } else {
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "value": [{
+                                        "id": "fld-deep",
+                                        "name": "DeepSub",
+                                        "size": 0,
+                                        "folder": { "childCount": 1 },
+                                        "parentReference": { "driveId": drive_id, "id": "fld-restricted", "path": "/drive/root:/Restricted" }
+                                    }]
+                                })),
+                            )
+                                .into_response()
+                        }
+                    }
+                    _ => (StatusCode::OK, Json(json!({ "value": [] }))).into_response(),
+                }
+            }),
+        )
+        .with_state(st.clone());
+
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let profile = tempdir().unwrap();
+    let run_cli = |args: Vec<String>| {
+        let profile_path = profile.path().to_path_buf();
+        let base_url = base_url.clone();
+        async move {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_sharepoint"));
+            cmd.kill_on_drop(true);
+            for (k, _) in std::env::vars_os() {
+                let u = k.to_string_lossy().to_ascii_uppercase();
+                if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+                    .iter()
+                    .any(|p| u.starts_with(p))
+                {
+                    cmd.env_remove(k);
+                }
+            }
+            cmd.env("SHAREPOINT_GRAPH_BASE_URL", &base_url)
+                .env("SHAREPOINT_ACCESS_TOKEN", "sp12-test-token")
+                .env("SHAREPOINT_DISABLE_KEYRING", "1")
+                .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+                .env("SHAREPOINT_AUTO_DAEMON", "0")
+                .env("SHAREPOINT_CONFIG_DIR", profile_path.join("config"))
+                .env("SHAREPOINT_DATA_DIR", profile_path.join("data"))
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .args(&args)
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1. Depth 2 with Restricted returning 403 -> exit code 1, stderr has Restricted + 403, stdout empty
+    for extra in [vec!["--json"], vec![]] {
+        let mut args = vec![
+            "tree".into(),
+            "--drive".into(),
+            "me".into(),
+            "--depth".into(),
+            "2".into(),
+        ];
+        args.extend(extra.into_iter().map(str::to_string));
+        let out = run_cli(args).await;
+        assert_eq!(out.status.code(), Some(1), "tree with 403 child must exit with code 1");
+        assert!(
+            out.stdout.is_empty(),
+            "failed tree must not print partial/empty-children success tree, stdout={}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Restricted") && stderr.contains("403"),
+            "stderr must contain failing folder 'Restricted' and status '403', got: {stderr}"
+        );
+    }
+
+    // 2. Regression control: depth 1 does NOT query subfolders beyond requested depth
+    st.child_requests.lock().await.clear();
+    let d1 = run_cli(vec![
+        "tree".into(),
+        "--drive".into(),
+        "me".into(),
+        "--depth".into(),
+        "1".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(d1.status.success());
+    assert!(
+        st.child_requests.lock().await.is_empty(),
+        "depth 1 must not query child folders"
+    );
+
+    // 3. Regression control: truly empty folder succeeds with empty children, depth 2 doesn't query depth 3
+    st.restricted_forbidden.store(false, Ordering::SeqCst);
+    st.child_requests.lock().await.clear();
+    let d2_ok = run_cli(vec![
+        "tree".into(),
+        "--drive".into(),
+        "me".into(),
+        "--depth".into(),
+        "2".into(),
+        "--json".into(),
+    ])
+    .await;
+    assert!(d2_ok.status.success());
+    let tree_json: Value = serde_json::from_slice(&d2_ok.stdout).unwrap();
+    let nodes = tree_json["tree"].as_array().unwrap();
+    let empty_node = nodes
+        .iter()
+        .find(|n| n["item"]["id"] == "fld-empty")
+        .unwrap();
+    assert!(empty_node["children"].as_array().unwrap().is_empty());
+    assert!(
+        !st.child_requests.lock().await.iter().any(|id| id == "fld-deep"),
+        "depth 2 must not fetch children of depth-2 folder fld-deep"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_sharepoint_sp_15_limit_zero_returns_empty_and_preserves_cache() {
+    use tokio::process::Command;
+
+    #[derive(Clone)]
+    struct Sp15State {
+        list_calls: Arc<AtomicUsize>,
+    }
+
+    let st = Sp15State {
+        list_calls: Arc::new(AtomicUsize::new(0)),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+
+    let router = Router::new()
+        .route(
+            "/v1.0/me/drive",
+            get(|| async {
+                Json(json!({ "id": "drv-me", "name": "OneDrive", "driveType": "business" }))
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/root/children",
+            get(|State(s): State<Sp15State>, Path(drive_id): Path<String>| async move {
+                s.list_calls.fetch_add(1, Ordering::SeqCst);
+                Json(json!({
+                    "value": [
+                        {
+                            "id": "item-ls-1",
+                            "name": "alpha-report.md",
+                            "size": 12,
+                            "file": { "mimeType": "text/markdown" },
+                            "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                        },
+                        {
+                            "id": "item-ls-2",
+                            "name": "beta-report.md",
+                            "size": 24,
+                            "file": { "mimeType": "text/markdown" },
+                            "parentReference": { "driveId": drive_id, "id": "root", "path": "/drive/root:" }
+                        }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/drive/recent",
+            get(|State(s): State<Sp15State>| async move {
+                s.list_calls.fetch_add(1, Ordering::SeqCst);
+                Json(json!({
+                    "value": [{
+                        "id": "item-rec-1",
+                        "name": "recent-report.md",
+                        "size": 30,
+                        "file": { "mimeType": "text/markdown" },
+                        "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/drive/sharedWithMe",
+            get(|State(s): State<Sp15State>| async move {
+                s.list_calls.fetch_add(1, Ordering::SeqCst);
+                Json(json!({
+                    "value": [{
+                        "id": "item-sh-1",
+                        "name": "shared-report.md",
+                        "size": 40,
+                        "file": { "mimeType": "text/markdown" },
+                        "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/search/query",
+            post(|State(s): State<Sp15State>| async move {
+                s.list_calls.fetch_add(1, Ordering::SeqCst);
+                Json(json!({
+                    "value": [{
+                        "hitsContainers": [{
+                            "hits": [{
+                                "resource": {
+                                    "id": "item-ls-1",
+                                    "name": "alpha-report.md",
+                                    "size": 12,
+                                    "file": { "mimeType": "text/markdown" },
+                                    "parentReference": { "driveId": "drv-me", "id": "root", "path": "/drive/root:" }
+                                }
+                            }]
+                        }]
+                    }]
+                }))
+            }),
+        )
+        .with_state(st.clone());
+
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let profile = tempdir().unwrap();
+    let run_cli = |args: &[&str]| {
+        let profile_path = profile.path().to_path_buf();
+        let base_url = base_url.clone();
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        async move {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_sharepoint"));
+            cmd.kill_on_drop(true);
+            for (k, _) in std::env::vars_os() {
+                let u = k.to_string_lossy().to_ascii_uppercase();
+                if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+                    .iter()
+                    .any(|p| u.starts_with(p))
+                {
+                    cmd.env_remove(k);
+                }
+            }
+            cmd.env("SHAREPOINT_GRAPH_BASE_URL", &base_url)
+                .env("SHAREPOINT_ACCESS_TOKEN", "sp15-test-token")
+                .env("SHAREPOINT_DISABLE_KEYRING", "1")
+                .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+                .env("SHAREPOINT_AUTO_DAEMON", "0")
+                .env("SHAREPOINT_CONFIG_DIR", profile_path.join("config"))
+                .env("SHAREPOINT_DATA_DIR", profile_path.join("data"))
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .args(&args)
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Warm cache with positive/default limits
+    let ls_warm = run_cli(&["ls", "--drive", "me", "--json"]).await;
+    assert!(ls_warm.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&ls_warm.stdout).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let rec_warm = run_cli(&["recent", "--json"]).await;
+    assert!(rec_warm.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&rec_warm.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let sh_warm = run_cli(&["shared", "--json"]).await;
+    assert!(sh_warm.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&sh_warm.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Run --limit 0 online and offline for ls, recent, shared, search -> ALL return length 0 with 0 page fetches!
+    let calls_before_zero = st.list_calls.load(Ordering::SeqCst);
+
+    for args in [
+        &["ls", "--drive", "me", "--limit", "0", "--json"][..],
+        &["ls", "--drive", "me", "--limit", "0", "--offline", "--json"][..],
+    ] {
+        let out = run_cli(args).await;
+        assert!(out.status.success(), "{args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 0, "{args:?} must return 0 items");
+    }
+
+    for args in [
+        &["recent", "--limit", "0", "--json"][..],
+        &["recent", "--limit", "0", "--offline", "--json"][..],
+        &["shared", "--limit", "0", "--json"][..],
+        &["shared", "--limit", "0", "--offline", "--json"][..],
+        &["search", "report", "--limit", "0", "--remote", "--json"][..],
+        &["search", "report", "--limit", "0", "--json"][..],
+    ] {
+        let out = run_cli(args).await;
+        assert!(out.status.success(), "{args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 0, "{args:?} must return 0 items");
+    }
+
+    assert_eq!(
+        st.list_calls.load(Ordering::SeqCst),
+        calls_before_zero,
+        "limit=0 requests must not start remote page collection"
+    );
+
+    // After limit=0, limit=1 offline MUST still see the original first cached item for every command!
+    let ls_1 = run_cli(&["ls", "--drive", "me", "--limit", "1", "--offline", "--json"]).await;
+    assert!(ls_1.status.success());
+    let ls_1_json: Value = serde_json::from_slice(&ls_1.stdout).unwrap();
+    assert_eq!(ls_1_json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(ls_1_json["items"][0]["id"], "item-ls-1");
+
+    let rec_1 = run_cli(&["recent", "--limit", "1", "--offline", "--json"]).await;
+    assert!(rec_1.status.success());
+    let rec_1_json: Value = serde_json::from_slice(&rec_1.stdout).unwrap();
+    assert_eq!(rec_1_json.as_array().unwrap().len(), 1);
+    assert_eq!(rec_1_json[0]["id"], "item-rec-1");
+
+    let sh_1 = run_cli(&["shared", "--limit", "1", "--offline", "--json"]).await;
+    assert!(sh_1.status.success());
+    let sh_1_json: Value = serde_json::from_slice(&sh_1.stdout).unwrap();
+    assert_eq!(sh_1_json.as_array().unwrap().len(), 1);
+    assert_eq!(sh_1_json[0]["id"], "item-sh-1");
+
+    let search_1 = run_cli(&["search", "report", "--limit", "1", "--json"]).await;
+    assert!(search_1.status.success());
+    let search_1_json: Value = serde_json::from_slice(&search_1.stdout).unwrap();
+    assert_eq!(search_1_json.as_array().unwrap().len(), 1);
+
+    // bitefoundry-onedrive entrypoint also returns empty list for --limit 0 without touching cache
+    let mut od_cmd = Command::new(env!("CARGO_BIN_EXE_bitefoundry-onedrive"));
+    od_cmd.kill_on_drop(true);
+    for (k, _) in std::env::vars_os() {
+        let u = k.to_string_lossy().to_ascii_uppercase();
+        if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+            .iter()
+            .any(|p| u.starts_with(p))
+        {
+            od_cmd.env_remove(k);
+        }
+    }
+    let od_zero = od_cmd
+        .env("SHAREPOINT_GRAPH_BASE_URL", &base_url)
+        .env("SHAREPOINT_ACCESS_TOKEN", "sp15-od-token")
+        .env("SHAREPOINT_DISABLE_KEYRING", "1")
+        .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+        .env("SHAREPOINT_AUTO_DAEMON", "0")
+        .env("SHAREPOINT_CONFIG_DIR", profile.path().join("config"))
+        .env("SHAREPOINT_DATA_DIR", profile.path().join("data"))
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .args(["ls", "--limit", "0", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(od_zero.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&od_zero.stdout).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 
     server.abort();
 }

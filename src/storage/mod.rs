@@ -208,6 +208,25 @@ impl Storage {
         drives::upsert_drive_items(&mut conn, items)
     }
 
+    pub fn upsert_drive_item_after_move(
+        &self,
+        item: &DriveItem,
+        old_folder_path: Option<&str>,
+    ) -> Result<usize> {
+        let mut conn = self.lock_conn()?;
+        drives::upsert_drive_item_after_move(&mut conn, item, old_folder_path)
+    }
+
+    pub fn has_cached_child_for_parent(&self, drive_id: &str, parent_id: &str) -> Result<bool> {
+        let conn = self.read_conn()?;
+        drives::has_cached_child_for_parent(&conn, drive_id, parent_id)
+    }
+
+    pub fn has_nested_drive_items(&self, drive_id: &str) -> Result<bool> {
+        let conn = self.read_conn()?;
+        drives::has_nested_drive_items(&conn, drive_id)
+    }
+
     pub fn replace_folder_children(
         &self,
         drive_id: &str,
@@ -362,6 +381,11 @@ impl Storage {
     pub fn upsert_download_baseline(&self, baseline: &DownloadBaseline) -> Result<()> {
         let conn = self.lock_conn()?;
         drives::upsert_download_baseline(&conn, baseline)
+    }
+
+    pub fn update_download_baseline_if_same_item(&self, baseline: &DownloadBaseline) -> Result<bool> {
+        let conn = self.lock_conn()?;
+        drives::update_download_baseline_if_same_item(&conn, baseline)
     }
 
     pub fn get_download_baseline(&self, local_path: &Path) -> Result<Option<DownloadBaseline>> {

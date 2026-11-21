@@ -255,7 +255,7 @@ pub enum Command {
         /// Optional remote filename override
         #[arg(long)]
         name: Option<String>,
-        /// Optional exact target item ID for conditional replacement
+        /// Optional exact target item ID to replace (works at any size, with or without --if-match)
         #[arg(long = "item-id", value_name = "ITEM_ID")]
         item_id: Option<String>,
         /// ETag precondition (`If-Match`) for replacement via an upload session at any size
@@ -1184,6 +1184,16 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
+                if if_match
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_none()
+                    && upload_opts.target_item_id.as_deref() != Some(explicit_id)
+                {
+                    upload_opts.if_match = None;
+                    upload_opts.expected_c_tag = None;
+                }
                 upload_opts.target_item_id = Some(explicit_id.to_string());
             }
             let uploaded = graph
@@ -1272,7 +1282,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, &item_or_path)
                     .await?;
             let dest_parent_id = match parent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some("/") | Some("root") => Some("root".to_string()),
+                Some(p) if p == "/" || p.eq_ignore_ascii_case("root") => Some("root".to_string()),
                 Some(p) => Some(
                     resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, p)
                         .await?
@@ -1442,7 +1452,9 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             json: as_json,
         }) => {
             let (_, graph, storage) = init_runtime(&config, offline).await?;
-            let items = if offline || cached {
+            let items = if limit == 0 {
+                Vec::new()
+            } else if offline || cached {
                 let c = storage.list_recent_items(limit)?;
                 if !c.is_empty() || offline {
                     c
@@ -1484,7 +1496,9 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             json: as_json,
         }) => {
             let (_, graph, storage) = init_runtime(&config, offline).await?;
-            let items = if offline || cached {
+            let items = if limit == 0 {
+                Vec::new()
+            } else if offline || cached {
                 let c = storage.list_shared_items(limit)?;
                 if !c.is_empty() || offline {
                     c
@@ -1996,6 +2010,9 @@ pub async fn fetch_folder_items(
     offline: bool,
     cached: bool,
 ) -> Result<Vec<DriveItem>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let target = path_or_id
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "/" && *s != "root");
@@ -2078,7 +2095,7 @@ pub async fn fetch_folder_items(
                     }
                     page.items
                 }
-                Err(_) => {
+                Err(err) if crate::graph::is_graph_not_found_error(&err) => {
                     let page = graph
                         .list_children_by_path_detailed(drive_id, id_or_name, Some(limit))
                         .await?;
@@ -2093,6 +2110,7 @@ pub async fn fetch_folder_items(
                     }
                     page.items
                 }
+                Err(err) => return Err(err),
             }
         }
     };
@@ -2207,28 +2225,21 @@ pub fn refresh_download_baseline_after_upload(
     storage: &Storage,
     local_path: &Path,
     uploaded: &DriveItem,
-    used_options: &UploadOptions,
+    _used_options: &UploadOptions,
 ) {
-    let had_baseline = storage
-        .get_download_baseline(local_path)
-        .ok()
-        .flatten()
-        .is_some();
-    if had_baseline || used_options.if_match.is_some() {
-        let baseline = DownloadBaseline {
-            local_path: crate::storage::drives::normalize_local_baseline_path(local_path),
-            drive_id: uploaded.effective_drive_id().to_string(),
-            item_id: uploaded.effective_item_id().to_string(),
-            parent_id: uploaded.parent_id.clone(),
-            parent_path: uploaded.parent_path.clone(),
-            remote_name: uploaded.name.clone(),
-            e_tag: uploaded.e_tag.clone(),
-            c_tag: uploaded.c_tag.clone(),
-            last_modified_at: uploaded.last_modified_at.clone(),
-            downloaded_at: chrono::Utc::now().to_rfc3339(),
-        };
-        let _ = storage.upsert_download_baseline(&baseline);
-    }
+    let baseline = DownloadBaseline {
+        local_path: crate::storage::drives::normalize_local_baseline_path(local_path),
+        drive_id: uploaded.effective_drive_id().to_string(),
+        item_id: uploaded.effective_item_id().to_string(),
+        parent_id: uploaded.parent_id.clone(),
+        parent_path: uploaded.parent_path.clone(),
+        remote_name: uploaded.name.clone(),
+        e_tag: uploaded.e_tag.clone(),
+        c_tag: uploaded.c_tag.clone(),
+        last_modified_at: uploaded.last_modified_at.clone(),
+        downloaded_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = storage.update_download_baseline_if_same_item(&baseline);
 }
 
 fn upload_parent_matches_baseline(
@@ -2273,39 +2284,66 @@ pub async fn search_items_combined(
     remote: bool,
     limit: usize,
 ) -> Result<Vec<DriveItem>> {
-    let mut results: Vec<DriveItem> = storage
-        .search_items(query, drive_id, limit)?
-        .into_iter()
-        .map(|h| h.item)
-        .collect();
+    if query.trim().is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    if !remote {
+        return Ok(storage
+            .search_items(query, drive_id, limit)?
+            .into_iter()
+            .map(|h| h.item)
+            .collect());
+    }
 
-    if remote {
-        let remote_items = if let Some(did) = drive_id {
-            graph.search_drive(did, query, limit).await?
-        } else {
-            match graph.search_across_sites(query, limit).await {
-                Ok(items) => items,
-                Err(_) => {
-                    // Fallback to personal drive search when `/search/query` is unavailable
-                    if let Ok(me) = graph.get_my_drive().await {
-                        graph.search_drive(&me.id, query, limit).await.unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    }
-                }
+    let remote_items = if let Some(did) = drive_id {
+        graph.search_drive(did, query, limit).await?
+    } else {
+        match graph.search_across_sites(query, limit).await {
+            Ok(items) => items,
+            Err(cross_err) => {
+                // Fallback to personal drive search when `/search/query` is unavailable
+                let me = graph.get_my_drive().await.with_context(|| {
+                    format!(
+                        "Cross-site search failed ({cross_err:#}); personal drive fallback failed"
+                    )
+                })?;
+                graph
+                    .search_drive(&me.id, query, limit)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Cross-site search failed ({cross_err:#}); personal drive search fallback failed"
+                        )
+                    })?
             }
-        };
-        let _ = storage.upsert_drive_items(&remote_items);
-        for item in remote_items {
-            if !results
-                .iter()
-                .any(|existing| existing.drive_id == item.drive_id && existing.id == item.id)
-            {
-                results.push(item);
+        }
+    };
+
+    let _ = storage.upsert_drive_items(&remote_items);
+
+    let mut results = Vec::with_capacity(limit.min(remote_items.len()));
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for item in remote_items {
+        if results.len() >= limit {
+            break;
+        }
+        if seen.insert((item.drive_id.clone(), item.id.clone())) {
+            results.push(item);
+        }
+    }
+
+    if results.len() < limit {
+        let local_items = storage.search_items(query, drive_id, limit.saturating_add(seen.len()))?;
+        for hit in local_items {
+            if results.len() >= limit {
+                break;
+            }
+            if seen.insert((hit.item.drive_id.clone(), hit.item.id.clone())) {
+                results.push(hit.item);
             }
         }
     }
-    results.truncate(limit);
+
     Ok(results)
 }
 
@@ -2331,7 +2369,13 @@ fn build_tree<'a>(
             let children = if item.is_folder && depth > 1 {
                 build_tree(graph, storage, drive_id, Some(&item.id), depth - 1)
                     .await
-                    .unwrap_or_default()
+                    .with_context(|| {
+                        format!(
+                            "Failed to list folder '{}' (id: {})",
+                            item.display_path(),
+                            item.id
+                        )
+                    })?
             } else {
                 Vec::new()
             };

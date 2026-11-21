@@ -514,8 +514,22 @@ async fn call_tool(
                     if_match.as_deref(),
                     explicit_conflict,
                 );
-                if target_item_id.is_some() {
-                    opts.target_item_id = target_item_id.clone();
+                if let Some(explicit_id) = target_item_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if if_match
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                        && opts.target_item_id.as_deref() != Some(explicit_id)
+                    {
+                        opts.if_match = None;
+                        opts.expected_c_tag = None;
+                    }
+                    opts.target_item_id = Some(explicit_id.to_string());
                 }
                 let item = map_graph_err(
                     graph,
@@ -640,7 +654,7 @@ async fn call_tool(
             )
             .await?;
             let resolved_parent_id = match new_parent_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some("/") | Some("root") => Some("root".to_string()),
+                Some(p) if p == "/" || p.eq_ignore_ascii_case("root") => Some("root".to_string()),
                 Some(p) if p.starts_with('/') || p.contains('/') => {
                     let folder = map_graph_err(
                         graph,
@@ -783,7 +797,9 @@ async fn call_tool(
         "list_recent" => {
             let limit = usize_arg("limit", 30);
             let offline = bool_arg("offline");
-            let items = if offline {
+            let items = if limit == 0 {
+                Vec::new()
+            } else if offline {
                 storage.list_recent_items(limit).map_err(|e| e.to_string())?
             } else {
                 let live = map_graph_err(graph, graph.list_recent_items(limit).await).await?;
@@ -795,7 +811,9 @@ async fn call_tool(
         "list_shared_with_me" => {
             let limit = usize_arg("limit", 30);
             let offline = bool_arg("offline");
-            let items = if offline {
+            let items = if limit == 0 {
+                Vec::new()
+            } else if offline {
                 storage.list_shared_items(limit).map_err(|e| e.to_string())?
             } else {
                 let live = map_graph_err(graph, graph.list_shared_with_me(limit).await).await?;

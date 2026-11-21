@@ -2,7 +2,7 @@
 //! recent/shared lists, pinned sites/folders, and sync cursors.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
 };
 
@@ -275,16 +275,71 @@ fn item_display_path(parent_path: &str, name: &str) -> String {
     }
 }
 
+fn path_matches_folder_prefix(path: &str, prefix: &str) -> bool {
+    if prefix.is_empty() || path.len() < prefix.len() || !path.is_char_boundary(prefix.len()) {
+        return false;
+    }
+    path[..prefix.len()].eq_ignore_ascii_case(prefix)
+        && (path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
+}
+
 fn upsert_drive_items_tx(tx: &rusqlite::Transaction<'_>, items: &[DriveItem]) -> Result<usize> {
+    upsert_drive_items_tx_with_moves(tx, items, &[])
+}
+
+fn upsert_drive_items_tx_with_moves(
+    tx: &rusqlite::Transaction<'_>,
+    items: &[DriveItem],
+    extra_moved_folders: &[(String, String, String)],
+) -> Result<usize> {
     if items.is_empty() {
         return Ok(0);
     }
     let mut written = 0usize;
-    let mut moved_folders: Vec<(String, String, String)> = Vec::new();
+    let mut batch_keys: HashSet<(String, String)> = HashSet::with_capacity(items.len());
+    let mut pre_batch_folder_paths: HashMap<(String, String), String> = HashMap::new();
+    let mut final_folder_paths: HashMap<(String, String), String> = HashMap::new();
+
     {
         let mut get_prev_folder_stmt = tx.prepare_cached(
             "SELECT is_folder, parent_path, name FROM drive_items WHERE drive_id = ?1 AND id = ?2",
         )?;
+        let mut get_child_parent_path_stmt = tx.prepare_cached(
+            "SELECT parent_path FROM drive_items WHERE drive_id = ?1 AND parent_id = ?2 AND parent_path != '' LIMIT 1",
+        )?;
+
+        // Snapshot pre-batch folder paths before applying any UPSERT in this transaction.
+        for item in items {
+            let key = (item.drive_id.clone(), item.id.clone());
+            batch_keys.insert(key.clone());
+            if !item.is_folder {
+                continue;
+            }
+            if !pre_batch_folder_paths.contains_key(&key) {
+                let prev: Option<(i32, String, String)> = get_prev_folder_stmt
+                    .query_row(params![item.drive_id, item.id], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .optional()?;
+                let old_full = match prev {
+                    Some((was_folder, old_pp, old_name)) if was_folder != 0 => {
+                        Some(item_display_path(&old_pp, &old_name))
+                    }
+                    Some(_) => None,
+                    None => get_child_parent_path_stmt
+                        .query_row(params![item.drive_id, item.id], |r| r.get::<_, String>(0))
+                        .optional()?
+                        .map(|pp| normalize_parent_path(&pp))
+                        .filter(|pp| !pp.is_empty()),
+                };
+                if let Some(old) = old_full {
+                    pre_batch_folder_paths.insert(key.clone(), old);
+                }
+            }
+            let norm_parent_path = normalize_parent_path(&item.parent_path);
+            final_folder_paths.insert(key, item_display_path(&norm_parent_path, &item.name));
+        }
+
         let mut upsert_stmt = tx.prepare_cached(
             "
             INSERT INTO drive_items (
@@ -337,22 +392,6 @@ fn upsert_drive_items_tx(tx: &rusqlite::Transaction<'_>, items: &[DriveItem]) ->
 
         for item in items {
             let norm_parent_path = normalize_parent_path(&item.parent_path);
-            if item.is_folder {
-                let prev: Option<(i32, String, String)> = get_prev_folder_stmt
-                    .query_row(params![item.drive_id, item.id], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-                    })
-                    .optional()?;
-                if let Some((was_folder, old_pp, old_name)) = prev {
-                    if was_folder != 0 {
-                        let old_full = item_display_path(&old_pp, &old_name);
-                        let new_full = item_display_path(&norm_parent_path, &item.name);
-                        if old_full != new_full {
-                            moved_folders.push((item.drive_id.clone(), old_full, new_full));
-                        }
-                    }
-                }
-            }
             upsert_stmt.execute(params![
                 item.drive_id,
                 item.id,
@@ -391,28 +430,74 @@ fn upsert_drive_items_tx(tx: &rusqlite::Transaction<'_>, items: &[DriveItem]) ->
         }
     }
 
-    for (drive_id, old_prefix, new_prefix) in moved_folders {
-        let like_pat = format!("{}/%", escape_like(&old_prefix));
-        let descendants: Vec<(i64, String, String, String, Option<String>, Option<String>, Option<String>)> = {
+    let mut moved_by_drive: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (drive_id, old_full, new_full) in extra_moved_folders {
+        if !old_full.is_empty() && old_full != new_full {
+            moved_by_drive
+                .entry(drive_id.clone())
+                .or_default()
+                .push((old_full.clone(), new_full.clone()));
+        }
+    }
+    for (key, old_full) in pre_batch_folder_paths {
+        if let Some(new_full) = final_folder_paths.get(&key) {
+            if !old_full.is_empty() && old_full != *new_full {
+                moved_by_drive
+                    .entry(key.0)
+                    .or_default()
+                    .push((old_full, new_full.clone()));
+            }
+        }
+    }
+
+    for (drive_id, mut moves) in moved_by_drive {
+        // Longest original folder prefix first so each cached descendant is rewritten exactly once.
+        moves.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let mut seen_rowids: HashSet<i64> = HashSet::new();
+        let mut descendants: Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = Vec::new();
+        {
             let mut stmt = tx.prepare_cached(
                 "SELECT rowid, id, parent_path, name, last_modified_by, created_by, mime_type
                  FROM drive_items
                  WHERE drive_id = ?1
                    AND (parent_path = ?2 COLLATE NOCASE OR parent_path LIKE ?3 ESCAPE '\\' COLLATE NOCASE)",
             )?;
-            let mapped = stmt.query_map(params![drive_id, old_prefix, like_pat], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                ))
-            })?;
-            mapped.collect::<rusqlite::Result<Vec<_>>>()?
-        };
+            for (old_prefix, _) in &moves {
+                let like_pat = format!("{}/%", escape_like(old_prefix));
+                let mapped = stmt.query_map(params![drive_id, old_prefix, like_pat], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                })?;
+                for row_res in mapped {
+                    let row = row_res?;
+                    if batch_keys.contains(&(drive_id.clone(), row.1.clone())) {
+                        continue;
+                    }
+                    if seen_rowids.insert(row.0) {
+                        descendants.push(row);
+                    }
+                }
+            }
+        }
+
+        if descendants.is_empty() {
+            continue;
+        }
         let mut upd_path = tx.prepare_cached(
             "UPDATE drive_items SET parent_path = ?1 WHERE drive_id = ?2 AND id = ?3",
         )?;
@@ -422,8 +507,17 @@ fn upsert_drive_items_tx(tx: &rusqlite::Transaction<'_>, items: &[DriveItem]) ->
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for (rowid, id, pp, name, mod_by, cr_by, mime) in descendants {
+            let Some((old_prefix, new_prefix)) = moves
+                .iter()
+                .find(|(old_p, _)| path_matches_folder_prefix(&pp, old_p))
+            else {
+                continue;
+            };
             let suffix = pp.get(old_prefix.len()..).unwrap_or("");
             let updated_pp = format!("{new_prefix}{suffix}");
+            if updated_pp == pp {
+                continue;
+            }
             upd_path.execute(params![updated_pp, drive_id, id])?;
             del_fts.execute([rowid])?;
             let dummy = DriveItem {
@@ -454,6 +548,52 @@ pub fn upsert_drive_items(conn: &mut Connection, items: &[DriveItem]) -> Result<
     let written = upsert_drive_items_tx(&tx, items)?;
     tx.commit()?;
     Ok(written)
+}
+
+pub fn upsert_drive_item_after_move(
+    conn: &mut Connection,
+    item: &DriveItem,
+    old_folder_path: Option<&str>,
+) -> Result<usize> {
+    let tx = conn.transaction()?;
+    let extra_moves = if item.is_folder {
+        old_folder_path
+            .map(normalize_parent_path)
+            .filter(|old| !old.is_empty())
+            .map(|old| {
+                let new_full =
+                    item_display_path(&normalize_parent_path(&item.parent_path), &item.name);
+                vec![(item.drive_id.clone(), old, new_full)]
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let written = upsert_drive_items_tx_with_moves(&tx, std::slice::from_ref(item), &extra_moves)?;
+    tx.commit()?;
+    Ok(written)
+}
+
+pub fn has_cached_child_for_parent(
+    conn: &Connection,
+    drive_id: &str,
+    parent_id: &str,
+) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM drive_items WHERE drive_id = ?1 AND parent_id = ?2 AND parent_path != '')",
+        params![drive_id, parent_id],
+        |r| r.get(0),
+    )?;
+    Ok(exists)
+}
+
+pub fn has_nested_drive_items(conn: &Connection, drive_id: &str) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM drive_items WHERE drive_id = ?1 AND parent_path != '')",
+        [drive_id],
+        |r| r.get(0),
+    )?;
+    Ok(exists)
 }
 
 /// Deletes an item and, if it is a cached folder, recursively deletes all cached descendants
@@ -619,7 +759,10 @@ pub fn list_folder_children(
     parent_path: Option<&str>,
     limit: usize,
 ) -> Result<Vec<DriveItem>> {
-    let lim = limit.max(1) as i64;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let lim = limit as i64;
     if let Some(pid) = parent_id.map(str::trim).filter(|s| !s.is_empty() && *s != "root") {
         let sql = format!(
             "SELECT {DRIVE_ITEM_COLS} FROM drive_items
@@ -761,6 +904,9 @@ pub fn replace_named_item_list(
 }
 
 pub fn list_named_items(conn: &Connection, list_kind: &str, limit: usize) -> Result<Vec<DriveItem>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let sql = format!(
         "
         SELECT d.drive_id, d.id, d.parent_id, d.parent_path, d.name, d.size, d.is_folder, d.child_count,
@@ -774,7 +920,7 @@ pub fn list_named_items(conn: &Connection, list_kind: &str, limit: usize) -> Res
         "
     );
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params![list_kind, limit.max(1) as i64], map_drive_item_row)?;
+    let rows = stmt.query_map(params![list_kind, limit as i64], map_drive_item_row)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
 }
 
@@ -1221,6 +1367,42 @@ pub fn upsert_download_baseline(conn: &Connection, baseline: &DownloadBaseline) 
         ],
     )?;
     Ok(())
+}
+
+/// Updates an existing download baseline only when the uploaded item matches the recorded
+/// `(drive_id, item_id)` of the original download, preserving the original baseline across copy uploads.
+pub fn update_download_baseline_if_same_item(
+    conn: &Connection,
+    baseline: &DownloadBaseline,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "
+        UPDATE local_download_baselines
+        SET parent_id = ?4,
+            parent_path = ?5,
+            remote_name = ?6,
+            e_tag = ?7,
+            c_tag = ?8,
+            last_modified_at = ?9,
+            downloaded_at = ?10
+        WHERE local_path = ?1
+          AND drive_id = ?2
+          AND item_id = ?3
+        ",
+        params![
+            baseline.local_path,
+            baseline.drive_id,
+            baseline.item_id,
+            baseline.parent_id,
+            normalize_parent_path(&baseline.parent_path),
+            baseline.remote_name,
+            baseline.e_tag,
+            baseline.c_tag,
+            baseline.last_modified_at,
+            baseline.downloaded_at,
+        ],
+    )?;
+    Ok(changed > 0)
 }
 
 pub fn get_download_baseline(

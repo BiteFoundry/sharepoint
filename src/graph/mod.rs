@@ -18,6 +18,25 @@ use crate::{auth::AuthManager, config::AppConfig};
 /// Canonical prefix emitted by `GraphClient` HTTP errors; kept as a shared constant for safe parsing.
 pub const GRAPH_API_ERROR_PREFIX: &str = "Graph API error (";
 
+/// Extracts the 3-digit HTTP status code from a `GraphClient` API error if present.
+pub(crate) fn graph_error_status(err: &anyhow::Error) -> Option<u16> {
+    let msg = format!("{err:#}");
+    let idx = msg.find(GRAPH_API_ERROR_PREFIX)?;
+    let after_prefix = &msg[idx + GRAPH_API_ERROR_PREFIX.len()..];
+    let close = after_prefix.find("): ")?;
+    let detail = after_prefix[close + 3..].trim_start();
+    let code_str: String = detail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if code_str.len() == 3 {
+        code_str.parse::<u16>().ok()
+    } else {
+        None
+    }
+}
+
+pub(crate) fn is_graph_not_found_error(err: &anyhow::Error) -> bool {
+    graph_error_status(err) == Some(404)
+}
+
 #[derive(Clone)]
 pub struct GraphClient {
     auth: AuthManager,

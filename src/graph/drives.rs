@@ -625,6 +625,9 @@ impl GraphClient {
     }
 
     pub async fn list_recent_items(&self, limit: usize) -> Result<Vec<DriveItem>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         let mut next: Option<String> = Some(format!("/me/drive/recent?$top={}", limit.clamp(1, 200)));
         while let Some(url) = next {
@@ -641,6 +644,9 @@ impl GraphClient {
     }
 
     pub async fn list_shared_with_me(&self, limit: usize) -> Result<Vec<DriveItem>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         let mut next: Option<String> =
             Some(format!("/me/drive/sharedWithMe?$top={}", limit.clamp(1, 200)));
@@ -861,6 +867,12 @@ impl GraphClient {
         parent_item_id: Option<&str>,
         limit: Option<usize>,
     ) -> Result<FolderChildrenPage> {
+        if limit == Some(0) {
+            return Ok(FolderChildrenPage {
+                items: Vec::new(),
+                complete: false,
+            });
+        }
         let enc_drive = urlencoding::encode(drive_id.trim());
         let top = match limit {
             Some(cap) => cap.saturating_add(1).clamp(1, 200),
@@ -894,6 +906,12 @@ impl GraphClient {
         path: &str,
         limit: Option<usize>,
     ) -> Result<FolderChildrenPage> {
+        if limit == Some(0) {
+            return Ok(FolderChildrenPage {
+                items: Vec::new(),
+                complete: false,
+            });
+        }
         let encoded_path = encode_graph_path(path);
         if encoded_path.is_empty() {
             return self.list_children_detailed(drive_id, None, limit).await;
@@ -930,7 +948,7 @@ impl GraphClient {
                 out.push(item.into_model(drive_id));
                 if let Some(cap) = limit {
                     if out.len() >= cap {
-                        if idx + 1 < page_len || page.next_link.is_some() || cap >= 200 {
+                        if idx + 1 < page_len || page.next_link.is_some() {
                             truncated = true;
                         }
                         return Ok(FolderChildrenPage {
@@ -1483,6 +1501,26 @@ impl GraphClient {
             }
         }
 
+        // Direct item-ID replacement without precondition (`< 4 MiB`):
+        // match `>= 4 MiB` target selection by using `/drives/{drive}/items/{id}/content`.
+        if let Some(item_id) = options
+            .target_item_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return self
+                .upload_item_content_put(
+                    drive_id,
+                    item_id,
+                    file_name,
+                    bytes,
+                    content_type,
+                    options,
+                )
+                .await;
+        }
+
         // Ordinary new upload or explicit replace (`< 4 MiB`)
         self.upload_file_simple_put(
             drive_id,
@@ -1682,6 +1720,23 @@ impl GraphClient {
                 .await?;
         }
         if bytes.is_empty() {
+            if let Some(item_id) = effective_opts
+                .target_item_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return self
+                    .upload_item_content_put(
+                        drive_id,
+                        item_id,
+                        file_name,
+                        Vec::new(),
+                        None,
+                        &effective_opts,
+                    )
+                    .await;
+            }
             return self
                 .upload_file_simple_put(
                     drive_id,
@@ -1976,6 +2031,18 @@ impl GraphClient {
         Ok(raw.into_model(drive_id))
     }
 
+    pub async fn get_drive_root_id(&self, drive_id: &str) -> Result<String> {
+        let enc_drive = urlencoding::encode(drive_id.trim());
+        let raw: GraphDriveItem = self
+            .get_json(&format!("/drives/{enc_drive}/root"))
+            .await?;
+        let id = raw.id.trim();
+        if id.is_empty() {
+            bail!("Graph /drives/{drive_id}/root response returned an empty root folder id.");
+        }
+        Ok(id.to_string())
+    }
+
     pub async fn rename_or_move_item(
         &self,
         drive_id: &str,
@@ -1988,7 +2055,12 @@ impl GraphClient {
             patch.insert("name".to_string(), json!(name));
         }
         if let Some(pid) = new_parent_id.map(str::trim).filter(|s| !s.is_empty()) {
-            patch.insert("parentReference".to_string(), json!({ "id": pid }));
+            let resolved_pid = if pid == "/" || pid.eq_ignore_ascii_case("root") {
+                self.get_drive_root_id(drive_id).await?
+            } else {
+                pid.to_string()
+            };
+            patch.insert("parentReference".to_string(), json!({ "id": resolved_pid }));
         }
         if patch.is_empty() {
             bail!("Must specify at least a new name or a destination parent folder ID.");

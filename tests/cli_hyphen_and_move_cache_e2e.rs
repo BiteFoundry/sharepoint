@@ -1325,3 +1325,304 @@ impl CliRunner<'_> {
         serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
     }
 }
+
+#[tokio::test]
+async fn regression_sharepoint_sp_13_nested_folder_batch_and_uncached_http_rename_cache_paths() {
+    use sharepoint_cli::{
+        auth::{AuthManager, StoredTokens},
+        config::AppConfig,
+        graph::GraphClient,
+        models::DriveItem,
+        serve,
+        storage::Storage,
+    };
+
+    // Part A: Same-batch Alpha->Alpha-New and Beta->Beta-New in BOTH parent-first and child-first order
+    for parent_first in [true, false] {
+        let storage = Storage::open_in_memory().unwrap();
+        let initial = vec![
+            DriveItem {
+                id: "fld-alpha".into(),
+                drive_id: DRIVE_ME.into(),
+                parent_id: Some("root".into()),
+                parent_path: String::new(),
+                name: "Alpha".into(),
+                is_folder: true,
+                ..Default::default()
+            },
+            DriveItem {
+                id: "fld-beta".into(),
+                drive_id: DRIVE_ME.into(),
+                parent_id: Some("fld-alpha".into()),
+                parent_path: "/Alpha".into(),
+                name: "Beta".into(),
+                is_folder: true,
+                ..Default::default()
+            },
+            DriveItem {
+                id: "item-deep".into(),
+                drive_id: DRIVE_ME.into(),
+                parent_id: Some("fld-beta".into()),
+                parent_path: "/Alpha/Beta".into(),
+                name: "deep.md".into(),
+                size: 42,
+                mime_type: Some("text/markdown".into()),
+                ..Default::default()
+            },
+            DriveItem {
+                id: "item-alpha2".into(),
+                drive_id: DRIVE_ME.into(),
+                parent_id: Some("fld-alpha2".into()),
+                parent_path: "/Alpha2".into(),
+                name: "sibling.md".into(),
+                size: 10,
+                ..Default::default()
+            },
+            DriveItem {
+                id: "item-other-drive".into(),
+                drive_id: DRIVE_SP.into(),
+                parent_id: Some("fld-beta".into()),
+                parent_path: "/Alpha/Beta".into(),
+                name: "deep.md".into(),
+                size: 10,
+                ..Default::default()
+            },
+        ];
+        storage.upsert_drive_items(&initial).unwrap();
+
+        let alpha_new = DriveItem {
+            id: "fld-alpha".into(),
+            drive_id: DRIVE_ME.into(),
+            parent_id: Some("root".into()),
+            parent_path: String::new(),
+            name: "Alpha-New".into(),
+            is_folder: true,
+            ..Default::default()
+        };
+        let beta_new = DriveItem {
+            id: "fld-beta".into(),
+            drive_id: DRIVE_ME.into(),
+            parent_id: Some("fld-alpha".into()),
+            parent_path: "/Alpha-New".into(),
+            name: "Beta-New".into(),
+            is_folder: true,
+            ..Default::default()
+        };
+        let batch = if parent_first {
+            vec![alpha_new.clone(), beta_new.clone()]
+        } else {
+            vec![beta_new.clone(), alpha_new.clone()]
+        };
+
+        storage.upsert_drive_items(&batch).unwrap();
+
+        // deep.md MUST only resolve at /Alpha-New/Beta-New/deep.md
+        let found = storage
+            .get_drive_item_by_path(DRIVE_ME, "/Alpha-New/Beta-New/deep.md")
+            .unwrap();
+        assert_eq!(
+            found.as_ref().map(|i| i.id.as_str()),
+            Some("item-deep"),
+            "parent_first={parent_first}: deep.md must resolve at /Alpha-New/Beta-New/deep.md"
+        );
+        assert!(
+            storage
+                .get_drive_item_by_path(DRIVE_ME, "/Alpha-New/Beta/deep.md")
+                .unwrap()
+                .is_none(),
+            "parent_first={parent_first}: ghost path /Alpha-New/Beta/deep.md must not exist"
+        );
+        assert!(
+            storage
+                .get_drive_item_by_path(DRIVE_ME, "/Alpha/Beta/deep.md")
+                .unwrap()
+                .is_none(),
+            "parent_first={parent_first}: old path /Alpha/Beta/deep.md must not exist"
+        );
+        let fts_hits = storage.search_items("Beta-New", Some(DRIVE_ME), 20).unwrap();
+        assert!(
+            fts_hits.iter().any(|h| h.item.id == "item-deep"),
+            "parent_first={parent_first}: FTS search for Beta-New must include deep.md"
+        );
+
+        // Control: /Alpha2 and other drive remain untouched
+        assert_eq!(
+            storage
+                .get_drive_item_by_path(DRIVE_ME, "/Alpha2/sibling.md")
+                .unwrap()
+                .unwrap()
+                .id,
+            "item-alpha2"
+        );
+        assert_eq!(
+            storage
+                .get_drive_item_by_path(DRIVE_SP, "/Alpha/Beta/deep.md")
+                .unwrap()
+                .unwrap()
+                .id,
+            "item-other-drive"
+        );
+
+        // Control: re-receiving the same batch is idempotent (no duplicated path segments)
+        storage.upsert_drive_items(&batch).unwrap();
+        let after_replay = storage
+            .get_drive_item(DRIVE_ME, "item-deep")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_replay.parent_path, "/Alpha-New/Beta-New",
+            "parent_first={parent_first}: re-applying batch must not duplicate renamed segments"
+        );
+    }
+
+    // Part B: HTTP PATCH rename when target folder row is NOT cached (direct child cached, and grandchild-only cached)
+    let mut mock_state = MockDriveState::default();
+    mock_state.seed_item(MockItem {
+        id: "fld-http-1".into(),
+        drive_id: DRIVE_ME.into(),
+        parent_id: "root".into(),
+        parent_path: String::new(),
+        name: "UncachedDir".into(),
+        is_folder: true,
+        size: 0,
+        mime_type: None,
+    });
+    mock_state.seed_item(MockItem {
+        id: "item-http-child".into(),
+        drive_id: DRIVE_ME.into(),
+        parent_id: "fld-http-1".into(),
+        parent_path: "/UncachedDir".into(),
+        name: "child.txt".into(),
+        is_folder: false,
+        size: 12,
+        mime_type: Some("text/plain".into()),
+    });
+    mock_state.seed_item(MockItem {
+        id: "fld-http-2".into(),
+        drive_id: DRIVE_ME.into(),
+        parent_id: "root".into(),
+        parent_path: String::new(),
+        name: "UncachedTop".into(),
+        is_folder: true,
+        size: 0,
+        mime_type: None,
+    });
+    mock_state.seed_item(MockItem {
+        id: "fld-http-mid".into(),
+        drive_id: DRIVE_ME.into(),
+        parent_id: "fld-http-2".into(),
+        parent_path: "/UncachedTop".into(),
+        name: "Mid".into(),
+        is_folder: true,
+        size: 0,
+        mime_type: None,
+    });
+    mock_state.seed_item(MockItem {
+        id: "item-http-grand".into(),
+        drive_id: DRIVE_ME.into(),
+        parent_id: "fld-http-mid".into(),
+        parent_path: "/UncachedTop/Mid".into(),
+        name: "grand.txt".into(),
+        is_folder: false,
+        size: 9,
+        mime_type: Some("text/plain".into()),
+    });
+
+    let (base_url, _st, graph_server) = start_mock_server(mock_state).await;
+    let mut cfg = AppConfig::default();
+    cfg.graph_base_url = base_url.clone();
+    let tokens = StoredTokens {
+        access_token: "sp13-token".into(),
+        refresh_token: None,
+        expires_at: chrono::Utc::now().timestamp() + 3600,
+        client_id: cfg.client_id.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        user_id: Some("user-1".into()),
+        user_display_name: Some("Tester".into()),
+        user_email: Some("tester@example.com".into()),
+        auth_mode: "access_token".into(),
+    };
+    let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+    let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+
+    // Cache ONLY child.txt (NOT fld-http-1) and ONLY grand.txt (NOT fld-http-2 or fld-http-mid)
+    storage
+        .upsert_drive_items(&[
+            DriveItem {
+                id: "item-http-child".into(),
+                drive_id: DRIVE_ME.into(),
+                parent_id: Some("fld-http-1".into()),
+                parent_path: "/UncachedDir".into(),
+                name: "child.txt".into(),
+                size: 12,
+                ..Default::default()
+            },
+            DriveItem {
+                id: "item-http-grand".into(),
+                drive_id: DRIVE_ME.into(),
+                parent_id: Some("fld-http-mid".into()),
+                parent_path: "/UncachedTop/Mid".into(),
+                name: "grand.txt".into(),
+                size: 9,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+
+    let api_router = serve::build_router(cfg, graph, storage.clone(), None);
+    let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api_listener.local_addr().unwrap();
+    let api_server = tokio::spawn(async move {
+        let _ = axum::serve(api_listener, api_router).await;
+    });
+
+    let http = reqwest::Client::new();
+
+    // Rename uncached fld-http-1 (direct child cached)
+    let r1 = http
+        .patch(format!("http://{api_addr}/v1/items/fld-http-1"))
+        .json(&json!({ "drive": "me", "name": "RenamedViaHttp" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::OK);
+    assert_eq!(
+        storage
+            .get_drive_item_by_path(DRIVE_ME, "/RenamedViaHttp/child.txt")
+            .unwrap()
+            .as_ref()
+            .map(|i| i.id.as_str()),
+        Some("item-http-child"),
+        "uncached folder HTTP rename must update cached direct child path"
+    );
+    assert!(storage
+        .get_drive_item_by_path(DRIVE_ME, "/UncachedDir/child.txt")
+        .unwrap()
+        .is_none());
+
+    // Rename uncached fld-http-2 (only grandchild cached)
+    let r2 = http
+        .patch(format!("http://{api_addr}/v1/items/fld-http-2"))
+        .json(&json!({ "drive": "me", "name": "RenamedTop" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    assert_eq!(
+        storage
+            .get_drive_item_by_path(DRIVE_ME, "/RenamedTop/Mid/grand.txt")
+            .unwrap()
+            .as_ref()
+            .map(|i| i.id.as_str()),
+        Some("item-http-grand"),
+        "uncached folder HTTP rename must update cached grandchild path via pre-PATCH metadata"
+    );
+    assert!(storage
+        .get_drive_item_by_path(DRIVE_ME, "/UncachedTop/Mid/grand.txt")
+        .unwrap()
+        .is_none());
+
+    api_server.abort();
+    graph_server.abort();
+}

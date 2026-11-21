@@ -23,6 +23,7 @@ use crate::{
     config::{self, AppConfig, Persona},
     graph::{
         drives::{is_precondition_failed_error, ConflictBehavior, UploadOptions},
+        media::decode_text_file,
         GraphClient,
     },
     resolver,
@@ -529,6 +530,8 @@ async fn handle_item_content(
             q.max_bytes.unwrap_or(cli::DEFAULT_TEXT_PREVIEW_MAX_BYTES),
         )
         .await?;
+    let content = decode_text_file(&bytes)
+        .map_err(|err| ApiError::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, format!("{err:#}")))?;
     Ok(Json(json!({
         "ok": true,
         "id": item.id,
@@ -538,7 +541,7 @@ async fn handle_item_content(
         "e_tag": item.e_tag,
         "c_tag": item.c_tag,
         "size_bytes": bytes.len(),
-        "content": String::from_utf8_lossy(&bytes),
+        "content": content,
     })))
 }
 
@@ -614,6 +617,17 @@ async fn handle_upload(
             explicit_conflict,
         );
         if let Some(id) = body.item_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if body
+                .if_match
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+                && opts.target_item_id.as_deref() != Some(id)
+            {
+                opts.if_match = None;
+                opts.expected_c_tag = None;
+            }
             opts.target_item_id = Some(id.to_string());
         }
         let item = state
@@ -696,13 +710,38 @@ async fn handle_patch_item(
         false,
     )
     .await?;
+    let mut pre_patch_folder_path: Option<String> = None;
+    let folder_cached = state
+        .storage
+        .get_drive_item(&drive.id, &id)
+        .ok()
+        .flatten()
+        .is_some();
+    if !folder_cached {
+        let has_direct_child = state
+            .storage
+            .has_cached_child_for_parent(&drive.id, &id)
+            .unwrap_or(false);
+        if !has_direct_child
+            && state
+                .storage
+                .has_nested_drive_items(&drive.id)
+                .unwrap_or(false)
+        {
+            if let Ok(existing) = state.graph.get_item(&drive.id, &id).await {
+                if existing.is_folder {
+                    pre_patch_folder_path = Some(existing.display_path());
+                }
+            }
+        }
+    }
     let updated = state
         .graph
         .rename_or_move_item(&drive.id, &id, body.name.as_deref(), body.parent_id.as_deref())
         .await?;
     let _ = state
         .storage
-        .upsert_drive_items(std::slice::from_ref(&updated));
+        .upsert_drive_item_after_move(&updated, pre_patch_folder_path.as_deref());
     Ok(Json(json!({ "item": updated })))
 }
 
@@ -757,7 +796,9 @@ async fn handle_recent(
     Query(q): Query<LimitOfflineQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = q.limit.unwrap_or(30);
-    let items = if q.offline {
+    let items = if limit == 0 {
+        Vec::new()
+    } else if q.offline {
         state.storage.list_recent_items(limit)?
     } else {
         let live = state.graph.list_recent_items(limit).await?;
@@ -772,7 +813,9 @@ async fn handle_shared(
     Query(q): Query<LimitOfflineQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = q.limit.unwrap_or(30);
-    let items = if q.offline {
+    let items = if limit == 0 {
+        Vec::new()
+    } else if q.offline {
         state.storage.list_shared_items(limit)?
     } else {
         let live = state.graph.list_shared_with_me(limit).await?;
