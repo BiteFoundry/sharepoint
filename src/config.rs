@@ -1,4 +1,4 @@
-//! Application configuration, dual-persona detection (`sharepoint`/`sp` vs `onedrive`/`od`),
+//! Application configuration and persona detection for `sharepoint` and `bitefoundry-onedrive`,
 //! local paths, and settings (`config.toml`).
 //!
 //! Shared foundation module: treat public signatures here as stable across all modules.
@@ -133,7 +133,7 @@ impl ImageProtocolPreference {
     }
 }
 
-/// Dual-persona entry identity: `SharePoint` (`sharepoint`/`sp`) vs `OneDrive` (`onedrive`/`od`).
+/// Entry identity for the SharePoint and OneDrive modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Persona {
@@ -143,7 +143,7 @@ pub enum Persona {
 }
 
 impl Persona {
-    /// Detects entry persona from `SHAREPOINT_PERSONA` env var first, falling back to `argv[0]`.
+    /// The OneDrive launcher selects OneDrive. Other launchers accept a `SHAREPOINT_PERSONA` override.
     pub fn detect() -> Self {
         let env_val = std::env::var("SHAREPOINT_PERSONA").ok();
         let argv0 = std::env::args_os()
@@ -153,26 +153,30 @@ impl Persona {
     }
 
     pub fn detect_from(env_persona: Option<&str>, argv0: Option<&str>) -> Self {
-        if let Some(val) = env_persona {
-            if let Some(p) = Self::parse_str(val) {
-                return p;
-            }
-        }
-        if let Some(raw_bin) = argv0 {
-            let file_name = Path::new(raw_bin)
-                .file_name()
-                .and_then(|s| s.to_str())
+        let file_name = argv0.map(|raw_bin| {
+            raw_bin
+                .rsplit(['/', '\\'])
+                .next()
                 .unwrap_or(raw_bin)
-                .to_ascii_lowercase();
-            let stem = file_name
-                .strip_suffix(".exe")
-                .or_else(|| file_name.strip_suffix(".js"))
-                .or_else(|| file_name.strip_suffix(".cmd"))
-                .or_else(|| file_name.strip_suffix(".ps1"))
-                .unwrap_or(&file_name);
-            if stem == "od" || stem == "onedrive" || stem.starts_with("onedrive-") {
-                return Self::OneDrive;
-            }
+                .to_ascii_lowercase()
+        });
+        let file_name = file_name.as_deref().unwrap_or_default();
+        let stem = file_name
+            .strip_suffix(".exe")
+            .or_else(|| file_name.strip_suffix(".js"))
+            .or_else(|| file_name.strip_suffix(".cmd"))
+            .or_else(|| file_name.strip_suffix(".ps1"))
+            .unwrap_or(file_name);
+
+        if stem == Self::OneDrive.bin_name() {
+            return Self::OneDrive;
+        }
+        if let Some(persona) = env_persona.and_then(Self::parse_str) {
+            return persona;
+        }
+        // Existing standalone launchers keep working when updated in place.
+        if stem == "od" || stem == "onedrive" || stem.starts_with("onedrive-") {
+            return Self::OneDrive;
         }
         Self::SharePoint
     }
@@ -188,7 +192,7 @@ impl Persona {
     pub fn bin_name(self) -> &'static str {
         match self {
             Self::SharePoint => "sharepoint",
-            Self::OneDrive => "onedrive",
+            Self::OneDrive => "bitefoundry-onedrive",
         }
     }
 
@@ -200,7 +204,10 @@ impl Persona {
     }
 
     pub fn as_str(self) -> &'static str {
-        self.bin_name()
+        match self {
+            Self::SharePoint => "sharepoint",
+            Self::OneDrive => "onedrive",
+        }
     }
 }
 
@@ -784,6 +791,15 @@ mod tests {
         assert_eq!(Persona::detect_from(None, Some("onedrive.exe")), Persona::OneDrive);
         assert_eq!(Persona::detect_from(None, Some("C:\\bin\\od.exe")), Persona::OneDrive);
         assert_eq!(Persona::detect_from(None, Some("bin/od.js")), Persona::OneDrive);
+        assert_eq!(
+            Persona::detect_from(None, Some("/usr/local/bin/bitefoundry-onedrive")),
+            Persona::OneDrive
+        );
+        assert_eq!(
+            Persona::detect_from(Some("sharepoint"), Some("BITEFOUNDRY-ONEDRIVE.EXE")),
+            Persona::OneDrive
+        );
+        assert_eq!(Persona::OneDrive.as_str(), "onedrive");
         assert_eq!(
             Persona::detect_from(Some("onedrive"), Some("sharepoint.exe")),
             Persona::OneDrive

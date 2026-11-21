@@ -78,7 +78,9 @@ jobs:
 
       - name: Verify Linux GLIBC <= 2.28 compatibility
         if: matrix.os == 'ubuntu-latest'
-        run: node scripts/verify-glibc.mjs "target/${{ matrix.target }}/release/sharepoint" --max 2.28
+        run: |
+          node scripts/verify-glibc.mjs "target/${{ matrix.target }}/release/sharepoint" --max 2.28
+          node scripts/verify-glibc.mjs "target/${{ matrix.target }}/release/bitefoundry-onedrive" --max 2.28
 
       - name: Smoke test binary on AlmaLinux 8 container
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -87,6 +89,7 @@ jobs:
           set -euo pipefail
           docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/sharepoint --version
           docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/sharepoint --help >/dev/null
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/bitefoundry-onedrive --version
 
       - name: Build release binary
         if: matrix.os != 'ubuntu-latest'
@@ -101,14 +104,17 @@ jobs:
           set -euo pipefail
           version=$(node -p "require('./package.json').version")
           name="sharepoint-${version}-${{ matrix.target }}"
+          release_dir="target/${{ matrix.target }}/release"
           mkdir -p release-staging
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a "release-staging/${name}.zip" "target/${{ matrix.target }}/release/sharepoint.exe"
+            mkdir -p release-contents
+            cp "$release_dir/sharepoint.exe" "$release_dir/bitefoundry-onedrive.exe" LICENSE release-contents/
+            (cd release-contents && 7z a "../release-staging/${name}.zip" sharepoint.exe bitefoundry-onedrive.exe LICENSE)
             if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
-              cp "target/${{ matrix.target }}/release/sharepoint.exe" "release-staging/sharepoint.exe"
+              cp "$release_dir/sharepoint.exe" "$release_dir/bitefoundry-onedrive.exe" LICENSE release-staging/
             fi
           else
-            tar -czf "release-staging/${name}.tar.gz" -C "target/${{ matrix.target }}/release" sharepoint
+            tar -czf "release-staging/${name}.tar.gz" LICENSE -C "$release_dir" sharepoint bitefoundry-onedrive
           fi
 
       - name: Stage npm artifact directory
@@ -183,9 +189,8 @@ jobs:
           done
 
           test -f bin/sharepoint.js
-          test -f bin/sp.js
-          test -f bin/onedrive.js
-          test -f bin/od.js
+          test -f bin/bitefoundry-onedrive.js
+          test -f bin/launch.js
           test -f scripts/postinstall.mjs
           test -f dist/sharepoint-win32-x64/bin/sharepoint.exe
           test -f dist/sharepoint-win32-arm64/bin/sharepoint.exe
@@ -236,7 +241,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo 'Prebuilt unified Microsoft SharePoint & OneDrive binary (`sharepoint` / `sp` / `onedrive` / `od`) — CLI, TUI, HTTP API, and MCP server.'
+            echo 'Prebuilt Microsoft SharePoint and OneDrive executables (`sharepoint` and `bitefoundry-onedrive`) — CLI, TUI, HTTP API, and MCP server.'
             if [ -f "release-notes/${GITHUB_REF_NAME}.md" ]; then
               echo ""
               cat "release-notes/${GITHUB_REF_NAME}.md"

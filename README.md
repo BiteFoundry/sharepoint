@@ -21,7 +21,7 @@
 
 | Capability | Details |
 | --- | --- |
-| **Minimal-Chrome 3-Pane TUI** | Dual-persona explorer (`sharepoint`/`sp` & `onedrive`/`od`) with collapsible Sites, Document Libraries & OneDrive sidebar, sorted file list, live Inspector (metadata, version history, Markdown/YAML/JSON/code preview), Link Extractor (`u`), File Picker with `zoxide` (`Ctrl+F`), Context Menu (`.`), and 6 themes. |
+| **Minimal-Chrome 3-Pane TUI** | Dual-persona explorer (`sharepoint` and `bitefoundry-onedrive`) with collapsible Sites, Document Libraries & OneDrive sidebar, sorted file list, live Inspector (metadata, version history, Markdown/YAML/JSON/code preview), Link Extractor (`u`), File Picker with `zoxide` (`Ctrl+F`), Context Menu (`.`), and 6 themes. |
 | **High-Res Terminal Images** | Inline Inspector thumbnails & fullscreen HD previews (`v` / `Alt+v`) with 80ms protocol probing for **Kitty**, **iTerm2**, **Sixel** (Floyd-Steinberg dithering), and **24-bit Unicode Half-Blocks** + `Ctrl+V` instant clipboard PNG upload. |
 | **Local SQLite FTS5 + IPC Daemon** | WAL-mode SQLite cache with 4-reader pool, hybrid local FTS5 + remote Graph search (`/`), streaming chunked uploads (`> 4 MiB`), and a shared background sync daemon (`sharepoint daemon start`). |
 | **4-in-1 Agent Interface** | Interactive **TUI**, scriptable `--json` **CLI**, local **HTTP JSON API** (`sharepoint serve`, port `8790`), and stdio **MCP Server** (`sharepoint mcp`, 19 tools). |
@@ -38,12 +38,33 @@ npm i -g @bitefoundry/sharepoint
 sharepoint login
 
 # 3. Launch the interactive 3-pane TUI in either persona
-sharepoint          # SharePoint Sites & Document Libraries (alias: sp)
-onedrive            # Personal OneDrive: My Files, Recent, Shared (alias: od)
+sharepoint           # SharePoint sites and document libraries
+bitefoundry-onedrive # Personal OneDrive, including My Files, Recent, and Shared
 ```
 
-> Required Microsoft Graph delegated scopes: `Files.ReadWrite.All`, `Sites.ReadWrite.All`, `User.Read`, `offline_access`.  
-> Prefer building from source? Run `cargo build --release` and see [docs/NPM.md](docs/NPM.md) for external token brokers & environment variables.
+Build both commands with `cargo install --locked --path .` from a checkout. Both executables are also available in the same GitHub release archive. [Install and upgrade](docs/NPM.md)
+
+### Company-managed Microsoft Entra sign-in
+
+`sharepoint login` uses the public Microsoft Graph Command Line Tools client by default. To use a company-owned app, register it as a public client and configure the `http://localhost` redirect URI. Enable public client flows for headless `--device-code` sign-in. [Company app registration guide](https://github.com/BiteFoundry/teams/blob/master/docs/ENTERPRISE.md)
+
+Add the Microsoft Graph delegated permissions your users need and have your Entra administrator grant consent where required.
+
+| Feature | Delegated scopes |
+| --- | --- |
+| Profile and session refresh | `User.Read`, `offline_access` |
+| Read and edit OneDrive files | `Files.Read`, `Files.ReadWrite` |
+| Read and edit files the user can access across drives | `Files.Read.All`, `Files.ReadWrite.All` |
+| Browse SharePoint sites and libraries, and write to those libraries | `Sites.Read.All`, `Sites.ReadWrite.All` |
+
+The default sign-in requests all scopes in the table. Set `scopes` in `config.toml` to request a narrower set that matches your workflow.
+
+```sh
+sharepoint login --client-id YOUR_APP_ID --tenant-id YOUR_TENANT_ID
+sharepoint whoami --json
+```
+
+For persistent environment configuration, set `SHAREPOINT_CLIENT_ID` and `SHAREPOINT_TENANT_ID`. The OneDrive launcher uses the same credentials.
 
 ---
 
@@ -74,15 +95,15 @@ onedrive            # Personal OneDrive: My Files, Recent, Shared (alias: od)
 ```sh
 sharepoint sites --json
 sharepoint drives --site "Acme Engineering" --json
-onedrive ls /Projects/Platform-v4 --json --compact
-onedrive info /Projects/Platform-v4/deploy-pipeline.yaml --versions --versions-limit 5 --json --compact
-onedrive cat /Projects/Platform-v4/deploy-pipeline.yaml
+bitefoundry-onedrive ls /Projects/Platform-v4 --json --compact
+bitefoundry-onedrive info /Projects/Platform-v4/deploy-pipeline.yaml --versions --versions-limit 5 --json --compact
+bitefoundry-onedrive cat /Projects/Platform-v4/deploy-pipeline.yaml
 sharepoint upload ./q4-architecture-deck.pdf /RFCs --site "Acme Engineering" --json
 sharepoint share /api-gateway-rfc.md --site "Acme Engineering" --type view --scope organization --json
 sharepoint search "gateway" --remote --json
 ```
 
-`sharepoint --help` and `onedrive --help` list the commands that support `--json`.
+`sharepoint --help` and `bitefoundry-onedrive --help` list the commands that support `--json`.
 For `ls` and `info`, `--json --compact` returns the drive and item IDs, name,
 file or folder flag, byte size, and modification time. Compact `info` also includes the eTag.
 `info --versions` reads all available history by default. `--versions-limit` caps
@@ -151,10 +172,10 @@ Full tool catalog & schemas: [docs/MCP.md](docs/MCP.md).
 | --- | --- | --- |
 | [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams` | Microsoft Teams chats, channels, threads & meetings |
 | [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook` | Microsoft Outlook mail, calendar & contacts |
-| [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote`, `note` | Microsoft OneNote notebooks, sections, pages & XHTML/Markdown |
-| **`@bitefoundry/sharepoint`** | `sharepoint`, `sp`, `onedrive`, `od` | Microsoft SharePoint sites, document libraries & OneDrive files |
-| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Atlassian Jira issues, boards, sprints & Confluence pages |
-| [`@bitefoundry/notion`](https://www.npmjs.com/package/@bitefoundry/notion) | `notion`, `nt` | Notion pages, databases, blocks & Markdown sync |
+| [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote` | Microsoft OneNote notebooks, sections, pages & XHTML/Markdown |
+| **`@bitefoundry/sharepoint`** | `sharepoint`, `bitefoundry-onedrive` | Microsoft SharePoint sites, document libraries & OneDrive files |
+| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `confluence`, `conf` | Atlassian Jira issues, boards, sprints & Confluence pages |
+| [`@bitefoundry/notion`](https://www.npmjs.com/package/@bitefoundry/notion) | `notion` | Notion pages, databases, blocks & Markdown sync |
 
 ---
 

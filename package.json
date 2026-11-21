@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/sharepoint",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Unified Microsoft SharePoint & OneDrive terminal client & AI agent toolkit — Sites, Document Libraries & Personal Files (CLI, TUI, HTTP API, MCP)",
   "repository": {
     "type": "git",
@@ -9,15 +9,12 @@
   "license": "MIT",
   "bin": {
     "sharepoint": "bin/sharepoint.js",
-    "sp": "bin/sp.js",
-    "onedrive": "bin/onedrive.js",
-    "od": "bin/od.js"
+    "bitefoundry-onedrive": "bin/bitefoundry-onedrive.js"
   },
   "files": [
     "bin/sharepoint.js",
-    "bin/sp.js",
-    "bin/onedrive.js",
-    "bin/od.js",
+    "bin/bitefoundry-onedrive.js",
+    "bin/launch.js",
     "scripts/postinstall.mjs",
     "docs/NPM.md",
     "docs/API.md",
@@ -46,11 +43,11 @@
     "build:npm": "node scripts/build-npm.mjs"
   },
   "optionalDependencies": {
-    "@bitefoundry/sharepoint-win32-x64": "0.1.4",
-    "@bitefoundry/sharepoint-win32-arm64": "0.1.4",
-    "@bitefoundry/sharepoint-darwin-x64": "0.1.4",
-    "@bitefoundry/sharepoint-darwin-arm64": "0.1.4",
-    "@bitefoundry/sharepoint-linux-x64": "0.1.4",
-    "@bitefoundry/sharepoint-linux-arm64": "0.1.4"
+    "@bitefoundry/sharepoint-win32-x64": "0.2.0",
+    "@bitefoundry/sharepoint-win32-arm64": "0.2.0",
+    "@bitefoundry/sharepoint-darwin-x64": "0.2.0",
+    "@bitefoundry/sharepoint-darwin-arm64": "0.2.0",
+    "@bitefoundry/sharepoint-linux-x64": "0.2.0",
+    "@bitefoundry/sharepoint-linux-arm64": "0.2.0"
   }
 }

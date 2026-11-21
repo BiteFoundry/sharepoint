@@ -1,12 +1,12 @@
 <#
 .SYNOPSIS
-    Idempotently installs the `sharepoint` (`sp`, `onedrive`, `od`) terminal launchers on any Windows PC.
+    Installs the `sharepoint` and `bitefoundry-onedrive` terminal launchers on Windows.
 
 .DESCRIPTION
     1. Ensures <RepoRoot>\target\release\sharepoint.exe exists (downloads the prebuilt
        release binary from GitHub `BiteFoundry/sharepoint` via `gh` when missing, so
        Rust/Cargo is NOT required on target PCs).
-    2. Registers/updates `# >>> sharepoint launcher >>>` (`function sharepoint`, `sp`, `onedrive`, `od`) in PowerShell $PROFILE.
+    2. Registers/updates `# >>> sharepoint launcher >>>` in the PowerShell profile.
 
 .EXAMPLE
     pwsh -File .\scripts\install-profile.ps1
@@ -64,12 +64,10 @@ function sharepoint {
     }
     & `$exe @args
 }
-function sp { sharepoint @args }
-function onedrive {
+function bitefoundry-onedrive {
     `$prev = `$env:SHAREPOINT_PERSONA
     try { `$env:SHAREPOINT_PERSONA = 'onedrive'; sharepoint @args } finally { `$env:SHAREPOINT_PERSONA = `$prev }
 }
-function od { onedrive @args }
 $endMarker
 "@.TrimEnd("`r", "`n")
 

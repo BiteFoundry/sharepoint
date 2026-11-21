@@ -1,4 +1,4 @@
-//! Unified `sharepoint` / `sp` / `onedrive` / `od` CLI parser, command dispatcher, and shared domain helpers.
+//! CLI parser, command dispatcher, and shared domain helpers for SharePoint and OneDrive.
 
 use std::{
     io::{self, Write},
@@ -36,8 +36,8 @@ const DELETE_JSON_REQUIRES_YES: &str = "Deleting with --json requires passing --
 
 const ENV_AFTER_HELP: &str = "\
 Dual-Persona Launchers:
-  sharepoint / sp                       Boot into SharePoint Sites & Document Libraries
-  onedrive / od                         Boot directly into Personal OneDrive (SHAREPOINT_PERSONA=onedrive)
+  sharepoint                            Open SharePoint sites and document libraries
+  bitefoundry-onedrive                   Open personal OneDrive
 
 JSON Output (--json):
   login, logout, whoami, doctor, sites, drives, ls, tree, info, cat, download,
@@ -45,7 +45,7 @@ JSON Output (--json):
   daemon start/status/stop/restart
 
 Environment Variables:
-  SHAREPOINT_PERSONA=<sharepoint|onedrive> Override default persona
+  SHAREPOINT_PERSONA=<sharepoint|onedrive> Override the sharepoint command's default persona
   SHAREPOINT_TOKEN_FILE=<PATH>          Load an external token file (JWT or JSON) directly
   SHAREPOINT_TOKEN_REFRESH_CMD=<CMD>    Command hook run when token nears expiry
   SHAREPOINT_ACCESS_TOKEN=<JWT>         Inject a Bearer access token directly

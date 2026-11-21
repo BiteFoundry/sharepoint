@@ -1,4 +1,4 @@
-//! Local HTTP JSON API (`sharepoint serve` / `onedrive serve`, default port `8790`) + OpenAPI 3.1 powered by `axum`.
+//! Local HTTP JSON API (`sharepoint serve` / `bitefoundry-onedrive serve`, default port `8790`) + OpenAPI 3.1 powered by `axum`.
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 

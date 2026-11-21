@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // Zero-Node-Process npm native binary linker.
 //
-// On Unix (linux/darwin): replaces installed `bin/{sharepoint,sp,onedrive,od}.js` with
+// On Unix (linux/darwin): replaces installed `bin/{sharepoint,bitefoundry-onedrive}.js` with
 // hardlinks/symlinks directly to `@bitefoundry/sharepoint-<platform>-<arch>/bin/sharepoint` so npm's
 // bin symlink execve's the native Rust binary directly (0ms Node startup, 0MB Node RSS),
-// with persona inferred cleanly from `argv[0]` (`onedrive`/`od` vs `sharepoint`/`sp`).
+// with the persona selected by `argv[0]`.
 //
-// On Windows (win32): creates NTFS hardlinks (fallback copy) `bin/{sharepoint,sp,onedrive,od}.exe`
+// On Windows (win32): creates NTFS hardlinks (fallback copy) `bin/{sharepoint,bitefoundry-onedrive}.exe`
 // and rewrites npm's `.bin/<name>[.cmd|.ps1]` shims when present to invoke `<name>.exe`
 // directly without spawning `node.exe`.
 
@@ -15,7 +15,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-const BIN_NAMES = ['sharepoint', 'sp', 'onedrive', 'od'];
+const BIN_NAMES = ['sharepoint', 'bitefoundry-onedrive'];
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function linkOrCopyFile(source, destination) {
@@ -94,10 +94,7 @@ function collectWindowsShimDirs(pkgRoot, env = process.env) {
 
 function shimReferencesLauncher(content, name) {
   const normalized = content.replace(/\\/g, '/').toLowerCase();
-  return (
-    normalized.includes('@bitefoundry/sharepoint') &&
-    normalized.includes(`bin/${name}.js`)
-  );
+  return normalized.includes(`/@bitefoundry/sharepoint/bin/${name}.js"`);
 }
 
 function rewriteWindowsShims(shimDir, pkgRoot) {
@@ -134,11 +131,10 @@ function rewriteWindowsShims(shimDir, pkgRoot) {
           const ps1Body = [
             '#!/usr/bin/env pwsh',
             '$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent',
-            `$exePath = Join-Path $basedir '${relWin.replace(/'/g, "''")}'`,
             'if ($MyInvocation.ExpectingInput) {',
-            '  $input | & $exePath @args',
+            `  $input | & "$basedir/${relPosix}" $args`,
             '} else {',
-            '  & $exePath @args',
+            `  & "$basedir/${relPosix}" $args`,
             '}',
             'exit $LASTEXITCODE',
             '',

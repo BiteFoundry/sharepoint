@@ -740,7 +740,7 @@ fn main() -> Result<()> {
         &mut ui,
         2200,
         "3-pane OneDrive & SharePoint TUI · Sites, Libraries, Files & live Inspector",
-        "onedrive",
+        "bitefoundry-onedrive",
     )?);
 
     // Frame 2: Navigate into a folder / preview a YAML/code file (Enter / j / k)
@@ -883,7 +883,7 @@ fn main() -> Result<()> {
     ui.overlays.clear();
 
     let spec = json!({
-        "title": "sharepoint / onedrive — Acme Engineering · Microsoft 365 Files TUI",
+        "title": "sharepoint / bitefoundry-onedrive — Acme Engineering · Microsoft 365 Files TUI",
         "badge": "@bitefoundry/sharepoint v0.1.0",
         "width": WIDTH,
         "height": HEIGHT,

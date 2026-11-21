@@ -11,3 +11,4 @@ npm/*/bin/sharepoint.exe
 
 # local release staging
 /dist-release/
+npm/*/LICENSE

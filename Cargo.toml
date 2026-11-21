@@ -1,7 +1,8 @@
 [package]
 name = "sharepoint-cli"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
+default-run = "sharepoint"
 description = "Unified Microsoft SharePoint & OneDrive terminal client & AI agent toolkit — Sites, Document Libraries & Personal Files (CLI, TUI, HTTP API, MCP)"
 license = "MIT"
 
@@ -12,6 +13,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "sharepoint"
 path = "src/main.rs"
+
+[[bin]]
+name = "bitefoundry-onedrive"
+path = "src/onedrive_main.rs"
+test = false
 
 [dependencies]
 anyhow = "1"
