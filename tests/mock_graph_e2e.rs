@@ -689,8 +689,19 @@ async fn e2e_http_api_and_mcp_tools_parity() {
     .unwrap();
     let compact = &compact_info["result"]["structuredContent"];
     assert_eq!(compact, &json!({ "item": {
-        "drive_id": "drv-me", "id": "item-readme", "name": "README.md", "is_folder": false,
-        "size": 25, "last_modified_at": null, "e_tag": "\"mock-etag\""
+        "drive_id": "drv-me",
+        "id": "item-readme",
+        "name": "README.md",
+        "parent_path": "",
+        "is_folder": false,
+        "size": 25,
+        "last_modified_at": null,
+        "e_tag": "\"mock-etag\"",
+        "omitted": {
+            "fields": ["mime_type", "parent_id", "web_url"],
+            "versions": null
+        },
+        "hint": "Call get_file_info with item_id \"item-readme\", drive \"drv-me\" and compact:false for every field."
     } }));
     let text = compact_info["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(&serde_json::from_str::<Value>(text).unwrap(), compact);

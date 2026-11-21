@@ -95,6 +95,13 @@ pub struct FolderChildrenPage {
 }
 
 #[derive(Debug, Clone)]
+pub struct VersionsPage {
+    pub versions: Vec<DriveItemVersion>,
+    /// None only when the caller asked for zero versions and nothing was requested.
+    pub has_more: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
 pub enum DriveDeltaChange {
     Root {
         id: String,
@@ -1128,6 +1135,24 @@ impl GraphClient {
         item_id: &str,
         limit: Option<usize>,
     ) -> Result<Vec<DriveItemVersion>> {
+        Ok(self
+            .list_item_versions_page(drive_id, item_id, limit)
+            .await?
+            .versions)
+    }
+
+    pub async fn list_item_versions_page(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        limit: Option<usize>,
+    ) -> Result<VersionsPage> {
+        if limit == Some(0) {
+            return Ok(VersionsPage {
+                versions: Vec::new(),
+                has_more: None,
+            });
+        }
         let enc_drive = urlencoding::encode(drive_id.trim());
         let enc_item = urlencoding::encode(item_id.trim());
         let limit = limit.unwrap_or(usize::MAX);
@@ -1135,20 +1160,28 @@ impl GraphClient {
         let mut next: Option<String> =
             Some(format!("/drives/{enc_drive}/items/{enc_item}/versions"));
         while let Some(url) = next {
-            let remaining = limit - out.len();
-            if remaining == 0 {
-                break;
-            }
             let page: GraphListPage<GraphVersion> = self.get_json(&url).await?;
+            let remaining = limit - out.len();
+            let page_len = page.value.len();
             out.extend(page.value.into_iter().take(remaining).map(|v| DriveItemVersion {
                 id: v.id,
                 last_modified_at: v.last_modified_date_time,
                 last_modified_by: v.last_modified_by.and_then(|u| u.display_label()),
                 size: v.size.unwrap_or(0),
             }));
+            if out.len() >= limit {
+                let has_more = page_len > remaining || page.next_link.is_some();
+                return Ok(VersionsPage {
+                    versions: out,
+                    has_more: Some(has_more),
+                });
+            }
             next = page.next_link;
         }
-        Ok(out)
+        Ok(VersionsPage {
+            versions: out,
+            has_more: Some(false),
+        })
     }
 
     pub async fn create_share_link(

@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use futures::StreamExt;
 use serde_json::{json, Value};
 
 use crate::{
@@ -184,9 +185,9 @@ pub enum Command {
         drive: Option<String>,
         #[arg(long)]
         site: Option<String>,
-        /// Maximum recursion depth
-        #[arg(long, default_value_t = 2)]
-        depth: usize,
+        /// Maximum recursion depth (1-5)
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=5))]
+        depth: u8,
         #[arg(long)]
         json: bool,
     },
@@ -198,8 +199,8 @@ pub enum Command {
         drive: Option<String>,
         #[arg(long)]
         site: Option<String>,
-        /// Also fetch and display version history
-        #[arg(long)]
+        /// Also fetch and display version history (online only)
+        #[arg(long, conflicts_with = "offline")]
         versions: bool,
         /// Fetch at most this many versions with --versions (default: all)
         #[arg(long, requires = "versions")]
@@ -208,9 +209,12 @@ pub enum Command {
         offline: bool,
         #[arg(long)]
         json: bool,
-        /// Return compact item fields, including its eTag, in JSON
+        /// Compatibility alias: compact JSON is already the default
         #[arg(long, requires = "json")]
         compact: bool,
+        /// Return every item field in JSON
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
     },
     /// Print UTF-8 or BOM-marked UTF-16 text up to a byte cap
     Cat {
@@ -443,13 +447,19 @@ pub struct ListTarget {
 
 #[derive(Subcommand, Debug)]
 pub enum ListAction {
-    /// List rows and their field values across all Graph pages
+    /// List one page of rows and their field values
     Items {
         #[command(flatten)]
         target: ListTarget,
         /// Internal column name to return. Repeat to select multiple fields
         #[arg(long = "field")]
         fields: Vec<String>,
+        /// Rows in the first page (1-200)
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=200), conflicts_with = "cursor")]
+        limit: u16,
+        /// next_cursor from the previous page; pass the same site, list and --field values
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Discover column names, display names, and read-only flags
     Columns {
@@ -821,13 +831,15 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             json: as_json,
         }) => {
             let (_, graph, storage) = init_runtime(&config, offline).await?;
-            let drives = fetch_drives(&graph, &storage, site.as_deref(), refresh, offline, cached).await?;
+            let found =
+                discover_drives(&graph, &storage, site.as_deref(), refresh, offline, cached)
+                    .await?;
             if as_json {
-                println!("{}", serde_json::to_string_pretty(&drives)?);
-            } else if drives.is_empty() {
+                println!("{}", serde_json::to_string_pretty(&found.drives)?);
+            } else if found.drives.is_empty() {
                 println!("No drives found.");
             } else {
-                for d in &drives {
+                for d in &found.drives {
                     let quota = match (d.quota_used, d.quota_total) {
                         (Some(u), Some(t)) => {
                             format!(" [{}/{}]", format_human_size(u), format_human_size(t))
@@ -842,6 +854,22 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                         d.id
                     );
                 }
+            }
+            if found.has_more == Some(true) {
+                eprintln!(
+                    "warning: scanned the first {DRIVE_DISCOVERY_SITE_CAP} SharePoint sites and more exist; pass --site <NAME_OR_ID> for a specific site."
+                );
+            }
+            if found.sites_failed > 0 {
+                eprintln!(
+                    "warning: could not list libraries for {} site(s).",
+                    found.sites_failed
+                );
+            }
+            if found.sites_scanned.is_some() && found.has_more.is_none() {
+                eprintln!(
+                    "warning: SharePoint site discovery failed; only drives that could be listed are shown."
+                );
             }
             Ok(())
         }
@@ -867,7 +895,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 offline,
             )
             .await?;
-            let items = fetch_folder_items(
+            let listing = fetch_folder_listing(
                 &graph,
                 &storage,
                 &target_drive.id,
@@ -879,7 +907,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             )
             .await?;
             if as_json {
-                let mut output = folder_listing_json(&target_drive, &items, compact);
+                let mut output = folder_listing_json(&target_drive, &listing, compact);
                 output["path"] = json!(path_or_id.as_deref().unwrap_or("/"));
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
@@ -888,10 +916,10 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     target_drive.display_label(),
                     path_or_id.as_deref().unwrap_or("/")
                 );
-                if items.is_empty() {
+                if listing.items.is_empty() {
                     println!("  (empty)");
                 } else {
-                    for item in &items {
+                    for item in &listing.items {
                         let size = if item.is_folder {
                             format!(
                                 "{} items",
@@ -914,6 +942,9 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                             item.id
                         );
                     }
+                }
+                if listing.has_more == Some(true) {
+                    eprintln!("More items exist; rerun with a larger --limit (now {limit}).");
                 }
             }
             Ok(())
@@ -939,18 +970,29 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 Some(p) => Some(resolver::resolve_item(&graph, &storage, &target_drive.id, p, false).await?.id),
                 None => None,
             };
-            let nodes = build_tree(&graph, &storage, &target_drive.id, parent_id.as_deref(), depth.clamp(1, 5)).await?;
+            let (nodes, root_cut) = build_tree(
+                &graph,
+                &storage,
+                &target_drive.id,
+                parent_id.as_deref(),
+                usize::from(depth),
+            )
+            .await?;
             if as_json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "drive": target_drive,
                         "tree": nodes,
+                        "has_more": root_cut,
                     }))?
                 );
             } else {
                 println!("{}", target_drive.display_label());
                 print_tree_nodes(&nodes, "");
+                if root_cut {
+                    println!("… more items not shown (200 per folder)");
+                }
             }
             Ok(())
         }
@@ -962,7 +1004,8 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             versions_limit,
             offline,
             json: as_json,
-            compact,
+            compact: _,
+            full,
         }) => {
             let (_, graph, storage) = init_runtime(&config, offline).await?;
             let target_drive = resolver::resolve_target_drive(
@@ -977,24 +1020,27 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             let item =
                 resolver::resolve_item(&graph, &storage, &target_drive.id, &item_or_path, offline)
                     .await?;
-            let vers = if versions && !offline {
+            let vers = if versions {
                 match graph
-                    .list_item_versions_with_limit(
+                    .list_item_versions_page(
                         item.effective_drive_id(),
                         item.effective_item_id(),
                         versions_limit,
                     )
                     .await
                 {
-                    Ok(versions) => versions,
+                    Ok(page) => Some(page),
                     Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
                 }
             } else {
-                Vec::new()
+                None
             };
             if as_json {
-                let mut output = file_info_json(&item, compact);
-                output["versions"] = json!(vers);
+                let mut output = file_info_json(&item, full, DetailHint::Cli, vers.is_some());
+                if let Some(page) = &vers {
+                    output["versions"] = json!(page.versions);
+                    output["versions_has_more"] = json!(page.has_more);
+                }
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
                 println!("Name:      {}", item.name);
@@ -1015,16 +1061,21 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 if let Some(u) = &item.web_url {
                     println!("Web URL:   {u}");
                 }
-                if !vers.is_empty() {
-                    println!("Versions ({}):", vers.len());
-                    for v in &vers {
-                        println!(
-                            "  v{}  {}  {}  {}",
-                            v.id,
-                            format_human_size(v.size),
-                            v.last_modified_at.as_deref().unwrap_or(""),
-                            v.last_modified_by.as_deref().unwrap_or("")
-                        );
+                if let Some(page) = &vers {
+                    if !page.versions.is_empty() {
+                        println!("Versions ({}):", page.versions.len());
+                        for v in &page.versions {
+                            println!(
+                                "  v{}  {}  {}  {}",
+                                v.id,
+                                format_human_size(v.size),
+                                v.last_modified_at.as_deref().unwrap_or(""),
+                                v.last_modified_by.as_deref().unwrap_or("")
+                            );
+                        }
+                    }
+                    if page.has_more == Some(true) {
+                        println!("  (more versions exist; raise --versions-limit)");
                     }
                 }
             }
@@ -1661,23 +1712,42 @@ async fn run_list_action(config: &AppConfig, action: ListAction, as_json: bool) 
     let (_, graph, _) = init_runtime(config, false).await?;
     let outcome: Result<()> = async {
         match action {
-            ListAction::Items { target, fields } => {
-                let items = graph
-                    .list_items(&target.site_id, &target.list_id, &fields)
+            ListAction::Items {
+                target,
+                fields,
+                limit,
+                cursor,
+            } => {
+                let page = graph
+                    .list_items_page(
+                        &target.site_id,
+                        &target.list_id,
+                        &fields,
+                        usize::from(limit),
+                        cursor.as_deref(),
+                    )
                     .await?;
                 if as_json {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&json!({ "items": items }))?
+                        serde_json::to_string_pretty(&json!({
+                            "items": page.items,
+                            "returned": page.items.len(),
+                            "has_more": page.next_cursor.is_some(),
+                            "next_cursor": page.next_cursor,
+                        }))?
                     );
                 } else {
-                    for item in items {
+                    for item in &page.items {
                         println!(
                             "{}  {}  {}",
                             item.id,
                             item.e_tag.as_deref().unwrap_or(""),
                             serde_json::to_string(&item.fields)?
                         );
+                    }
+                    if let Some(next) = &page.next_cursor {
+                        eprintln!("More rows: rerun with --cursor {next}");
                     }
                 }
             }
@@ -1914,6 +1984,15 @@ pub async fn fetch_sites(
     Ok(combined.into_iter().take(limit).collect())
 }
 
+const DRIVE_DISCOVERY_SITE_CAP: usize = 200;
+
+pub struct DriveDiscovery {
+    pub drives: Vec<DriveInfo>,
+    pub sites_scanned: Option<usize>,
+    pub sites_failed: usize,
+    pub has_more: Option<bool>,
+}
+
 pub async fn fetch_drives(
     graph: &GraphClient,
     storage: &Storage,
@@ -1922,6 +2001,19 @@ pub async fn fetch_drives(
     offline: bool,
     cached: bool,
 ) -> Result<Vec<DriveInfo>> {
+    Ok(discover_drives(graph, storage, site_query, refresh, offline, cached)
+        .await?
+        .drives)
+}
+
+pub async fn discover_drives(
+    graph: &GraphClient,
+    storage: &Storage,
+    site_query: Option<&str>,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+) -> Result<DriveDiscovery> {
     if let Some(sq) = site_query.map(str::trim).filter(|s| !s.is_empty()) {
         let site = if offline {
             let sites = storage.list_sites()?;
@@ -1932,20 +2024,35 @@ pub async fn fetch_drives(
         if !refresh && (offline || cached) {
             let local = storage.list_drives(Some(&site.id))?;
             if !local.is_empty() || offline {
-                return Ok(local);
+                return Ok(DriveDiscovery {
+                    drives: local,
+                    sites_scanned: None,
+                    sites_failed: 0,
+                    has_more: None,
+                });
             }
         }
         let drives = graph
             .list_site_drives(&site.id, Some(site.effective_name()))
             .await?;
         let _ = storage.upsert_drives(&drives);
-        return Ok(drives);
+        return Ok(DriveDiscovery {
+            drives,
+            sites_scanned: Some(1),
+            sites_failed: 0,
+            has_more: Some(false),
+        });
     }
 
     if !refresh && (offline || cached) {
         let local = storage.list_drives(None)?;
         if !local.is_empty() || offline {
-            return Ok(local);
+            return Ok(DriveDiscovery {
+                drives: local,
+                sites_scanned: None,
+                sites_failed: 0,
+                has_more: None,
+            });
         }
     }
 
@@ -1953,40 +2060,132 @@ pub async fn fetch_drives(
     if let Ok(me) = graph.get_my_drive().await {
         all.push(me);
     }
-    let sites = fetch_sites(graph, storage, None, 20, false, false, false)
-        .await
-        .unwrap_or_default();
-    for s in sites.iter().take(10) {
-        if let Ok(sd) = graph.list_site_drives(&s.id, Some(s.effective_name())).await {
-            for d in sd {
-                if !all.iter().any(|existing| existing.id == d.id) {
-                    all.push(d);
+    let listed = fetch_sites(
+        graph,
+        storage,
+        None,
+        DRIVE_DISCOVERY_SITE_CAP + 1,
+        false,
+        false,
+        false,
+    )
+    .await;
+    let (sites, has_more) = match listed {
+        Ok(mut sites) => {
+            let more = sites.len() > DRIVE_DISCOVERY_SITE_CAP;
+            sites.truncate(DRIVE_DISCOVERY_SITE_CAP);
+            (sites, Some(more))
+        }
+        Err(_) => (Vec::new(), None),
+    };
+    let site_targets: Vec<(String, String)> = sites
+        .iter()
+        .map(|s| (s.id.clone(), s.effective_name().to_string()))
+        .collect();
+    let results: Vec<_> = futures::stream::iter(site_targets)
+        .map(|(id, name)| async move { graph.list_site_drives(&id, Some(&name)).await })
+        .buffered(8)
+        .collect()
+        .await;
+    let mut sites_failed = 0;
+    for result in results {
+        match result {
+            Ok(site_drives) => {
+                for d in site_drives {
+                    if !all.iter().any(|existing| existing.id == d.id) {
+                        all.push(d);
+                    }
                 }
             }
+            Err(_) => sites_failed += 1,
         }
     }
     let _ = storage.upsert_drives(&all);
-    Ok(all)
+    Ok(DriveDiscovery {
+        drives: all,
+        sites_scanned: Some(sites.len()),
+        sites_failed,
+        has_more,
+    })
 }
 
-pub(crate) fn folder_listing_json(drive: &DriveInfo, items: &[DriveItem], compact: bool) -> Value {
+pub struct FolderListing {
+    pub items: Vec<DriveItem>,
+    pub has_more: Option<bool>,
+    pub source: &'static str,
+}
+
+pub(crate) fn folder_listing_json(
+    drive: &DriveInfo,
+    listing: &FolderListing,
+    compact: bool,
+) -> Value {
     if compact {
-        let items: Vec<_> = items.iter().map(compact_drive_item).collect();
-        json!({ "drive": { "id": drive.id }, "items": items })
+        let items: Vec<_> = listing.items.iter().map(compact_drive_item).collect();
+        json!({
+            "drive": { "id": drive.id },
+            "items": items,
+            "returned": listing.items.len(),
+            "has_more": listing.has_more,
+            "source": listing.source,
+        })
     } else {
-        json!({ "drive": drive, "items": items })
+        json!({
+            "drive": drive,
+            "items": listing.items,
+            "returned": listing.items.len(),
+            "has_more": listing.has_more,
+            "source": listing.source,
+        })
     }
 }
 
-pub(crate) fn file_info_json(item: &DriveItem, compact: bool) -> Value {
-    let item = if compact {
-        let mut summary = compact_drive_item(item);
-        summary["e_tag"] = json!(item.e_tag);
-        summary
-    } else {
-        json!(item)
-    };
-    json!({ "item": item })
+pub(crate) enum DetailHint {
+    Cli,
+    Mcp,
+}
+
+pub(crate) fn file_info_json(
+    item: &DriveItem,
+    full: bool,
+    hint: DetailHint,
+    versions_included: bool,
+) -> Value {
+    if full {
+        return json!({ "item": item });
+    }
+    let all = json!(item);
+    let mut summary = compact_drive_item(item);
+    summary["e_tag"] = json!(item.e_tag);
+    summary["parent_path"] = json!(item.parent_path);
+    let omitted_fields: Vec<&str> = all
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, value)| summary.get(key.as_str()).is_none() && !value.is_null())
+        .map(|(key, _)| key.as_str())
+        .collect();
+    let mut omitted = json!({ "fields": omitted_fields });
+    if !versions_included {
+        omitted["versions"] = Value::Null;
+    }
+    summary["omitted"] = omitted;
+    summary["hint"] = json!(match hint {
+        DetailHint::Cli => format!(
+            "sharepoint info {} --drive {} --json --full",
+            shell_quote(&item.id),
+            shell_quote(&item.drive_id)
+        ),
+        DetailHint::Mcp => format!(
+            "Call get_file_info with item_id {:?}, drive {:?} and compact:false for every field.",
+            item.id, item.drive_id
+        ),
+    });
+    json!({ "item": summary })
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn compact_drive_item(item: &DriveItem) -> Value {
@@ -2000,6 +2199,7 @@ fn compact_drive_item(item: &DriveItem) -> Value {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_folder_items(
     graph: &GraphClient,
     storage: &Storage,
@@ -2010,39 +2210,72 @@ pub async fn fetch_folder_items(
     offline: bool,
     cached: bool,
 ) -> Result<Vec<DriveItem>> {
+    Ok(
+        fetch_folder_listing(graph, storage, drive_id, path_or_id, limit, refresh, offline, cached)
+            .await?
+            .items,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_folder_listing(
+    graph: &GraphClient,
+    storage: &Storage,
+    drive_id: &str,
+    path_or_id: Option<&str>,
+    limit: usize,
+    refresh: bool,
+    offline: bool,
+    cached: bool,
+) -> Result<FolderListing> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(FolderListing {
+            items: Vec::new(),
+            has_more: None,
+            source: if !refresh && (offline || cached) {
+                "cache"
+            } else {
+                "remote"
+            },
+        });
     }
     let target = path_or_id
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "/" && *s != "root");
 
     if !refresh && (offline || cached) {
-        let local = match target {
-            None => storage.list_folder_children(drive_id, None, Some(""), limit)?,
+        let probe_limit = limit.saturating_add(1);
+        let mut local = match target {
+            None => storage.list_folder_children(drive_id, None, Some(""), probe_limit)?,
             Some(p) if p.starts_with('/') || p.contains('/') => {
                 let norm = format!("/{}", p.trim_matches('/'));
-                let by_path = storage.list_folder_children(drive_id, None, Some(&norm), limit)?;
+                let by_path =
+                    storage.list_folder_children(drive_id, None, Some(&norm), probe_limit)?;
                 if !by_path.is_empty() {
                     by_path
                 } else if let Some(folder) = storage.get_drive_item_by_path(drive_id, &norm)? {
-                    storage.list_folder_children(drive_id, Some(&folder.id), None, limit)?
+                    storage.list_folder_children(drive_id, Some(&folder.id), None, probe_limit)?
                 } else {
                     Vec::new()
                 }
             }
             Some(id) => {
-                let by_id = storage.list_folder_children(drive_id, Some(id), None, limit)?;
+                let by_id = storage.list_folder_children(drive_id, Some(id), None, probe_limit)?;
                 if !by_id.is_empty() {
                     by_id
                 } else {
                     let norm = format!("/{id}");
                     let by_path =
-                        storage.list_folder_children(drive_id, None, Some(&norm), limit)?;
+                        storage.list_folder_children(drive_id, None, Some(&norm), probe_limit)?;
                     if !by_path.is_empty() {
                         by_path
                     } else if let Some(folder) = storage.get_drive_item_by_path(drive_id, &norm)? {
-                        storage.list_folder_children(drive_id, Some(&folder.id), None, limit)?
+                        storage.list_folder_children(
+                            drive_id,
+                            Some(&folder.id),
+                            None,
+                            probe_limit,
+                        )?
                     } else {
                         Vec::new()
                     }
@@ -2050,11 +2283,17 @@ pub async fn fetch_folder_items(
             }
         };
         if !local.is_empty() || offline {
-            return Ok(local);
+            let has_more = local.len() > limit;
+            local.truncate(limit);
+            return Ok(FolderListing {
+                items: local,
+                has_more: Some(has_more),
+                source: "cache",
+            });
         }
     }
 
-    let items = match target {
+    let (items, complete) = match target {
         None => {
             let page = graph
                 .list_children_detailed(drive_id, None, Some(limit))
@@ -2064,7 +2303,7 @@ pub async fn fetch_folder_items(
             } else {
                 let _ = storage.upsert_drive_items(&page.items);
             }
-            page.items
+            (page.items, page.complete)
         }
         Some(p) if p.starts_with('/') || p.contains('/') => {
             let page = graph
@@ -2075,7 +2314,7 @@ pub async fn fetch_folder_items(
             } else {
                 let _ = storage.upsert_drive_items(&page.items);
             }
-            page.items
+            (page.items, page.complete)
         }
         Some(id_or_name) => {
             // Try direct item ID children first, fall back to path-based children
@@ -2093,7 +2332,7 @@ pub async fn fetch_folder_items(
                     } else {
                         let _ = storage.upsert_drive_items(&page.items);
                     }
-                    page.items
+                    (page.items, page.complete)
                 }
                 Err(err) if crate::graph::is_graph_not_found_error(&err) => {
                     let page = graph
@@ -2108,13 +2347,17 @@ pub async fn fetch_folder_items(
                     } else {
                         let _ = storage.upsert_drive_items(&page.items);
                     }
-                    page.items
+                    (page.items, page.complete)
                 }
                 Err(err) => return Err(err),
             }
         }
     };
-    Ok(items)
+    Ok(FolderListing {
+        items,
+        has_more: Some(!complete),
+        source: "remote",
+    })
 }
 
 pub fn record_download_baseline(
@@ -2353,7 +2596,8 @@ fn build_tree<'a>(
     drive_id: &'a str,
     parent_id: Option<&'a str>,
     depth: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<TreeNode>>> + Send + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<TreeNode>, bool)>> + Send + 'a>>
+{
     Box::pin(async move {
         let page = graph
             .list_children_detailed(drive_id, parent_id, Some(200))
@@ -2363,25 +2607,34 @@ fn build_tree<'a>(
         } else {
             let _ = storage.upsert_drive_items(&page.items);
         }
+        let cut = !page.complete;
         let items = page.items;
         let mut nodes = Vec::with_capacity(items.len());
         for item in items {
-            let children = if item.is_folder && depth > 1 {
-                build_tree(graph, storage, drive_id, Some(&item.id), depth - 1)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to list folder '{}' (id: {})",
-                            item.display_path(),
-                            item.id
-                        )
-                    })?
+            let (children, has_more) = if item.is_folder && depth > 1 {
+                let (children, child_cut) =
+                    build_tree(graph, storage, drive_id, Some(&item.id), depth - 1)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Failed to list folder '{}' (id: {})",
+                                item.display_path(),
+                                item.id
+                            )
+                        })?;
+                (children, Some(child_cut))
+            } else if item.is_folder {
+                (Vec::new(), item.child_count.map(|count| count > 0))
             } else {
-                Vec::new()
+                (Vec::new(), Some(false))
             };
-            nodes.push(TreeNode { item, children });
+            nodes.push(TreeNode {
+                item,
+                children,
+                has_more,
+            });
         }
-        Ok(nodes)
+        Ok((nodes, cut))
     })
 }
 
@@ -2394,6 +2647,9 @@ fn print_tree_nodes(nodes: &[TreeNode], prefix: &str) {
         if !node.children.is_empty() {
             let next_prefix = format!("{prefix}{}", if is_last { "    " } else { "│   " });
             print_tree_nodes(&node.children, &next_prefix);
+            if node.has_more == Some(true) {
+                println!("{next_prefix}… more items not shown (200 per folder)");
+            }
         }
     }
 }

@@ -218,7 +218,7 @@ async fn call_tool(
             let tokens = graph.auth().current_tokens().await;
             let source = cli::auth_source_label(tokens.as_ref(), config);
             let Some(tok) = tokens else {
-                return Ok(json!({ "authenticated": false, "auth_source": source }));
+                return Ok(json!({ "authenticated": false, "persona": persona.as_str(), "auth_source": source }));
             };
             let diag = diagnose_access_token_scopes(&tok.access_token);
             Ok(json!({
@@ -246,12 +246,18 @@ async fn call_tool(
         "list_drives" => {
             let site = str_arg("site");
             let offline = bool_arg("offline");
-            let drives = map_graph_err(
+            let found = map_graph_err(
                 graph,
-                cli::fetch_drives(graph, storage, site.as_deref(), false, offline, false).await,
+                cli::discover_drives(graph, storage, site.as_deref(), false, offline, false).await,
             )
             .await?;
-            Ok(json!({ "drives": drives }))
+            Ok(json!({
+                "drives": found.drives,
+                "returned": found.drives.len(),
+                "sites_scanned": found.sites_scanned,
+                "sites_failed": found.sites_failed,
+                "has_more": found.has_more,
+            }))
         }
         "list_items" | "list_columns" | "update_list_item_field" => {
             let site_id = str_arg("site_id").ok_or_else(|| "site_id is required".to_string())?;
@@ -265,10 +271,37 @@ async fn call_tool(
                             })?,
                         None => Vec::new(),
                     };
-                    let items =
-                        map_graph_err(graph, graph.list_items(&site_id, &list_id, &fields).await)
-                            .await?;
-                    Ok(json!({ "items": items }))
+                    let cursor = match args.get("cursor") {
+                        None => None,
+                        Some(Value::String(cursor)) => Some(cursor.as_str()),
+                        Some(_) => return Err("cursor must be a string".to_string()),
+                    };
+                    let limit = match args.get("limit") {
+                        None => 50,
+                        Some(_) if cursor.is_some() => {
+                            return Err(
+                                "cursor and limit cannot be combined; a cursor keeps the first page's size"
+                                    .to_string(),
+                            )
+                        }
+                        Some(value) => match value.as_u64() {
+                            Some(limit @ 1..=200) => limit as usize,
+                            _ => return Err("limit must be an integer from 1 to 200".to_string()),
+                        },
+                    };
+                    let page = map_graph_err(
+                        graph,
+                        graph
+                            .list_items_page(&site_id, &list_id, &fields, limit, cursor)
+                            .await,
+                    )
+                    .await?;
+                    Ok(json!({
+                        "items": page.items,
+                        "returned": page.items.len(),
+                        "has_more": page.next_cursor.is_some(),
+                        "next_cursor": page.next_cursor,
+                    }))
                 }
                 "list_columns" => {
                     let columns =
@@ -322,9 +355,9 @@ async fn call_tool(
                 .await,
             )
             .await?;
-            let items = map_graph_err(
+            let listing = map_graph_err(
                 graph,
-                cli::fetch_folder_items(
+                cli::fetch_folder_listing(
                     graph,
                     storage,
                     &drive.id,
@@ -337,7 +370,7 @@ async fn call_tool(
                 .await,
             )
             .await?;
-            Ok(cli::folder_listing_json(&drive, &items, bool_arg("compact")))
+            Ok(cli::folder_listing_json(&drive, &listing, bool_arg("compact")))
         }
         "get_file_info" => {
             let item_q = str_arg("item_id")
@@ -364,7 +397,12 @@ async fn call_tool(
                 resolver::resolve_item(graph, storage, &drive.id, &item_q, offline).await,
             )
             .await?;
-            Ok(cli::file_info_json(&item, bool_arg("compact")))
+            let compact = match args.get("compact") {
+                None => true,
+                Some(Value::Bool(flag)) => *flag,
+                Some(_) => return Err("compact must be a boolean".to_string()),
+            };
+            Ok(cli::file_info_json(&item, !compact, cli::DetailHint::Mcp, false))
         }
         "read_text_file" => {
             let item_q = str_arg("item_id")
@@ -855,10 +893,10 @@ async fn call_tool(
                 resolver::resolve_item(graph, storage, &drive.id, &item_q, false).await,
             )
             .await?;
-            let versions = map_graph_err(
+            let page = map_graph_err(
                 graph,
                 graph
-                    .list_item_versions_with_limit(
+                    .list_item_versions_page(
                         item.effective_drive_id(),
                         item.effective_item_id(),
                         limit,
@@ -866,7 +904,13 @@ async fn call_tool(
                     .await,
             )
             .await?;
-            Ok(json!({ "item_id": item.id, "drive_id": item.drive_id, "versions": versions }))
+            Ok(json!({
+                "item_id": item.id,
+                "drive_id": item.drive_id,
+                "versions": page.versions,
+                "returned": page.versions.len(),
+                "has_more": page.has_more,
+            }))
         }
         other => Err(format!("unknown tool: {other}")),
     }
@@ -876,24 +920,26 @@ pub fn tool_catalog() -> Vec<Value> {
     vec![
         tool_def("whoami", "Show current Microsoft 365 user identity, persona, and OAuth scope diagnostics", json!({ "type": "object", "properties": {} })),
         tool_def("list_sites", "List followed and discovered SharePoint sites", json!({ "type": "object", "properties": { "search": { "type": "string" }, "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
-        tool_def("list_drives", "List Personal OneDrive and SharePoint document libraries", json!({ "type": "object", "properties": { "site": { "type": "string" }, "offline": { "type": "boolean" } } })),
-        tool_def("list_files", "List files and folders inside a OneDrive or SharePoint drive", json!({ "type": "object", "properties": { "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" }, "path": { "type": "string" }, "limit": { "type": "integer" }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Return the drive ID and core item fields" } } })),
-        tool_def("get_file_info", "Get detailed metadata for a file or folder by item_id or path", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Return core item fields and eTag" } } })),
+        tool_def("list_drives", "List Personal OneDrive and SharePoint document libraries. Without site, scans up to 200 followed and discovered sites.", json!({ "type": "object", "properties": { "site": { "type": "string" }, "offline": { "type": "boolean" } } })),
+        tool_def("list_files", "List files and folders inside a OneDrive or SharePoint drive", json!({ "type": "object", "properties": { "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" }, "path": { "type": "string" }, "limit": { "type": "integer", "description": "Maximum items (default 100). has_more reports whether the folder holds more." }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Return the drive ID and core item fields" } } })),
+        tool_def("get_file_info", "Get detailed metadata for a file or folder by item_id or path", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Default true: core item fields, eTag, omitted field names and a hint. Pass false for every field." } } })),
         tool_def("read_text_file", "Read UTF-8 or BOM-marked UTF-16 text up to the original byte cap. Use download_file for binary files.", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "max_bytes": { "type": "integer" } } })),
-        tool_def("download_file", "Download a OneDrive or SharePoint file to local disk, returning { ok, path, file_name, mime_type, size_bytes, is_image }", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "dir": { "type": "string" } } })),
+        tool_def("download_file", "Download a OneDrive or SharePoint file to local disk, returning { ok, path, file_name, mime_type, size_bytes, is_image, drive_id, item_id, e_tag, c_tag }", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "dir": { "type": "string" } } })),
         tool_def("upload_file", "Upload a local file, base64 bytes, or text content. Files at least 4 MiB and conditional replacements use an upload session.", json!({ "type": "object", "properties": { "local_path": { "type": "string" }, "file_name": { "type": "string" }, "content_base64": { "type": "string" }, "content_text": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" }, "item_id": { "type": "string" }, "if_match": { "type": "string", "description": "eTag precondition for replacement via an upload session at any size" }, "conflict_behavior": { "type": "string", "enum": ["replace", "fail", "rename"] } } })),
         tool_def("create_folder", "Create a new folder inside OneDrive or a SharePoint document library", json!({ "type": "object", "required": ["name"], "properties": { "name": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" } } })),
         tool_def("move_or_rename_item", "Rename and/or move a OneDrive or SharePoint item to another folder", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "new_name": { "type": "string" }, "new_parent_id": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" } } })),
         tool_def("delete_item", "Delete a OneDrive or SharePoint file or folder (requires confirm: true)", json!({ "type": "object", "required": ["confirm"], "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "confirm": { "type": "boolean" } } })),
-        tool_def("search_files", "Search files in local SQLite FTS5 cache and/or Microsoft Graph", json!({ "type": "object", "required": ["query"], "properties": { "query": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "remote": { "type": "boolean" }, "limit": { "type": "integer" } } })),
+        tool_def("search_files", "Search files in local SQLite FTS5 cache and/or Microsoft Graph", json!({ "type": "object", "required": ["query"], "properties": { "query": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "remote": { "type": "boolean", "description": "Default true: query Microsoft Graph and fill remaining slots from the local cache. false searches the local cache only." }, "limit": { "type": "integer" } } })),
         tool_def("create_share_link", "Create a SharePoint/OneDrive sharing link (view, edit, or embed)", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "type": { "type": "string" }, "scope": { "type": "string" }, "expires": { "type": "string" } } })),
         tool_def("list_recent", "List recently accessed OneDrive files", json!({ "type": "object", "properties": { "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
         tool_def("list_shared_with_me", "List files shared with the signed-in user", json!({ "type": "object", "properties": { "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
-        tool_def("list_versions", "List version history for a OneDrive or SharePoint file", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "limit": { "type": "integer", "minimum": 0, "description": "Maximum versions to fetch. Omit to read the full history." } } })),
-        tool_def("list_items", "Read rows and field values from a SharePoint List across all pages", json!({
+        tool_def("list_versions", "List version history for a OneDrive or SharePoint file", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "limit": { "type": "integer", "minimum": 0, "description": "Maximum versions to fetch. Omit to read the full history. has_more reports whether older versions remain." } } })),
+        tool_def("list_items", "Read one page of rows and field values from a SharePoint List", json!({
             "type": "object", "required": ["site_id", "list_id"], "properties": {
                 "site_id": { "type": "string" }, "list_id": { "type": "string" },
-                "fields": { "type": "array", "items": { "type": "string" }, "description": "Internal column names to select" }
+                "fields": { "type": "array", "items": { "type": "string" }, "description": "Internal column names to select" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Rows in the first page (default 50)" },
+                "cursor": { "type": "string", "description": "Opaque next_cursor from the previous page. Pass the same site_id, list_id and fields; do not pass limit." }
             }
         })),
         tool_def("list_columns", "Discover the internal column names for a SharePoint List", json!({
@@ -979,7 +1025,7 @@ fn tool_result(outcome: Result<Value, String>) -> Value {
         Ok(val) => json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string()),
+                "text": serde_json::to_string(&val).unwrap_or_else(|_| val.to_string()),
             }],
             "structuredContent": val,
             "isError": false,
@@ -1034,5 +1080,26 @@ mod tests {
         ] {
             assert!(names.contains(&required), "missing MCP tool: {required}");
         }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_whoami_includes_persona() {
+        let cfg = AppConfig::default();
+        let auth = crate::auth::AuthManager::empty_for_test(cfg.clone());
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let reply = handle_rpc_line(
+            &cfg,
+            &graph,
+            &storage,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}"#,
+        )
+        .await
+        .unwrap();
+        let sc = &reply["result"]["structuredContent"];
+        assert_eq!(reply["result"]["isError"], false);
+        assert_eq!(sc["authenticated"], false);
+        assert!(sc["persona"].is_string());
+        assert!(sc["auth_source"].is_string());
     }
 }

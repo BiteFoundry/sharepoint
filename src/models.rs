@@ -420,6 +420,7 @@ pub struct PinnedTarget {
 pub struct TreeNode {
     pub item: DriveItem,
     pub children: Vec<TreeNode>,
+    pub has_more: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------

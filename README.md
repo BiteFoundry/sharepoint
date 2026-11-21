@@ -96,7 +96,7 @@ For persistent environment configuration, set `SHAREPOINT_CLIENT_ID` and `SHAREP
 sharepoint sites --json
 sharepoint drives --site "Acme Engineering" --json
 bitefoundry-onedrive ls /Projects/Platform-v4 --json --compact
-bitefoundry-onedrive info /Projects/Platform-v4/deploy-pipeline.yaml --versions --versions-limit 5 --json --compact
+bitefoundry-onedrive info /Projects/Platform-v4/deploy-pipeline.yaml --versions --versions-limit 5 --json
 bitefoundry-onedrive cat /Projects/Platform-v4/deploy-pipeline.yaml
 sharepoint upload ./q4-architecture-deck.pdf /RFCs --site "Acme Engineering" --json
 sharepoint share /api-gateway-rfc.md --site "Acme Engineering" --type view --scope organization --json
@@ -104,11 +104,15 @@ sharepoint search "gateway" --remote --json
 ```
 
 `sharepoint --help` and `bitefoundry-onedrive --help` list the commands that support `--json`.
-For `ls` and `info`, `--json --compact` returns the drive and item IDs, name,
-file or folder flag, byte size, and modification time. Compact `info` also includes the eTag.
-`info --versions` reads all available history by default. `--versions-limit` caps
-history and stops fetching pages once the cap is reached. An online history lookup
-reports Graph errors, including permission denials.
+`info --json` defaults to compact output with `drive_id`, `id`, `name`, `parent_path`,
+`is_folder`, `size`, `last_modified_at`, `e_tag`, `omitted`, and `hint`. Pass `--json --full`
+for every item field; `--compact` remains a compatibility alias. For `ls`, `--json --compact`
+returns `{ "id": "…" }` for `drive` and core item fields as before, and `ls --json` includes
+`returned`, `has_more`, and `source` (`"remote"` or `"cache"`). `info --versions` is online-only
+(cannot be combined with `--offline`), reads all available history by default, and adds
+`versions` and `versions_has_more`. `--versions-limit` caps history and stops fetching pages
+once the cap is reached. An online history lookup reports Graph errors, including permission
+denials.
 
 `cat` reads UTF-8 with an optional BOM and UTF-16LE or UTF-16BE with a BOM. Its
 byte limit applies to the original file, and plain output preserves line endings.
@@ -129,10 +133,29 @@ sharepoint lists set-field --site-id "$SITE_ID" --list-id "$LIST_ID" \
   --item-id 17 --field ReviewStatus --value-json '"Ready"' --if-match '"row-etag"' --json
 ```
 
-`items` follows Graph pagination and returns each row's `id`, `e_tag` when
-available, and `fields`. `set-field` accepts a typed JSON value such as
-`"Ready"`, `false`, or `0`. Pass the row's current `e_tag` as `--if-match` to
-apply the update conditionally. Graph returns `412` for stale ETags. [List rows](https://learn.microsoft.com/en-us/graph/api/listitem-list?view=graph-rest-1.0) · [Update list fields](https://learn.microsoft.com/en-us/graph/api/listitem-update?view=graph-rest-1.0)
+`items` reads one page (default 50 rows; `--limit` accepts `1`–`200`) and returns `items`
+(each row's `id`, `e_tag` when available, and `fields` without duplicate `@odata.etag`),
+`returned`, `has_more`, and `next_cursor`. Pass `next_cursor` to `--cursor` to read the next
+page; the cursor is bound to the same `--site-id`, `--list-id`, and `--field` set (order
+independent) and cannot be combined with `--limit`. To read all pages:
+
+```sh
+cursor=""
+while :; do
+  if [ -z "$cursor" ]; then
+    page=$(sharepoint lists items --site-id "$SITE_ID" --list-id "$LIST_ID" --field Title --limit 200 --json)
+  else
+    page=$(sharepoint lists items --site-id "$SITE_ID" --list-id "$LIST_ID" --field Title --json --cursor "$cursor")
+  fi
+  printf '%s\n' "$page" | jq -c '.items[]'
+  cursor=$(printf '%s\n' "$page" | jq -r '.next_cursor // empty')
+  [ -n "$cursor" ] || break
+done
+```
+
+`set-field` accepts a typed JSON value such as `"Ready"`, `false`, or `0`. Pass the row's
+current `e_tag` as `--if-match` to apply the update conditionally. Graph returns `412` for
+stale ETags. [List rows](https://learn.microsoft.com/en-us/graph/api/listitem-list?view=graph-rest-1.0) · [Update list fields](https://learn.microsoft.com/en-us/graph/api/listitem-update?view=graph-rest-1.0)
 
 ### Local HTTP API (`sharepoint serve`)
 
