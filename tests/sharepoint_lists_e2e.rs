@@ -34,6 +34,41 @@ struct ListState {
 }
 
 impl Fixture {
+    async fn lists(
+        State(fixture): State<Self>,
+        RoutePath(site): RoutePath<String>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        assert_eq!(site.as_str(), SITE);
+        let selection = query.get("$select");
+        assert_eq!(
+            selection.map(String::as_str),
+            Some("id,name,displayName,webUrl,list")
+        );
+        fixture.state.lock().await.reads.push((
+            "lists".into(),
+            selection.cloned(),
+            None,
+            None,
+        ));
+        Json(json!({ "value": [
+            {
+                "id": LIST,
+                "name": "ReviewTracker",
+                "displayName": "Review Tracker",
+                "webUrl": "https://contoso.sharepoint.com/sites/eng/Lists/ReviewTracker",
+                "list": { "template": "genericList" }
+            },
+            {
+                "id": "list-docs-0002",
+                "name": "Shared Documents",
+                "displayName": "Documents",
+                "webUrl": "https://contoso.sharepoint.com/sites/eng/Shared%20Documents",
+                "list": { "template": "documentLibrary" }
+            }
+        ] }))
+    }
+
     async fn items(
         State(fixture): State<Self>,
         RoutePath((site, list)): RoutePath<(String, String)>,
@@ -286,6 +321,7 @@ async fn cli_and_stdio_mcp_read_two_pages_and_update_one_typed_field() {
         writes: vec![],
     }));
     let app = Router::new()
+        .route("/v1.0/sites/{site}/lists", get(Fixture::lists))
         .route("/v1.0/sites/{site}/lists/{list}/items", get(Fixture::items))
         .route(
             "/v1.0/sites/{site}/lists/{list}/columns",
@@ -309,7 +345,25 @@ async fn cli_and_stdio_mcp_read_two_pages_and_update_one_typed_field() {
         base: &base,
     };
 
-    let columns = cli_json(client.cli("columns", &[]).await);
+    let cli_lists = cli_json(
+        client
+            .command()
+            .args(["lists", "ls", "--site-id", SITE, "--json"])
+            .output()
+            .await
+            .unwrap(),
+    );
+    let mcp_lists = client.mcp_raw("list_lists", json!({ "site_id": SITE })).await;
+    assert_eq!(mcp_lists["isError"], false);
+    assert_eq!(mcp_lists["structuredContent"], cli_lists);
+    assert_eq!(cli_lists["returned"], 2);
+    assert_eq!(cli_lists["lists"][0]["id"], LIST);
+    assert_eq!(cli_lists["lists"][0]["display_name"], "Review Tracker");
+    assert_eq!(cli_lists["lists"][0]["template"], "genericList");
+    assert_eq!(cli_lists["lists"][1]["template"], "documentLibrary");
+    let discovered_list_id = cli_lists["lists"][0]["id"].as_str().unwrap();
+
+    let columns = cli_json(client.cli_for(SITE, discovered_list_id, "columns", &[]).await);
     assert_eq!(
         client.mcp("list_columns", json!({})).await["structuredContent"],
         columns
@@ -894,11 +948,20 @@ async fn list_items_rejects_bad_limit_and_malformed_cursor() {
     assert!(String::from_utf8_lossy(&combo.stderr)
         .contains("the argument '--limit <LIMIT>' cannot be used with '--cursor <CURSOR>'"));
 
-    // CLI malformed cursors (exit 1, 0 requests)
+    // CLI malformed cursors (exit 1, 0 requests, single-line JSON error on stdout)
     for bad in ["not-a-token", raw_next_link.as_str(), v2_cursor.as_str()] {
         let out = client.cli("items", &["--cursor", bad]).await;
         assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 1, "expected single-line JSON error on stdout, got: {stdout}");
+        let err_json: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(err_json["ok"], false);
+        assert_eq!(err_json["error"]["code"], "error");
+        assert!(err_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid cursor: pass the next_cursor value from the previous page"));
         assert!(String::from_utf8_lossy(&out.stderr)
             .contains("Invalid cursor: pass the next_cursor value from the previous page"));
 
@@ -1010,7 +1073,15 @@ async fn list_items_cursor_is_bound_to_site_list_and_fields() {
     for (site, list, cli_args, mcp_fields, cursor, expected_err) in cases {
         let out = client.cli_for(site, list, "items", &cli_args).await;
         assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 1, "expected single-line JSON error on stdout, got: {stdout}");
+        let err_json: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(err_json["ok"], false);
+        assert!(err_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(expected_err));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains(expected_err),
@@ -1074,7 +1145,15 @@ async fn list_items_cursor_rejects_foreign_host_and_shape() {
     ] {
         let out = client.cli("items", &["--cursor", token]).await;
         assert_eq!(out.status.code(), Some(1));
-        assert!(out.stdout.is_empty());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 1, "expected single-line JSON error on stdout, got: {stdout}");
+        let err_json: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(err_json["ok"], false);
+        assert!(err_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(expected));
         assert!(String::from_utf8_lossy(&out.stderr).contains(expected));
 
         let mcp = client.mcp("list_items", json!({"cursor": token})).await;

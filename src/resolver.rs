@@ -12,6 +12,43 @@ use crate::{
     storage::Storage,
 };
 
+#[derive(Debug, Clone)]
+pub struct AmbiguousMatch {
+    pub query: String,
+    pub candidates: Vec<(String, String)>,
+    message: String,
+}
+
+impl std::fmt::Display for AmbiguousMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AmbiguousMatch {}
+
+fn ambiguous_site_error(query: &str, message: String, candidates: &[&SharePointSite]) -> anyhow::Error {
+    anyhow::Error::new(AmbiguousMatch {
+        query: query.to_string(),
+        candidates: candidates
+            .iter()
+            .map(|s| (s.effective_name().to_string(), s.id.clone()))
+            .collect(),
+        message,
+    })
+}
+
+fn ambiguous_drive_error(query: &str, message: String, candidates: &[&DriveInfo]) -> anyhow::Error {
+    anyhow::Error::new(AmbiguousMatch {
+        query: query.to_string(),
+        candidates: candidates
+            .iter()
+            .map(|d| (d.display_label(), d.id.clone()))
+            .collect(),
+        message,
+    })
+}
+
 pub fn is_personal_drive_alias(q: &str) -> bool {
     matches!(
         q.trim().to_ascii_lowercase().as_str(),
@@ -38,10 +75,14 @@ pub fn resolve_site_from_slice(sites: &[SharePointSite], query: &str) -> Result<
     if exact_name.len() == 1 {
         return Ok(exact_name[0].clone());
     } else if exact_name.len() > 1 {
-        bail!(
-            "Ambiguous SharePoint site '{q}' matches multiple sites:\n{}",
-            format_site_candidates(&exact_name)
-        );
+        return Err(ambiguous_site_error(
+            q,
+            format!(
+                "Ambiguous SharePoint site '{q}' matches multiple sites:\n{}",
+                format_site_candidates(&exact_name)
+            ),
+            &exact_name,
+        ));
     }
 
     let prefix: Vec<&SharePointSite> = sites
@@ -54,10 +95,14 @@ pub fn resolve_site_from_slice(sites: &[SharePointSite], query: &str) -> Result<
     if prefix.len() == 1 {
         return Ok(prefix[0].clone());
     } else if prefix.len() > 1 {
-        bail!(
-            "Ambiguous SharePoint site prefix '{q}' matches multiple sites:\n{}",
-            format_site_candidates(&prefix)
-        );
+        return Err(ambiguous_site_error(
+            q,
+            format!(
+                "Ambiguous SharePoint site prefix '{q}' matches multiple sites:\n{}",
+                format_site_candidates(&prefix)
+            ),
+            &prefix,
+        ));
     }
 
     let sub: Vec<&SharePointSite> = sites
@@ -72,10 +117,14 @@ pub fn resolve_site_from_slice(sites: &[SharePointSite], query: &str) -> Result<
         .collect();
     match sub.len() {
         1 => Ok(sub[0].clone()),
-        n if n > 1 => bail!(
-            "Ambiguous SharePoint site '{q}' matches {n} sites:\n{}",
-            format_site_candidates(&sub)
-        ),
+        n if n > 1 => Err(ambiguous_site_error(
+            q,
+            format!(
+                "Ambiguous SharePoint site '{q}' matches {n} sites:\n{}",
+                format_site_candidates(&sub)
+            ),
+            &sub,
+        )),
         _ => bail!("SharePoint site not found: {q}"),
     }
 }
@@ -109,8 +158,10 @@ pub async fn resolve_site(
     }
     if !combined.is_empty() {
         let _ = storage.upsert_sites(&combined);
-        if let Ok(found) = resolve_site_from_slice(&combined, q) {
-            return Ok(found);
+        match resolve_site_from_slice(&combined, q) {
+            Ok(found) => return Ok(found),
+            Err(err) if err.downcast_ref::<AmbiguousMatch>().is_some() => return Err(err),
+            Err(_) => {}
         }
     }
     // Direct lookup fallback when user passes an exact site ID
@@ -150,6 +201,16 @@ fn resolve_drive_from_slice_inner(
         .collect();
     if exact_name.len() == 1 {
         return Ok(exact_name[0].clone());
+    } else if exact_name.len() > 1 {
+        return Err(ambiguous_drive_error(
+            q,
+            format!(
+                "Ambiguous drive '{q}' matches {} drives:\n{}",
+                exact_name.len(),
+                format_drive_candidates(&exact_name)
+            ),
+            &exact_name,
+        ));
     }
 
     let prefix: Vec<&DriveInfo> = drives
@@ -161,6 +222,16 @@ fn resolve_drive_from_slice_inner(
         .collect();
     if prefix.len() == 1 {
         return Ok(prefix[0].clone());
+    } else if prefix.len() > 1 {
+        return Err(ambiguous_drive_error(
+            q,
+            format!(
+                "Ambiguous drive prefix '{q}' matches {} drives:\n{}",
+                prefix.len(),
+                format_drive_candidates(&prefix)
+            ),
+            &prefix,
+        ));
     }
 
     let sub: Vec<&DriveInfo> = drives
@@ -172,10 +243,14 @@ fn resolve_drive_from_slice_inner(
         .collect();
     match sub.len() {
         1 => Ok(sub[0].clone()),
-        n if n > 1 => bail!(
-            "Ambiguous drive '{q}' matches {n} drives:\n{}",
-            format_drive_candidates(&sub)
-        ),
+        n if n > 1 => Err(ambiguous_drive_error(
+            q,
+            format!(
+                "Ambiguous drive '{q}' matches {n} drives:\n{}",
+                format_drive_candidates(&sub)
+            ),
+            &sub,
+        )),
         _ => bail!("Drive not found: {q}"),
     }
 }
@@ -231,8 +306,10 @@ pub async fn resolve_target_drive(
 
     if let Some(d_str) = dq {
         let cached = storage.list_drives(None)?;
-        if let Ok(found) = resolve_drive_from_slice(&cached, d_str) {
-            return Ok(found);
+        match resolve_drive_from_slice(&cached, d_str) {
+            Ok(found) => return Ok(found),
+            Err(err) if err.downcast_ref::<AmbiguousMatch>().is_some() => return Err(err),
+            Err(_) => {}
         }
         if offline {
             bail!("Drive '{d_str}' not found in local cache.");
@@ -249,7 +326,7 @@ pub async fn resolve_target_drive(
                 return Ok(me);
             }
         }
-        bail!("Drive not found: {d_str}");
+        bail!("Drive not found: {d_str}. Library names are matched against the local cache; pass --site <NAME_OR_ID> or run 'sharepoint drives' first.");
     }
 
     // Default drive selection based on persona
@@ -450,5 +527,47 @@ mod tests {
         assert_eq!(resolve_drive_from_slice(&drives, "onedrive").unwrap().id, "d-me");
         assert_eq!(resolve_drive_from_slice(&drives, "me").unwrap().id, "d-me");
         assert_eq!(resolve_drive_from_slice(&drives, "Shared").unwrap().id, "d-docs");
+
+        let dup_drives = vec![
+            DriveInfo {
+                id: "d-eng-docs".into(),
+                name: "Documents".into(),
+                drive_type: "documentLibrary".into(),
+                site_id: Some("s-eng".into()),
+                site_name: Some("Engineering Hub".into()),
+                ..Default::default()
+            },
+            DriveInfo {
+                id: "d-fin-docs".into(),
+                name: "Documents".into(),
+                drive_type: "documentLibrary".into(),
+                site_id: Some("s-fin".into()),
+                site_name: Some("Finance Portal".into()),
+                ..Default::default()
+            },
+            DriveInfo {
+                id: "d-other".into(),
+                name: "Archived Documents".into(),
+                drive_type: "documentLibrary".into(),
+                site_id: Some("s-other".into()),
+                site_name: Some("Other".into()),
+                ..Default::default()
+            },
+        ];
+        let dup_err = resolve_drive_from_slice(&dup_drives, "Documents").unwrap_err();
+        let amb = dup_err
+            .downcast_ref::<AmbiguousMatch>()
+            .expect("expected AmbiguousMatch for duplicate Documents");
+        let cand_ids: Vec<&str> = amb.candidates.iter().map(|(_, id)| id.as_str()).collect();
+        assert_eq!(cand_ids, vec!["d-eng-docs", "d-fin-docs"]);
+        let dup_msg = format!("{dup_err:#}");
+        assert!(dup_msg.contains("d-eng-docs") && dup_msg.contains("d-fin-docs"));
+        assert!(!dup_msg.contains("d-other"));
+        assert_eq!(
+            resolve_drive_from_slice(&dup_drives, "d-fin-docs")
+                .unwrap()
+                .id,
+            "d-fin-docs"
+        );
     }
 }

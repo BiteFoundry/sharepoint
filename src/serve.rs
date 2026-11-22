@@ -22,7 +22,9 @@ use crate::{
     cli,
     config::{self, AppConfig, Persona},
     graph::{
-        drives::{is_precondition_failed_error, ConflictBehavior, UploadOptions},
+        drives::{
+            explicit_if_match, is_precondition_failed_error, ConflictBehavior, UploadOptions,
+        },
         media::decode_text_file,
         GraphClient,
     },
@@ -590,6 +592,8 @@ async fn handle_upload(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UploadBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let if_match = explicit_if_match(body.if_match.as_deref())
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let drive = resolver::resolve_target_drive(
         &state.graph,
         &state.storage,
@@ -613,18 +617,11 @@ async fn handle_upload(
             None,
             body.file_name.as_deref(),
             &path,
-            body.if_match.as_deref(),
+            if_match.as_deref(),
             explicit_conflict,
         );
         if let Some(id) = body.item_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            if body
-                .if_match
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none()
-                && opts.target_item_id.as_deref() != Some(id)
-            {
+            if if_match.is_none() && opts.target_item_id.as_deref() != Some(id) {
                 opts.if_match = None;
                 opts.expected_c_tag = None;
             }
@@ -653,7 +650,7 @@ async fn handle_upload(
             .map_err(|e| ApiError::bad_request(format!("Invalid base64: {e}")))?;
         let opts = UploadOptions {
             conflict_behavior: explicit_conflict,
-            if_match: body.if_match.clone(),
+            if_match,
             expected_c_tag: None,
             target_item_id: body.item_id.clone(),
         };
@@ -669,7 +666,7 @@ async fn handle_upload(
             .ok_or_else(|| ApiError::bad_request("file_name is required with content_text"))?;
         let opts = UploadOptions {
             conflict_behavior: explicit_conflict,
-            if_match: body.if_match.clone(),
+            if_match,
             expected_c_tag: None,
             target_item_id: body.item_id.clone(),
         };

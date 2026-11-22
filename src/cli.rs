@@ -18,7 +18,7 @@ use crate::{
     },
     config::{self, AppConfig, Persona},
     graph::{
-        drives::{ConflictBehavior, UploadOptions},
+        drives::{explicit_if_match, ConflictBehavior, UploadOptions},
         media::decode_text_file,
         GraphClient,
     },
@@ -43,7 +43,7 @@ Dual-Persona Launchers:
 
 JSON Output (--json):
   login, logout, whoami, doctor, sites, drives, ls, tree, info, cat, download,
-  upload, mkdir, mv, rm, search, share, recent, shared, update, lists items/columns/set-field,
+  upload, mkdir, mv, rm, search, share, recent, shared, update, lists ls/items/columns/set-field,
   daemon start/status/stop/restart
 
 Environment Variables:
@@ -447,6 +447,12 @@ pub struct ListTarget {
 
 #[derive(Subcommand, Debug)]
 pub enum ListAction {
+    /// List SharePoint Lists in a site
+    Ls {
+        /// SharePoint site ID
+        #[arg(long)]
+        site_id: String,
+    },
     /// List one page of rows and their field values
     Items {
         #[command(flatten)]
@@ -676,8 +682,28 @@ fn normalize_hyphen_text_args(args: Vec<OsString>) -> Vec<OsString> {
         "search" => {
             normalize_single_hyphen_positional(args, &["--drive", "--site", "--limit", "--top"])
         }
+        "info" => {
+            normalize_single_hyphen_positional(args, &["--drive", "--site", "--versions-limit"])
+        }
+        "cat" => normalize_single_hyphen_positional(args, &["--drive", "--site", "--max-bytes"]),
+        "download" | "dl" => {
+            normalize_single_hyphen_positional(args, &["--drive", "--site", "--dir", "--out"])
+        }
+        "rm" => normalize_single_hyphen_positional(args, &["--drive", "--site"]),
         _ => args,
     }
+}
+
+fn args_has_json_flag(args: &[OsString]) -> bool {
+    for arg in args.iter().skip(1) {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--json" {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn parse_cli_from<I, T>(args: I, bin_name: &'static str) -> std::result::Result<Cli, clap::Error>
@@ -695,9 +721,20 @@ where
 
 pub async fn run_from_env() -> Result<()> {
     let persona = Persona::detect();
-    let cli = parse_cli_from(std::env::args_os(), persona.bin_name())
+    let raw_args: Vec<OsString> = std::env::args_os().collect();
+    let cli = parse_cli_from(raw_args.iter().cloned(), persona.bin_name())
         .unwrap_or_else(|err| err.exit());
-    run_cli(cli, persona).await
+    let json_mode = args_has_json_flag(&raw_args);
+    let res = run_cli(cli, persona).await;
+    if let Err(ref err) = res {
+        if json_mode {
+            let payload = json_error_value(err);
+            if let Ok(line) = serde_json::to_string(&payload) {
+                println!("{line}");
+            }
+        }
+    }
+    res
 }
 
 pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
@@ -1191,6 +1228,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             conflict,
             json: as_json,
         }) => {
+            let if_match = explicit_if_match(if_match.as_deref())?;
             let (_, graph, storage) = init_runtime(&config, false).await?;
             let target_drive = resolver::resolve_target_drive(
                 &graph,
@@ -1319,6 +1357,19 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             parent,
             json: as_json,
         }) => {
+            if name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+                && parent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .is_none()
+            {
+                bail!("Must specify at least a new name or a destination parent folder ID.");
+            }
             let (_, graph, storage) = init_runtime(&config, false).await?;
             let target_drive = resolver::resolve_target_drive(
                 &graph,
@@ -1675,7 +1726,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             .await
         }
         Some(Command::Mcp) => {
-            let (_, graph, storage) = init_runtime(&config, false).await?;
+            let (_, graph, storage) = init_runtime(&config, true).await?;
             crate::mcp::run(config, graph, storage).await
         }
         Some(Command::Update {
@@ -1712,6 +1763,23 @@ async fn run_list_action(config: &AppConfig, action: ListAction, as_json: bool) 
     let (_, graph, _) = init_runtime(config, false).await?;
     let outcome: Result<()> = async {
         match action {
+            ListAction::Ls { site_id } => {
+                let lists = graph.list_lists(&site_id).await?;
+                if as_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "lists": lists,
+                            "returned": lists.len(),
+                        }))?
+                    );
+                } else {
+                    for list in lists {
+                        let display = list.display_name.as_deref().unwrap_or(&list.name);
+                        println!("{}  {display}", list.id);
+                    }
+                }
+            }
             ListAction::Items {
                 target,
                 fields,
@@ -2151,10 +2219,11 @@ pub(crate) fn file_info_json(
     hint: DetailHint,
     versions_included: bool,
 ) -> Value {
+    let mut all = json!(item);
+    all["download_url"] = json!(item.download_url);
     if full {
-        return json!({ "item": item });
+        return json!({ "item": all });
     }
-    let all = json!(item);
     let mut summary = compact_drive_item(item);
     summary["e_tag"] = json!(item.e_tag);
     summary["parent_path"] = json!(item.parent_path);
@@ -2731,6 +2800,46 @@ pub async fn wrap_graph_permission_error(
     err
 }
 
+fn json_error_value(err: &anyhow::Error) -> Value {
+    let message = format!("{err:#}");
+    let http_status = crate::graph::graph_error_status(err);
+    let ambiguous = err.downcast_ref::<resolver::AmbiguousMatch>();
+
+    let code = if message.starts_with("Not logged in") || http_status == Some(401) {
+        "not_authenticated"
+    } else if ambiguous.is_some() {
+        "ambiguous"
+    } else if message.contains("Upload conflict (412") || http_status == Some(412) {
+        "precondition_failed"
+    } else if http_status == Some(403) {
+        "forbidden"
+    } else if http_status == Some(404) || message.to_ascii_lowercase().contains("not found") {
+        "not_found"
+    } else {
+        "error"
+    };
+
+    let mut error = serde_json::Map::new();
+    error.insert("code".to_string(), json!(code));
+    if let Some(status) = http_status {
+        error.insert("http_status".to_string(), json!(status));
+    }
+    error.insert("message".to_string(), json!(message));
+    if let Some(amb) = ambiguous {
+        let candidates: Vec<Value> = amb
+            .candidates
+            .iter()
+            .map(|(name, id)| json!({ "name": name, "id": id }))
+            .collect();
+        error.insert("candidates".to_string(), Value::Array(candidates));
+    }
+
+    json!({
+        "ok": false,
+        "error": Value::Object(error),
+    })
+}
+
 pub fn normalize_download_dir(config: &AppConfig, override_dir: Option<&str>) -> PathBuf {
     match override_dir.map(str::trim).filter(|s| !s.is_empty()) {
         Some(d) => Path::new(d).to_path_buf(),
@@ -2841,6 +2950,51 @@ mod tests {
                         json: true,
                         ..
                     }) if query == sample
+                ));
+
+                let inf = parse_cli_from([bin, "info", sample, "--drive", "d1", "--json"], bin)
+                    .unwrap();
+                assert!(matches!(
+                    inf.command,
+                    Some(Command::Info {
+                        ref item_or_path,
+                        json: true,
+                        ..
+                    }) if item_or_path == sample
+                ));
+
+                let ct = parse_cli_from([bin, "cat", sample, "--max-bytes", "64", "--json"], bin)
+                    .unwrap();
+                assert!(matches!(
+                    ct.command,
+                    Some(Command::Cat {
+                        ref item_or_path,
+                        max_bytes: 64,
+                        json: true,
+                        ..
+                    }) if item_or_path == sample
+                ));
+
+                let dl = parse_cli_from([bin, "dl", sample, "--dir", "out", "--json"], bin)
+                    .unwrap();
+                assert!(matches!(
+                    dl.command,
+                    Some(Command::Download {
+                        ref item_or_path,
+                        json: true,
+                        ..
+                    }) if item_or_path == sample
+                ));
+
+                let rm = parse_cli_from([bin, "rm", sample, "--yes", "--json"], bin).unwrap();
+                assert!(matches!(
+                    rm.command,
+                    Some(Command::Rm {
+                        ref item_or_path,
+                        yes: true,
+                        json: true,
+                        ..
+                    }) if item_or_path == sample
                 ));
             }
 

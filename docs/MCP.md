@@ -6,7 +6,9 @@ Start the stdio JSON-RPC 2.0 MCP server:
 sharepoint mcp
 ```
 
-## Tools (19)
+`sharepoint mcp` starts even when signed out (`whoami` reports `authenticated: false`). If you sign in after starting the server, restart `sharepoint mcp` so the local cache uses the signed-in account.
+
+## Tools (20)
 
 1. `whoami`
 2. `list_sites`
@@ -24,9 +26,10 @@ sharepoint mcp
 14. `list_recent`
 15. `list_shared_with_me`
 16. `list_versions`
-17. `list_items`
-18. `list_columns`
-19. `update_list_item_field`
+17. `list_lists`
+18. `list_items`
+19. `list_columns`
+20. `update_list_item_field`
 
 ## Drives
 
@@ -66,9 +69,10 @@ at any file size. If the eTag is stale, `upload_file` reports an error.
 
 ## SharePoint List rows
 
-All three tools take a SharePoint `site_id` and `list_id`. Call `list_columns`
-to find each column's internal `name`, its `display_name`, and its `read_only`
-flag. [Graph column discovery](https://learn.microsoft.com/en-us/graph/api/list-list-columns?view=graph-rest-1.0) · [Column properties](https://learn.microsoft.com/en-us/graph/api/resources/columndefinition?view=graph-rest-1.0)
+Call `list_lists` with a SharePoint `site_id` to discover `list_id` values.
+`list_columns`, `list_items`, and `update_list_item_field` take both `site_id`
+and `list_id`. Call `list_columns` to find each column's internal `name`, its
+`display_name`, and its `read_only` flag. [Graph column discovery](https://learn.microsoft.com/en-us/graph/api/list-list-columns?view=graph-rest-1.0) · [Column properties](https://learn.microsoft.com/en-us/graph/api/resources/columndefinition?view=graph-rest-1.0)
 
 `list_items` reads one page (default `limit` `50`, range `1`–`200`) and returns
 `items`, `returned`, `has_more`, and `next_cursor`. Each row includes `id`,

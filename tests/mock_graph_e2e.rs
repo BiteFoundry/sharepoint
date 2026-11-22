@@ -253,6 +253,30 @@ async fn start_mock_graph() -> (String, MockGraphState, tokio::task::JoinHandle<
             }),
         )
         .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}/children",
+            post(|Path((drive_id, item_id)): Path<(String, String)>, Json(body): Json<Value>| async move {
+                if item_id.starts_with('/') || item_id.contains('/') {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "error": { "code": "itemNotFound", "message": "raw path not allowed as item_id" } })),
+                    )
+                        .into_response();
+                }
+                let name = body.get("name").and_then(Value::as_str).unwrap_or("New Folder");
+                (
+                    StatusCode::CREATED,
+                    Json(json!({
+                        "id": format!("folder-under-{item_id}"),
+                        "name": name,
+                        "size": 0,
+                        "folder": { "childCount": 0 },
+                        "parentReference": { "driveId": drive_id, "id": item_id, "path": format!("/drive/root:/{item_id}") }
+                    })),
+                )
+                    .into_response()
+            }),
+        )
+        .route(
             "/v1.0/drives/{drive_id}/items/{item_id}/versions",
             get(|State(st): State<MockGraphState>, Path((drive_id, item_id)): Path<(String, String)>, Query(query): Query<std::collections::HashMap<String, String>>| async move {
                 st.version_pages.fetch_add(1, Ordering::SeqCst);
@@ -658,6 +682,26 @@ async fn e2e_http_api_and_mcp_tools_parity() {
     assert_eq!(dl_resp["mime_type"], "image/png");
     assert_eq!(dl_resp["is_image"], true);
 
+    // HTTP /v1/items/upload with empty if_match returns 400 Bad Request (WI-1)
+    let bad_if_match = http
+        .post(format!("http://{api_addr}/v1/items/upload"))
+        .bearer_auth("secret-api-key")
+        .json(&json!({
+            "drive": "me",
+            "file_name": "note.md",
+            "content_text": "hello",
+            "if_match": ""
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_if_match.status(), StatusCode::BAD_REQUEST);
+    let bad_if_match_body: Value = bad_if_match.json().await.unwrap();
+    assert!(bad_if_match_body["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("If-Match requires a non-empty ETag"));
+
     // --- MCP Server (`mcp::handle_rpc_line`) ---
     let init = mcp::handle_rpc_line(
         &cfg,
@@ -766,6 +810,43 @@ async fn e2e_http_api_and_mcp_tools_parity() {
     .unwrap();
     assert_eq!(del_ok["result"]["isError"], false);
     assert_eq!(del_ok["result"]["structuredContent"]["deleted"], true);
+
+    // WI-3 (F-06): create_folder accepts both a folder path and a folder ID
+    let cf_by_path = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"create_folder","arguments":{"drive":"me","parent_id":"/Team Docs","name":"Path Child"}}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cf_by_path["result"]["isError"], false, "{cf_by_path}");
+    assert_eq!(
+        cf_by_path["result"]["structuredContent"]["item"]["name"],
+        "Path Child"
+    );
+    assert_eq!(
+        cf_by_path["result"]["structuredContent"]["item"]["parent_id"],
+        "item-by-path"
+    );
+
+    let cf_by_id = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"create_folder","arguments":{"drive":"me","parent_id":"folder-proj","name":"Id Child"}}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cf_by_id["result"]["isError"], false, "{cf_by_id}");
+    assert_eq!(
+        cf_by_id["result"]["structuredContent"]["item"]["name"],
+        "Id Child"
+    );
+    assert_eq!(
+        cf_by_id["result"]["structuredContent"]["item"]["parent_id"],
+        "folder-proj"
+    );
 
     api_server.abort();
     graph_server.abort();
@@ -1171,7 +1252,7 @@ async fn e2e_sync_fixes_write_targeting_conditional_upload_partial_limit_and_off
     let server = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    let (_cfg, graph, storage) = make_graph_and_storage(&base_url);
+    let (cfg, graph, storage) = make_graph_and_storage(&base_url);
 
     // S5: Cache /Finance/secret.md, then online resolve_item_for_write("secret.md") MUST fail with 0 deletes!
     let fin_items = cli::fetch_folder_items(&graph, &storage, "drv-me", Some("/Finance"), 100, false, false, false)
@@ -1370,8 +1451,10 @@ async fn e2e_sync_fixes_write_targeting_conditional_upload_partial_limit_and_off
     assert!(
         zero_ok_reqs
             .iter()
-            .any(|(m, p, _)| m == "PUT" && p == "/v1.0/drives/drv-me/items/item-doc/content"),
-        "zero-length conditional upload must use exact item-ID PUT /content: {zero_ok_reqs:?}"
+            .any(|(m, p, im)| m == "PUT"
+                && p == "/v1.0/drives/drv-me/items/item-doc/content"
+                && im.as_deref() == clean_up.e_tag.as_deref()),
+        "zero-length conditional upload must use exact item-ID PUT /content with If-Match: {zero_ok_reqs:?}"
     );
     assert_eq!(zero_up.size, 0);
     assert_eq!(
@@ -1409,6 +1492,113 @@ async fn e2e_sync_fixes_write_targeting_conditional_upload_partial_limit_and_off
         st.contents.lock().await.get(&("drv-me".into(), "item-doc".into())).unwrap().as_slice(),
         b"EXPLICIT_REPLACE_DATA"
     );
+
+    // WI-1: CLI `upload --if-match ""` and MCP `upload_file(if_match: "")` must fail before sending PUT and keep remote content unchanged.
+    {
+        let empty_etag_file = tmp.path().join("empty-etag-upload.md");
+        std::fs::write(&empty_etag_file, b"SHOULD_NOT_OVERWRITE_CLI").unwrap();
+        let reqs_before_empty_cli = st.requests.lock().await.len();
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_sharepoint"));
+        cmd.kill_on_drop(true);
+        for (k, _) in std::env::vars_os() {
+            let u = k.to_string_lossy().to_ascii_uppercase();
+            if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+                .iter()
+                .any(|p| u.starts_with(p))
+            {
+                cmd.env_remove(k);
+            }
+        }
+        let cli_out = cmd
+            .env("SHAREPOINT_GRAPH_BASE_URL", &base_url)
+            .env("SHAREPOINT_ACCESS_TOKEN", "sync-empty-etag-token")
+            .env("SHAREPOINT_DISABLE_KEYRING", "1")
+            .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+            .env("SHAREPOINT_AUTO_DAEMON", "0")
+            .env("SHAREPOINT_CONFIG_DIR", tmp.path().join("cfg_empty_etag"))
+            .env("SHAREPOINT_DATA_DIR", tmp.path().join("data_empty_etag"))
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .args([
+                "upload",
+                &empty_etag_file.to_string_lossy(),
+                "--drive",
+                "drv-me",
+                "--item-id",
+                "item-doc",
+                "--if-match",
+                "",
+                "--json",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            cli_out.status.code(),
+            Some(1),
+            "CLI upload --if-match \"\" must exit 1, stderr={}",
+            String::from_utf8_lossy(&cli_out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&cli_out.stderr).contains("If-Match requires a non-empty ETag"),
+            "unexpected stderr: {}",
+            String::from_utf8_lossy(&cli_out.stderr)
+        );
+        assert!(
+            !st.requests.lock().await[reqs_before_empty_cli..]
+                .iter()
+                .any(|(m, _, _)| m == "PUT" || m == "POST"),
+            "CLI upload --if-match \"\" must not send PUT/POST"
+        );
+        assert_eq!(
+            st.contents.lock().await.get(&("drv-me".into(), "item-doc".into())).unwrap().as_slice(),
+            b"EXPLICIT_REPLACE_DATA",
+            "CLI upload --if-match \"\" must preserve remote content"
+        );
+
+        let reqs_before_empty_mcp = st.requests.lock().await.len();
+        let mcp_empty = mcp::handle_rpc_line(
+            &cfg,
+            &graph,
+            &storage,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 91,
+                "method": "tools/call",
+                "params": {
+                    "name": "upload_file",
+                    "arguments": {
+                        "drive": "drv-me",
+                        "item_id": "item-doc",
+                        "file_name": "doc.md",
+                        "content_text": "SHOULD_NOT_OVERWRITE_MCP",
+                        "if_match": ""
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mcp_empty["result"]["isError"], true);
+        assert!(
+            mcp_empty["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("If-Match requires a non-empty ETag"),
+            "unexpected MCP error: {mcp_empty}"
+        );
+        assert!(
+            !st.requests.lock().await[reqs_before_empty_mcp..]
+                .iter()
+                .any(|(m, _, _)| m == "PUT" || m == "POST"),
+            "MCP upload_file(if_match:\"\") must not send PUT/POST"
+        );
+        assert_eq!(
+            st.contents.lock().await.get(&("drv-me".into(), "item-doc".into())).unwrap().as_slice(),
+            b"EXPLICIT_REPLACE_DATA",
+            "MCP upload_file(if_match:\"\") must preserve remote content"
+        );
+    }
 
     // S4: Offline sites search sends 0 network requests + unfollow persists false
     let sites1 = cli::fetch_sites(&graph, &storage, None, 50, false, false, false).await.unwrap();
@@ -3997,8 +4187,9 @@ async fn regression_sharepoint_sp_12_tree_propagates_child_folder_errors_with_pa
         }
     };
 
-    // 1. Depth 2 with Restricted returning 403 -> exit code 1, stderr has Restricted + 403, stdout empty
+    // 1. Depth 2 with Restricted returning 403 -> exit code 1, stderr has Restricted + 403, no partial success tree
     for extra in [vec!["--json"], vec![]] {
+        let is_json = !extra.is_empty();
         let mut args = vec![
             "tree".into(),
             "--drive".into(),
@@ -4009,11 +4200,22 @@ async fn regression_sharepoint_sp_12_tree_propagates_child_folder_errors_with_pa
         args.extend(extra.into_iter().map(str::to_string));
         let out = run_cli(args).await;
         assert_eq!(out.status.code(), Some(1), "tree with 403 child must exit with code 1");
-        assert!(
-            out.stdout.is_empty(),
-            "failed tree must not print partial/empty-children success tree, stdout={}",
-            String::from_utf8_lossy(&out.stdout)
-        );
+        if is_json {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let lines: Vec<&str> = stdout.lines().collect();
+            assert_eq!(lines.len(), 1, "expected single-line JSON error on stdout, got: {stdout}");
+            let err_json: Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(err_json["ok"], false);
+            assert_eq!(err_json["error"]["code"], "forbidden");
+            assert_eq!(err_json["error"]["http_status"], 403);
+            assert!(err_json.get("tree").is_none());
+        } else {
+            assert!(
+                out.stdout.is_empty(),
+                "failed tree must not print partial/empty-children success tree, stdout={}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("Restricted") && stderr.contains("403"),

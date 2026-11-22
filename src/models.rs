@@ -128,6 +128,7 @@ pub struct DriveItem {
     pub mime_type: Option<String>,
     pub web_url: Option<String>,
     /// Optional pre-authenticated `@microsoft.graph.downloadUrl`.
+    #[serde(skip_serializing)]
     pub download_url: Option<String>,
     pub e_tag: Option<String>,
     pub c_tag: Option<String>,

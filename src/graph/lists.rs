@@ -10,6 +10,32 @@ use url::Url;
 
 use super::{client::GraphListPage, GraphClient};
 
+#[derive(Debug, Deserialize)]
+struct RawListFacet {
+    template: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawListInfo {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+    #[serde(rename = "webUrl")]
+    web_url: Option<String>,
+    list: Option<RawListFacet>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListInfo {
+    pub id: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub web_url: Option<String>,
+    pub template: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ListColumn {
     pub id: String,
@@ -75,6 +101,25 @@ fn describe_fields(fields: &[String]) -> String {
 }
 
 impl GraphClient {
+    pub async fn list_lists(&self, site_id: &str) -> Result<Vec<ListInfo>> {
+        let site = resource_id("site_id", site_id)?;
+        let raw: Vec<RawListInfo> = self
+            .get_list_collection(format!(
+                "/sites/{site}/lists?$select=id,name,displayName,webUrl,list"
+            ))
+            .await?;
+        Ok(raw
+            .into_iter()
+            .map(|item| ListInfo {
+                id: item.id,
+                name: item.name,
+                display_name: item.display_name,
+                web_url: item.web_url,
+                template: item.list.and_then(|facet| facet.template),
+            })
+            .collect())
+    }
+
     pub async fn list_columns(&self, site_id: &str, list_id: &str) -> Result<Vec<ListColumn>> {
         let path = list_path(site_id, list_id)?;
         self.get_list_collection(format!(

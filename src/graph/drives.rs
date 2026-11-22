@@ -86,6 +86,19 @@ impl UploadOptions {
     }
 }
 
+pub fn explicit_if_match(raw: Option<&str>) -> Result<Option<String>> {
+    match raw {
+        None => Ok(None),
+        Some(tag) => {
+            let trimmed = tag.trim();
+            if trimmed.is_empty() {
+                bail!("If-Match requires a non-empty ETag");
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FolderChildrenPage {
     pub items: Vec<DriveItem>,
@@ -1579,8 +1592,17 @@ impl GraphClient {
         let enc_item = urlencoding::encode(item_id.trim());
         let endpoint = format!("/drives/{enc_drive}/items/{enc_item}/content");
         let ct = content_type.unwrap_or_else(|| guess_mime_type(Path::new(file_name)));
+        let mut headers = Vec::new();
+        if let Some(etag) = options
+            .if_match
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            headers.push(("If-Match", etag.to_string()));
+        }
         let raw: GraphDriveItem = self
-            .put_bytes_with_headers(&endpoint, bytes, Some(ct), &[])
+            .put_bytes_with_headers(&endpoint, bytes, Some(ct), &headers)
             .await
             .map_err(|err| annotate_upload_conflict(err, file_name, options))?;
         Ok(raw.into_model(drive_id))

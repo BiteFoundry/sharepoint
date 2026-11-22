@@ -538,6 +538,16 @@ async fn spawn_mock(
         )
         .route("/v1.0/me/followedSites", get(MockGraph::followed_sites))
         .route("/v1.0/sites", get(MockGraph::sites))
+        .route(
+            "/v1.0/sites/{s}",
+            get(|State(mock): State<MockGraph>, uri: Uri| async move {
+                mock.record(&uri).await;
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": { "code": "itemNotFound", "message": "Site not found" } })),
+                )
+            }),
+        )
         .route("/v1.0/sites/{s}/drives", get(MockGraph::site_drives))
         .with_state(MockGraph {
             base: base.clone(),
@@ -685,6 +695,32 @@ async fn info_full_returns_all_fields_and_flag_conflicts() {
     assert_eq!(no_json.status.code(), Some(2));
     assert!(no_json.stdout.is_empty());
     assert!(String::from_utf8_lossy(&no_json.stderr).contains("--json"));
+
+    // WI-4: runtime error with --json writes a single-line {ok:false,error} JSON to stdout; without --json stdout stays empty
+    let missing_json = client
+        .cli(&["info", "/does-not-exist.md", "--drive", "d1", "--json"])
+        .await;
+    assert_eq!(missing_json.status.code(), Some(1));
+    let missing_stdout = String::from_utf8_lossy(&missing_json.stdout);
+    let missing_lines: Vec<&str> = missing_stdout.lines().collect();
+    assert_eq!(
+        missing_lines.len(),
+        1,
+        "expected single-line JSON error on stdout, got: {missing_stdout}"
+    );
+    let missing_val: Value = serde_json::from_str(missing_lines[0]).unwrap();
+    assert_eq!(missing_val["ok"], false);
+    assert_eq!(missing_val["error"]["code"], "not_found");
+    assert!(missing_val["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("/does-not-exist.md"));
+
+    let missing_plain = client
+        .cli(&["info", "/does-not-exist.md", "--drive", "d1"])
+        .await;
+    assert_eq!(missing_plain.status.code(), Some(1));
+    assert!(missing_plain.stdout.is_empty());
 
     server.abort();
 }
@@ -948,6 +984,14 @@ async fn ls_reports_returned_has_more_and_source() {
     assert_eq!(d1_default["path"], "/");
     assert!(d1_default.get("drive").is_some());
     assert_eq!(d1_default["items"].as_array().unwrap().len(), 100);
+    assert!(
+        d1_default["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|it| it.get("download_url").is_none()),
+        "ls --json items must omit download_url"
+    );
 
     // dx (exact 100 items), default limit 100 -> (100, false, remote)
     let dx_default = cli_json(client.cli(&["ls", "--drive", "dx", "--json"]).await);
@@ -1212,6 +1256,128 @@ async fn drives_site_and_offline_paths_unchanged() {
 }
 
 #[tokio::test]
+async fn drives_site_prefix_ambiguity_preserves_candidates_without_404_fallback() {
+    let state = MockState {
+        followed_sites: vec![
+            SiteSpec {
+                id: "site-acme-ops".into(),
+                name: "acme-ops".into(),
+                display_name: "Acme Operations".into(),
+            },
+            SiteSpec {
+                id: "site-acme-fin".into(),
+                name: "acme-fin".into(),
+                display_name: "Acme Finance".into(),
+            },
+        ],
+        discovered_sites: Vec::new(),
+        failing_site_drives: HashSet::new(),
+        fail_site_discovery: false,
+        requests: Vec::new(),
+    };
+    let (base, st, server, profile, exe) = spawn_mock(state).await;
+    let client = Client::new(Path::new(&exe), profile.path(), &base);
+
+    let out = client.cli(&["drives", "--site", "Acme", "--json"]).await;
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("site-acme-ops") && stderr.contains("site-acme-fin"),
+        "expected both ambiguous site IDs in stderr, got: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "expected single-line JSON error, got: {stdout}");
+    let err_json: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(err_json["ok"], false);
+    assert_eq!(err_json["error"]["code"], "ambiguous");
+    assert_eq!(err_json["error"]["candidates"].as_array().unwrap().len(), 2);
+    assert!(
+        !st.lock()
+            .await
+            .requests
+            .iter()
+            .any(|req| req.starts_with("/v1.0/sites/Acme")),
+        "ambiguous site prefix must not fall back to GET /sites/Acme: {:?}",
+        st.lock().await.requests
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn mcp_starts_unauthenticated_and_serves_initialize_tools_list_and_whoami() {
+    let profile = tempfile::tempdir().unwrap();
+    let exe = Path::new(env!("CARGO_BIN_EXE_sharepoint"));
+    let mut cmd = Command::new(exe);
+    cmd.kill_on_drop(true);
+    for (key, _) in std::env::vars_os() {
+        let upper = key.to_string_lossy().to_ascii_uppercase();
+        if ["SHAREPOINT_", "ONEDRIVE_", "TEAMS_", "AZURE_"]
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+        {
+            cmd.env_remove(key);
+        }
+    }
+    let mut child = cmd
+        .env("SHAREPOINT_DISABLE_KEYRING", "1")
+        .env("SHAREPOINT_SHARE_M365_AUTH", "0")
+        .env("SHAREPOINT_AUTO_DAEMON", "0")
+        .env("SHAREPOINT_CONFIG_DIR", profile.path().join("config"))
+        .env("SHAREPOINT_DATA_DIR", profile.path().join("data"))
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let requests = [
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": { "name": "unauth-check", "version": "1" }
+        }}),
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "whoami", "arguments": {} } }),
+        json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": { "name": "list_sites", "arguments": {} } }),
+    ];
+    let mut stdin = child.stdin.take().unwrap();
+    for req in requests {
+        stdin
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "unauthenticated mcp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let replies: Vec<Value> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 4);
+    assert_eq!(replies[0]["id"], 1);
+    assert_eq!(replies[0]["result"]["serverInfo"]["name"], "sharepoint");
+    assert_eq!(replies[1]["id"], 2);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 20);
+    assert_eq!(replies[2]["id"], 3);
+    assert_eq!(replies[2]["result"]["isError"], false);
+    assert_eq!(replies[2]["result"]["structuredContent"]["authenticated"], false);
+    assert_eq!(replies[3]["id"], 4);
+    assert_eq!(replies[3]["result"]["isError"], true);
+    assert!(replies[3]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Not logged in"));
+}
+
+#[tokio::test]
 async fn tree_depth_range_and_folder_cap() {
     let (base, _state, server, profile, exe) = spawn_mock(MockState::default()).await;
     let client = Client::new(Path::new(&exe), profile.path(), &base);
@@ -1297,6 +1463,17 @@ async fn mcp_text_is_minified_and_matches_structured_content() {
         .await;
     assert_eq!(err_res["isError"], true);
     assert!(err_res.get("structuredContent").is_none());
+
+    // WI-3 (F-08): negative integer limit is rejected rather than silently defaulted
+    let neg_limit = client
+        .mcp_call("list_files", json!({"drive": "ds", "limit": -5}))
+        .await;
+    assert_eq!(neg_limit["isError"], true);
+    assert_eq!(
+        neg_limit["content"][0]["text"],
+        "limit must be a non-negative integer"
+    );
+    assert!(neg_limit.get("structuredContent").is_none());
 
     server.abort();
 }
@@ -1391,6 +1568,17 @@ async fn mcp_tool_catalog_and_site_discovery_failure_contract() {
         .is_some());
     assert!(find_tool("list_items")["inputSchema"]["properties"]
         .get("cursor")
+        .is_some());
+    assert_eq!(
+        find_tool("create_share_link")["inputSchema"]["properties"]["type"]["enum"],
+        json!(["view", "edit", "embed"])
+    );
+    assert_eq!(
+        find_tool("create_share_link")["inputSchema"]["properties"]["scope"]["enum"],
+        json!(["organization", "anonymous"])
+    );
+    assert!(find_tool("list_lists")["inputSchema"]["properties"]
+        .get("site_id")
         .is_some());
 
     server.abort();

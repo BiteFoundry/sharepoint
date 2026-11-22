@@ -26,7 +26,7 @@
 | **Minimal-Chrome 3-Pane TUI** | Dual-persona explorer (`sharepoint` and `bitefoundry-onedrive`) with collapsible Sites, Document Libraries & OneDrive sidebar, sorted file list, live Inspector (metadata, version history, Markdown/YAML/JSON/code preview), Link Extractor (`u`), File Picker with `zoxide` (`Ctrl+F`), Context Menu (`.`), and 6 themes. |
 | **High-Res Terminal Images** | Inline Inspector thumbnails & fullscreen HD previews (`v` / `Alt+v`) with 80ms protocol probing for **Kitty**, **iTerm2**, **Sixel** (Floyd-Steinberg dithering), and **24-bit Unicode Half-Blocks** + `Ctrl+V` instant clipboard PNG upload. |
 | **Local SQLite FTS5 + IPC Daemon** | WAL-mode SQLite cache with 4-reader pool, hybrid local FTS5 + remote Graph search (`/`), streaming chunked uploads (`> 4 MiB`), and a shared background sync daemon (`sharepoint daemon start`). |
-| **4-in-1 Agent Interface** | Interactive **TUI**, scriptable `--json` **CLI**, local **HTTP JSON API** (`sharepoint serve`, port `8790`), and stdio **MCP Server** (`sharepoint mcp`, 19 tools). |
+| **4-in-1 Agent Interface** | Interactive **TUI**, scriptable `--json` **CLI**, local **HTTP JSON API** (`sharepoint serve`, port `8790`), and stdio **MCP Server** (`sharepoint mcp`, 20 tools). |
 
 ---
 
@@ -128,12 +128,26 @@ Use `download` for binary files. To replace a file conditionally, pass its item 
 and eTag to `upload --item-id <ITEM_ID> --if-match <ETAG>`. Conditional
 replacement uses an upload session at any file size.
 
+When targeting a site with multiple document libraries, pass `--drive` alongside
+`--site`; responses report the selected library in `drive.id` (or `drive_id`).
+`drives --json` outputs a JSON array and writes partial site-discovery warnings
+to stderr; use MCP `list_drives` if you need `sites_failed` or `has_more` in JSON.
+For root paths with spaces, dots, or leading hyphens, prefix with `/` (for
+example `/Q4 Report.md` or `mv /-name`).
+
+Exit codes: `1` is a runtime error (with `--json`, stdout prints a single-line
+`{"ok":false,"error":{"code":...,"message":...}}` object alongside the stderr
+message); `2` is an argument or usage error (plain text on stderr, empty stdout).
+
 ### SharePoint List rows
 
-Use `sites --json` to find the site ID. With the list ID, discover its column
-names, then select one or more columns by passing `--field` for each name.
+Use `sites --json` to find the site ID, then `lists ls --site-id` to find the
+list ID. With the list ID, discover its column names, then select one or more
+columns by passing `--field` for each name.
 
 ```sh
+sharepoint sites --json
+sharepoint lists ls --site-id "$SITE_ID" --json
 sharepoint lists columns --site-id "$SITE_ID" --list-id "$LIST_ID" --json
 sharepoint lists items --site-id "$SITE_ID" --list-id "$LIST_ID" \
   --field ReviewStatus --field Quantity --json
@@ -180,7 +194,7 @@ Full route reference & OpenAPI 3.1 spec: [docs/API.md](docs/API.md) · [docs/ope
 
 ### Model Context Protocol (`sharepoint mcp`)
 
-Add to Claude Desktop, Claude Code, Cursor, or Codex (`16` tools over stdio JSON-RPC 2.0):
+Add to Claude Desktop, Claude Code, Cursor, or Codex (`20` tools over stdio JSON-RPC 2.0):
 
 ```json
 {

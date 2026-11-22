@@ -400,6 +400,27 @@ async fn start_mock_server(
                             .into_response(),
                     }
                 },
+            )
+            .delete(
+                |State(mock): State<MockApp>,
+                 RoutePath((drive_id, item_id)): RoutePath<(String, String)>| async move {
+                    let mut st = mock.state.lock().await;
+                    st.requests.push(RecordedRequest {
+                        method: "DELETE".into(),
+                        path: format!("/v1.0/drives/{drive_id}/items/{item_id}"),
+                        body: None,
+                        raw_bytes: None,
+                    });
+                    if st.items.remove(&(drive_id, item_id)).is_some() {
+                        StatusCode::NO_CONTENT.into_response()
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({ "error": { "code": "itemNotFound" } })),
+                        )
+                            .into_response()
+                    }
+                },
             ),
         )
         .route(
@@ -781,6 +802,20 @@ async fn cli_hyphen_filenames_search_and_lists_negative_number_on_both_binaries(
             );
         }
 
+        // 1b. WI-7: mkdir -draft-notes -> info -draft-notes -> rm -draft-notes --yes
+        let mk_draft = cli.run_json(&["mkdir", "-draft-notes", "--json"]).await;
+        assert_eq!(mk_draft["name"], "-draft-notes", "{label}: mkdir -draft-notes");
+        let info_draft = cli.run_json(&["info", "-draft-notes", "--json"]).await;
+        assert_eq!(
+            info_draft["item"]["id"], mk_draft["id"],
+            "{label}: info -draft-notes must resolve created folder"
+        );
+        let rm_draft = cli
+            .run_json(&["rm", "-draft-notes", "--yes", "--json"])
+            .await;
+        assert_eq!(rm_draft["deleted"], true, "{label}: rm -draft-notes");
+        assert_eq!(rm_draft["item_id"], mk_draft["id"]);
+
         // 2. upload test.txt --name -report.md sends exact upload path and bytes.
         let up = cli
             .run_json(&[
@@ -1013,6 +1048,24 @@ async fn cli_hyphen_filenames_search_and_lists_negative_number_on_both_binaries(
             state.lock().await.requests.len(),
             reqs_before_guards,
             "{label}: rejected flag invocations and --help must send 0 Graph requests"
+        );
+
+        // 9. WI-7: mv with neither --name nor --parent fails with exit 1 and 0 Graph requests.
+        let reqs_before_noop_mv = state.lock().await.requests.len();
+        let noop_mv = cli
+            .run(&["mv", "item-rename-target", "--json"])
+            .await;
+        assert_eq!(noop_mv.status.code(), Some(1), "{label}: mv without --name/--parent must exit 1");
+        assert!(
+            String::from_utf8_lossy(&noop_mv.stderr)
+                .contains("Must specify at least a new name or a destination parent folder ID."),
+            "{label}: unexpected stderr: {}",
+            String::from_utf8_lossy(&noop_mv.stderr)
+        );
+        assert_eq!(
+            state.lock().await.requests.len(),
+            reqs_before_noop_mv,
+            "{label}: mv without --name/--parent must send 0 Graph requests"
         );
     }
 
