@@ -39,6 +39,7 @@ use sharepoint_cli::{
     sync::{
         bootstrap_drive_with_delta, drive_cursor_scope_key, spawn_sync_engine,
         sync_drive_delta_once, DriveSyncRuntime, FocusTarget, FocusViewKind, SyncCommand,
+        FOLDER_PAGE_SIZE,
     },
 };
 
@@ -63,7 +64,7 @@ fn build_graph_client(base_url: String) -> GraphClient {
 }
 
 /// Serves a drive root whose size is the number in the drive id (`drv-250` holds 250 files),
-/// 200 per page, plus a delta feed that changes `file-001` once at token `t1`.
+/// 200 per page, plus a delta feed that reports an edit of `file-001` on every pull from `t1` on.
 async fn spawn_sized_folder_graph() -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -114,23 +115,25 @@ async fn spawn_sized_folder_graph() -> (String, tokio::task::JoinHandle<()>) {
                     let base = base.clone();
                     async move {
                         let link = |t: &str| format!("{base}/drives/{drive_id}/root/delta?token={t}");
-                        match q.get("token").map(String::as_str).unwrap_or("") {
+                        let token = q.get("token").map(String::as_str).unwrap_or("");
+                        let round: usize = token.trim_start_matches('t').parse().unwrap_or(0);
+                        match token {
                             "latest" => Json(json!({ "value": [], "@odata.deltaLink": link("t0") })),
                             "t0" => Json(json!({ "value": [], "@odata.deltaLink": link("t1") })),
-                            "t1" => Json(json!({
+                            // Every later pull reports one more edit of the first file.
+                            _ => Json(json!({
                                 "value": [
                                     { "id": "real-root-id", "root": {} },
                                     {
                                         "id": "item-001",
                                         "name": "file-001.txt",
-                                        "size": 99,
+                                        "size": 98 + round,
                                         "file": { "mimeType": "text/plain" },
                                         "parentReference": { "driveId": drive_id, "id": "real-root-id" }
                                     }
                                 ],
-                                "@odata.deltaLink": link("t2")
+                                "@odata.deltaLink": link(&format!("t{}", round + 1))
                             })),
-                            _ => Json(json!({ "value": [], "@odata.deltaLink": link("t2") })),
                         }
                     }
                 }
@@ -162,7 +165,7 @@ async fn folder_items_updated_reports_truncation() {
     let mut rt = DriveSyncRuntime::default();
 
     // 250 files on the server: the first load shows 200 and says there are more.
-    bootstrap_drive_with_delta(&graph, &storage, &tx, &mut rt, "drv-250", None)
+    bootstrap_drive_with_delta(&graph, &storage, &tx, &mut rt, "drv-250", None, FOLDER_PAGE_SIZE)
         .await
         .unwrap();
     assert_eq!(last_folder_event(&mut rx), (200, true));
@@ -170,7 +173,7 @@ async fn folder_items_updated_reports_truncation() {
     assert_eq!(storage.list_folder_children("drv-250", None, None, 1000).unwrap().len(), 200);
 
     // A delta-driven refresh reads the cache and must keep the mark.
-    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-250", None)
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-250", None, FOLDER_PAGE_SIZE)
         .await
         .unwrap();
     assert_eq!(last_folder_event(&mut rx), (200, true));
@@ -187,18 +190,132 @@ async fn folder_items_updated_reports_truncation() {
         }])
         .unwrap();
     rt.delta_unsupported_drives.insert("drv-250".to_string());
-    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-250", None)
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-250", None, FOLDER_PAGE_SIZE)
         .await
         .unwrap();
     assert_eq!(last_folder_event(&mut rx), (200, true));
     assert!(storage.get_drive_item("drv-250", "item-240").unwrap().is_some());
 
     // Exactly 200 files: everything is shown and nothing is marked.
-    bootstrap_drive_with_delta(&graph, &storage, &tx, &mut rt, "drv-200", None)
+    bootstrap_drive_with_delta(&graph, &storage, &tx, &mut rt, "drv-200", None, FOLDER_PAGE_SIZE)
         .await
         .unwrap();
     assert_eq!(last_folder_event(&mut rx), (200, false));
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn raised_folder_limit_lists_the_whole_folder_and_replaces_the_cache() {
+    let (base_url, server) = spawn_sized_folder_graph().await;
+    let graph = build_graph_client(base_url);
+    let storage = Storage::open_in_memory().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<CoreEvent>();
+    let mut rt = DriveSyncRuntime::default();
+
+    bootstrap_drive_with_delta(&graph, &storage, &tx, &mut rt, "drv-250", None, FOLDER_PAGE_SIZE)
+        .await
+        .unwrap();
+    assert_eq!(last_folder_event(&mut rx), (200, true));
+
+    // A cached row the server no longer has: only a complete listing may drop it.
+    storage
+        .upsert_drive_items(&[sharepoint_cli::models::DriveItem {
+            id: "item-stale".into(),
+            drive_id: "drv-250".into(),
+            name: "stale.txt".into(),
+            parent_id: Some("real-root-id".into()),
+            ..Default::default()
+        }])
+        .unwrap();
+    rt.delta_unsupported_drives.insert("drv-250".to_string());
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-250", None, FOLDER_PAGE_SIZE)
+        .await
+        .unwrap();
+    assert_eq!(last_folder_event(&mut rx), (200, true));
+    assert!(storage.get_drive_item("drv-250", "item-stale").unwrap().is_some());
+
+    // One more page asked for: 250 rows, nothing left on the server, cache made exact.
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-250", None, 400)
+        .await
+        .unwrap();
+    assert_eq!(last_folder_event(&mut rx), (250, false));
+    assert!(storage.get_drive_item("drv-250", "item-stale").unwrap().is_none());
+    assert_eq!(storage.list_folder_children("drv-250", None, None, 1000).unwrap().len(), 250);
+
+    // Back at one page the folder is cut short again, with all 250 rows still cached.
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-250", None, FOLDER_PAGE_SIZE)
+        .await
+        .unwrap();
+    assert_eq!(last_folder_event(&mut rx), (200, true));
+    assert_eq!(storage.list_folder_children("drv-250", None, None, 1000).unwrap().len(), 250);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn sync_engine_honours_the_folder_limit_from_command_and_focus() {
+    async fn next_folder_event(
+        rx: &mut mpsc::UnboundedReceiver<CoreEvent>,
+        wanted: Option<(usize, bool)>,
+    ) -> (usize, bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let ev = tokio::time::timeout(left, rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no folder event matching {wanted:?}"))
+                .expect("engine alive");
+            if let CoreEvent::FolderItemsUpdated { items, truncated, .. } = ev {
+                let got = (items.len(), truncated);
+                if wanted.is_none_or(|w| w == got) {
+                    return got;
+                }
+            }
+        }
+    }
+
+    let (base_url, server) = spawn_sized_folder_graph().await;
+    let cfg = AppConfig {
+        graph_base_url: base_url.clone(),
+        ..Default::default()
+    };
+    let graph = build_graph_client(base_url);
+    let storage = Storage::open_in_memory().unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<CoreEvent>();
+    let ctrl = spawn_sync_engine(cfg, graph, storage, ev_tx);
+
+    let focus = |active_limit: Option<usize>| FocusTarget {
+        active_drive_id: Some("drv-250".into()),
+        active_parent_id: None,
+        active_site_id: None,
+        view_kind: FocusViewKind::Folder,
+        active_limit,
+    };
+    let sync_folder = |limit: Option<usize>| SyncCommand::SyncFolder {
+        drive_id: "drv-250".into(),
+        parent_id: None,
+        reuse_startup_root: false,
+        limit,
+    };
+
+    // A client that sends no limit gets one page, as before.
+    ctrl.set_focus(focus(None));
+    ctrl.request(sync_folder(None));
+    assert_eq!(next_folder_event(&mut ev_rx, None).await, (200, true));
+
+    // "Load more": the command lists with the raised limit.
+    ctrl.set_focus(focus(Some(400)));
+    ctrl.request(sync_folder(Some(400)));
+    next_folder_event(&mut ev_rx, Some((250, false))).await;
+
+    // From here every refresh, delta-driven ones included, must use the focus limit.
+    ctrl.request(SyncCommand::FocusGained);
+    assert_eq!(next_folder_event(&mut ev_rx, None).await, (250, false));
+    ctrl.request(SyncCommand::FocusGained);
+    assert_eq!(next_folder_event(&mut ev_rx, None).await, (250, false));
+
+    ctrl.request(SyncCommand::Shutdown);
     server.abort();
 }
 
@@ -345,7 +462,7 @@ async fn bootstrap_gap_and_multipage_delta_cursor_atomicity_and_idempotent_retry
     let mut rt = DriveSyncRuntime::default();
 
     // 1. Bootstrap with gap closure: edit during initial load must be reflected AND cursor persisted at t1
-    bootstrap_drive_with_delta(&graph, &storage, &tx, &mut rt, "drv-1", None)
+    bootstrap_drive_with_delta(&graph, &storage, &tx, &mut rt, "drv-1", None, FOLDER_PAGE_SIZE)
         .await
         .unwrap();
     let doc = storage.get_drive_item("drv-1", "item-doc").unwrap().unwrap();
@@ -358,7 +475,7 @@ async fn bootstrap_gap_and_multipage_delta_cursor_atomicity_and_idempotent_retry
     assert!(cursor_t1.delta_link.as_deref().unwrap().ends_with("token=t1"));
 
     // 2. Multi-page delta where Page 2 fails on attempt 1 -> cursor MUST NOT advance!
-    let err = sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None)
+    let err = sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None, FOLDER_PAGE_SIZE)
         .await
         .expect_err("page 2 transient 500 must surface error");
     assert!(format!("{err:#}").contains("500"));
@@ -372,7 +489,7 @@ async fn bootstrap_gap_and_multipage_delta_cursor_atomicity_and_idempotent_retry
     );
 
     // 3. Retry replays from t1 idempotently on same IDs and advances cursor to t2 after page 2 commits
-    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None)
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None, FOLDER_PAGE_SIZE)
         .await
         .unwrap();
     assert_eq!(st.page2_attempts.load(Ordering::SeqCst), 2);
@@ -546,7 +663,7 @@ async fn delta_410_gone_with_location_and_without_location_reconciles_root_delet
         .unwrap();
 
     // Case A: 410 Gone WITH Location header prunes root-old and installs root-fresh
-    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None)
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None, FOLDER_PAGE_SIZE)
         .await
         .unwrap();
     assert!(storage.get_drive_item("drv-1", "root-old").unwrap().is_none());
@@ -571,7 +688,7 @@ async fn delta_410_gone_with_location_and_without_location_reconciles_root_delet
         })
         .unwrap();
 
-    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", Some("fld-sub"))
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", Some("fld-sub"), FOLDER_PAGE_SIZE)
         .await
         .unwrap();
     assert!(
@@ -755,6 +872,7 @@ async fn direct_socketio_push_delta_fallback_reconnect_and_focus_gained() {
         active_parent_id: None,
         active_site_id: None,
         view_kind: FocusViewKind::Folder,
+        active_limit: None,
     });
 
     // Wait for Socket.IO connection + initial folder bootstrap

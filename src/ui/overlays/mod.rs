@@ -267,6 +267,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
             ("Enter", "Open folder / toggle site / inspect file"),
             ("Backspace / ←", "Navigate to parent folder"),
             ("S", "Cycle sort (Name / Modified / Size / Type)"),
+            ("L", "Load 200 more items when a folder is cut short"),
             ("Ctrl+B", "Toggle left sidebar"),
             ("Ctrl+R / F5", "Refresh current folder & sites"),
         ],

@@ -48,6 +48,7 @@ fn palette_commands() -> Vec<PaletteItem> {
         ("Toggle Inline Link URLs (href)", "h", Action::ToggleShowLinkUrls),
         ("Toggle Markdown/HTML Rendered Preview", "m", Action::TogglePreviewRenderMode),
         ("Cycle Sort Mode (Name / Modified / Size / Type)", "S", Action::CycleSortMode),
+        ("Load More Items in This Folder", "L", Action::LoadMoreItems),
         ("Search Files (FTS5 + Graph)", "/", Action::OpenSearch),
         ("Sync / Refresh All", "Ctrl+R / F5", Action::RefreshAll),
         ("Toggle Left Sidebar", "Ctrl+B", Action::ToggleNavRail),

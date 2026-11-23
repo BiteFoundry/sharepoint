@@ -20,7 +20,9 @@ use crate::models::{
     POLL_RETRY_SUMMARY,
 };
 use crate::storage::Storage;
-use crate::sync::{FocusTarget, FocusViewKind, SyncController};
+use crate::sync::{
+    FocusTarget, FocusViewKind, SyncController, FOLDER_PAGE_SIZE, MAX_FOLDER_ITEMS,
+};
 
 use super::hitmap::HitMap;
 use super::keymap::Keymap;
@@ -343,7 +345,9 @@ pub struct AppState {
     pub current_items: Vec<DriveItem>,
     /// True when the active folder holds more rows than `current_items`.
     pub current_items_truncated: bool,
-    /// Folder the truncation state belongs to; a different target resets it.
+    /// Rows asked for in the active folder; "load more" raises it one page at a time.
+    pub folder_item_limit: usize,
+    /// Folder the truncation state and the limit belong to; a different target resets both.
     listed_folder: Option<(String, Option<String>)>,
     pub sort_mode: SortMode,
     pub loading_folder: bool,
@@ -367,6 +371,17 @@ pub struct AppState {
     pub active_selected_id: Option<String>,
     /// Lazy localhost Axum HTML server (`0 MB` idle until `o` is pressed).
     pub html_server: NativeHtmlServer,
+}
+
+/// What a "load more" request did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadMoreOutcome {
+    /// The folder is fully loaded, or the view is not a folder.
+    NothingMore,
+    /// The folder already holds the most rows the TUI keeps.
+    AtMaximum(usize),
+    /// A listing with this row limit was requested.
+    Requested(usize),
 }
 
 impl AppState {
@@ -405,6 +420,7 @@ impl AppState {
             folder_stack: Vec::new(),
             current_items: Vec::new(),
             current_items_truncated: false,
+            folder_item_limit: FOLDER_PAGE_SIZE,
             listed_folder: None,
             sort_mode: SortMode::NameAsc,
             loading_folder: false,
@@ -478,10 +494,38 @@ impl AppState {
             return None;
         }
         let shown = self.current_items.len();
+        if self.folder_item_limit >= MAX_FOLDER_ITEMS {
+            return Some((
+                format!(" · first {shown} shown · rest: {} ls --limit", self.persona.bin_name()),
+                format!(" · {shown}+"),
+            ));
+        }
         Some((
-            format!(" · first {shown} shown, more on server"),
-            format!(" · {shown}+"),
+            format!(" · first {shown} shown · L loads more"),
+            format!(" · {shown}+ (L)"),
         ))
+    }
+
+    /// Limit to send to the sync engine: `None` while the folder is at the default page, so
+    /// the frames match what an older daemon expects.
+    fn requested_folder_limit(&self) -> Option<usize> {
+        (self.folder_item_limit != FOLDER_PAGE_SIZE).then_some(self.folder_item_limit)
+    }
+
+    /// Asks for one more page of the active folder when the last listing was cut short.
+    pub fn load_more_items(&mut self, ui: &mut UiState) -> LoadMoreOutcome {
+        if !self.current_items_truncated || self.active_folder_target().is_none() {
+            return LoadMoreOutcome::NothingMore;
+        }
+        if self.folder_item_limit >= MAX_FOLDER_ITEMS {
+            return LoadMoreOutcome::AtMaximum(MAX_FOLDER_ITEMS);
+        }
+        self.folder_item_limit = self
+            .folder_item_limit
+            .saturating_add(FOLDER_PAGE_SIZE)
+            .min(MAX_FOLDER_ITEMS);
+        self.load_active_folder(ui);
+        LoadMoreOutcome::Requested(self.folder_item_limit)
     }
 
     pub fn sorted_visible_items(&self) -> Vec<DriveItem> {
@@ -905,6 +949,7 @@ impl AppState {
         if target != self.listed_folder {
             self.listed_folder = target;
             self.current_items_truncated = false;
+            self.folder_item_limit = FOLDER_PAGE_SIZE;
         }
 
         match &self.active_source {
@@ -914,6 +959,7 @@ impl AppState {
                     active_parent_id: None,
                     active_site_id: None,
                     view_kind: FocusViewKind::Recent,
+                    active_limit: None,
                 });
                 tokio::spawn(async move {
                     match graph.fetch_virtual_list(VirtualListKind::Recent, 50).await {
@@ -943,6 +989,7 @@ impl AppState {
                     active_parent_id: None,
                     active_site_id: None,
                     view_kind: FocusViewKind::SharedWithMe,
+                    active_limit: None,
                 });
                 tokio::spawn(async move {
                     match graph.fetch_virtual_list(VirtualListKind::SharedWithMe, 50).await {
@@ -979,13 +1026,14 @@ impl AppState {
             active_parent_id: parent_id.clone(),
             active_site_id: None,
             view_kind: FocusViewKind::Folder,
+            active_limit: self.requested_folder_limit(),
         });
 
         // Show cached children immediately, then refresh from Graph
         if let Ok((cached, cache_truncated)) = self.storage.list_folder_children_page(
             &drive_id,
             parent_id.as_deref(),
-            crate::sync::FOLDER_PAGE_SIZE,
+            self.folder_item_limit,
         ) {
             if !cached.is_empty() {
                 self.current_items = cached;
@@ -1000,6 +1048,7 @@ impl AppState {
             drive_id,
             parent_id,
             reuse_startup_root,
+            limit: self.requested_folder_limit(),
         });
     }
 
@@ -1877,7 +1926,8 @@ mod tests {
         assert!(app.current_items_truncated);
         let (full, short) = app.truncation_hint().expect("hint for a truncated folder");
         assert!(full.contains("first 200 shown"), "{full}");
-        assert!(short.contains("200+"), "{short}");
+        assert!(full.contains("L loads more"), "{full}");
+        assert!(short.contains("200+ (L)"), "{short}");
 
         // Refreshing the same folder keeps the mark until the next listing answers.
         app.load_active_folder(&mut ui);
@@ -1932,6 +1982,94 @@ mod tests {
             &mut ui,
         );
         assert!(!app.current_items_truncated);
+    }
+
+    #[tokio::test]
+    async fn load_more_raises_limit_and_resets_on_navigation() {
+        let (mut app, mut ui, _ui_rx) = test_app_and_ui_with_base_url(None);
+        let (focus_tx, focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        app.sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let mut folder_requests = move || {
+            let mut limits = Vec::new();
+            while let Ok(cmd) = nudge_rx.try_recv() {
+                if let SyncCommand::SyncFolder { limit, .. } = cmd {
+                    limits.push(limit);
+                }
+            }
+            limits
+        };
+
+        app.active_source = ActiveViewSource::Drive {
+            drive_id: "d1".into(),
+            label: "Docs".into(),
+        };
+        app.navigate_to_active_folder(&mut ui);
+        assert_eq!(folder_requests(), vec![None], "the first page uses the default limit");
+        assert_eq!(focus_rx.borrow().active_limit, None);
+
+        // Nothing is cut short yet: the key does nothing.
+        dispatch(Action::LoadMoreItems, &mut app, &mut ui);
+        assert_eq!(app.folder_item_limit, FOLDER_PAGE_SIZE);
+        assert!(folder_requests().is_empty());
+
+        let page: Vec<DriveItem> = (0..200)
+            .map(|i| make_text_file("d1", &format!("it-{i}"), &format!("f-{i:03}.txt"), "text/plain"))
+            .collect();
+        let truncated_page = |items: Vec<DriveItem>| CoreEvent::FolderItemsUpdated {
+            drive_id: "d1".into(),
+            parent_id: None,
+            items,
+            truncated: true,
+        };
+        app.apply_core_event(truncated_page(page.clone()), &mut ui);
+
+        dispatch(Action::LoadMoreItems, &mut app, &mut ui);
+        assert_eq!(app.folder_item_limit, 400);
+        assert_eq!(folder_requests(), vec![Some(400)]);
+        assert_eq!(focus_rx.borrow().active_limit, Some(400));
+        assert_eq!(focus_rx.borrow().active_drive_id.as_deref(), Some("d1"));
+
+        // A refresh of the same folder keeps the raised limit.
+        app.load_active_folder(&mut ui);
+        assert_eq!(folder_requests(), vec![Some(400)]);
+
+        // Going somewhere else starts from one page again.
+        app.folder_stack.push(("sub".into(), "Sub".into()));
+        app.navigate_to_active_folder(&mut ui);
+        assert_eq!(app.folder_item_limit, FOLDER_PAGE_SIZE);
+        assert_eq!(folder_requests(), vec![None]);
+        assert_eq!(focus_rx.borrow().active_limit, None);
+
+        // At the ceiling the key asks for nothing and the note points at the CLI.
+        app.folder_stack.clear();
+        app.navigate_to_active_folder(&mut ui);
+        app.apply_core_event(truncated_page(page), &mut ui);
+        app.folder_item_limit = MAX_FOLDER_ITEMS - 100;
+        let _ = folder_requests();
+        dispatch(Action::LoadMoreItems, &mut app, &mut ui);
+        assert_eq!(app.folder_item_limit, MAX_FOLDER_ITEMS, "the limit stops at the ceiling");
+        assert_eq!(folder_requests(), vec![Some(MAX_FOLDER_ITEMS)]);
+        dispatch(Action::LoadMoreItems, &mut app, &mut ui);
+        assert_eq!(app.folder_item_limit, MAX_FOLDER_ITEMS);
+        assert!(folder_requests().is_empty());
+        let (full, _) = app.truncation_hint().unwrap();
+        assert!(full.contains("ls --limit"), "{full}");
+
+        // The key is bound where the list is, and is plain text inside a text overlay.
+        let keymap = Keymap::default_sharepoint();
+        let shift_l = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('L'),
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        for focus in [Focus::List, Focus::Inspector] {
+            assert_eq!(keymap.resolve(focus, shift_l), Some(Action::LoadMoreItems));
+        }
+        assert_eq!(keymap.resolve(Focus::Nav, shift_l), None);
+        assert_eq!(
+            crate::ui::event::key_to_action(shift_l, Focus::Overlay, &keymap, true),
+            Some(Action::Input('L'))
+        );
     }
 
     #[test]

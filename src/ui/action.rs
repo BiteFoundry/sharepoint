@@ -7,7 +7,8 @@ use crate::models::{MarkupKind, PinnedTarget};
 use crate::sync::SyncCommand;
 
 use super::app::{
-    copy_text_to_clipboard, ActiveViewSource, AppState, Focus, NarrowPane, UiMsg, UiState,
+    copy_text_to_clipboard, ActiveViewSource, AppState, Focus, LoadMoreOutcome, NarrowPane, UiMsg,
+    UiState,
 };
 use super::hitmap::{ButtonId, HitTarget};
 use super::nav_pane::{build_nav_rows, NavRow};
@@ -111,6 +112,8 @@ pub enum Action {
     SearchRemoteFiles(String),
     JumpToSearchHit(usize),
     RefreshAll,
+    /// Load one more page of a folder whose listing was cut short.
+    LoadMoreItems,
 
     // Overlay text editing & mouse
     Input(char),
@@ -977,6 +980,24 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             app.load_active_folder(ui);
             ui.toast("Refreshing SharePoint & OneDrive...", ToastKind::Info);
         }
+
+        Action::LoadMoreItems => match app.load_more_items(ui) {
+            LoadMoreOutcome::Requested(limit) => {
+                ui.toast(format!("Loading up to {limit} items..."), ToastKind::Info);
+            }
+            LoadMoreOutcome::AtMaximum(max) => {
+                ui.toast(
+                    format!(
+                        "The list holds at most {max} items. Use `{} ls --limit` for the rest.",
+                        app.persona.bin_name()
+                    ),
+                    ToastKind::Info,
+                );
+            }
+            LoadMoreOutcome::NothingMore => {
+                ui.toast("Every item in this folder is already loaded", ToastKind::Info);
+            }
+        },
 
         // Overlays & misc
         Action::OpenOverlay(kind) => match kind {

@@ -893,7 +893,14 @@ mod tests {
 
         app.folder_stack.clear();
         let wide = render_list_header(&app, &mut ui, 120);
-        assert!(wide.contains("first 200 shown, more on server"), "{wide}");
+        assert!(wide.contains("first 200 shown · L loads more"), "{wide}");
+
+        // At the row ceiling the note points at the CLI instead of the key.
+        app.folder_item_limit = crate::sync::MAX_FOLDER_ITEMS;
+        let capped = render_list_header(&app, &mut ui, 120);
+        assert!(capped.contains("ls --limit"), "{capped}");
+        assert!(!capped.contains("L loads more"), "{capped}");
+        app.folder_item_limit = crate::sync::FOLDER_PAGE_SIZE;
 
         // Too narrow for any note beside the path: the header still renders.
         let narrow = render_list_header(&app, &mut ui, 24);

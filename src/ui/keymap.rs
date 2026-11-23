@@ -69,6 +69,7 @@ impl Keymap {
             map.bind(Some(focus), Delete, M::NONE, Action::ConfirmDeleteSelected);
             map.bind(Some(focus), Char('s'), M::NONE, Action::CreateAndCopyShareLink);
             map.bind(Some(focus), Char('S'), M::SHIFT, Action::CycleSortMode);
+            map.bind(Some(focus), Char('L'), M::SHIFT, Action::LoadMoreItems);
             map.bind(Some(focus), Char('u'), M::NONE, Action::OpenLinkExtractor);
             map.bind(Some(focus), Char('h'), M::NONE, Action::ToggleShowLinkUrls);
             map.bind(Some(focus), Char('m'), M::NONE, Action::TogglePreviewRenderMode);

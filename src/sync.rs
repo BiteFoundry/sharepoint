@@ -298,6 +298,9 @@ pub struct FocusTarget {
     pub active_site_id: Option<String>,
     #[serde(default)]
     pub view_kind: FocusViewKind,
+    /// Rows the client wants for the active folder; `None` means `FOLDER_PAGE_SIZE`.
+    #[serde(default)]
+    pub active_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +313,9 @@ pub enum SyncCommand {
         drive_id: String,
         parent_id: Option<String>,
         reuse_startup_root: bool,
+        /// Rows to load; `None` means `FOLDER_PAGE_SIZE`.
+        #[serde(default)]
+        limit: Option<usize>,
     },
     SyncRecent,
     SyncShared,
@@ -392,6 +398,17 @@ fn now_rfc3339() -> String {
 /// Rows the TUI loads for one folder before the user asks for more.
 pub const FOLDER_PAGE_SIZE: usize = 200;
 
+/// Most rows the TUI will hold for one folder. Larger folders are a job for `ls --limit`.
+pub const MAX_FOLDER_ITEMS: usize = 5000;
+
+/// Row limit for a folder listing: the requested one within `1..=MAX_FOLDER_ITEMS`,
+/// or `FOLDER_PAGE_SIZE` when the peer did not send one.
+pub fn effective_folder_limit(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(FOLDER_PAGE_SIZE)
+        .clamp(1, MAX_FOLDER_ITEMS)
+}
+
 #[derive(Debug, Default)]
 pub struct DriveSyncRuntime {
     pub delta_unsupported_drives: HashSet<String>,
@@ -447,7 +464,7 @@ pub async fn bootstrap_sharepoint(graph: &GraphClient, storage: &Storage) -> Res
         let _ = storage.upsert_drives(std::slice::from_ref(&drive));
         let (dummy_tx, _) = mpsc::unbounded_channel();
         let mut rt = DriveSyncRuntime::default();
-        let _ = sync_drive_delta_once(graph, storage, &dummy_tx, &mut rt, &drive.id, None).await;
+        let _ = sync_drive_delta_once(graph, storage, &dummy_tx, &mut rt, &drive.id, None, FOLDER_PAGE_SIZE).await;
     }
 
     let followed_res = graph.list_followed_sites().await;
@@ -598,6 +615,7 @@ pub fn spawn_sync_engine(
                                         &mut rt,
                                         &drive_id,
                                         focus.active_parent_id.as_deref(),
+                                        effective_folder_limit(focus.active_limit),
                                     )
                                     .await
                                     {
@@ -620,6 +638,7 @@ pub fn spawn_sync_engine(
                                         &mut rt,
                                         &drive_id,
                                         focus.active_parent_id.as_deref(),
+                                        effective_folder_limit(focus.active_limit),
                                     )
                                     .await
                                     {
@@ -664,6 +683,7 @@ pub fn spawn_sync_engine(
                                                     &mut rt,
                                                     &did,
                                                     focus.active_parent_id.as_deref(),
+                                                    effective_folder_limit(focus.active_limit),
                                                 )
                                                 .await;
                                             }
@@ -696,6 +716,7 @@ pub fn spawn_sync_engine(
                                                 &mut rt,
                                                 &did,
                                                 focus.active_parent_id.as_deref(),
+                                                effective_folder_limit(focus.active_limit),
                                             )
                                             .await
                                             {
@@ -727,18 +748,19 @@ pub fn spawn_sync_engine(
                                     let _ = event_tx.send(CoreEvent::DrivesUpdated { site_id, drives });
                                 }
                             }
-                            SyncCommand::SyncFolder { drive_id, parent_id, reuse_startup_root } => {
+                            SyncCommand::SyncFolder { drive_id, parent_id, reuse_startup_root, limit } => {
+                                let limit = effective_folder_limit(limit);
                                 let initial_result = startup_root.as_ref()
                                     .filter(|(id, _)| reuse_startup_root && parent_id.is_none() && *id == drive_id)
                                     .map(|(_, loaded)| *loaded);
                                 let result = match initial_result {
                                     Some(true) => Ok(()),
-                                    Some(false) => sync_folder_once(&graph, &storage, &event_tx, &mut rt, &drive_id, None).await,
+                                    Some(false) => sync_folder_once(&graph, &storage, &event_tx, &mut rt, &drive_id, None, limit).await,
                                     None => match storage.get_sync_cursor(&drive_cursor_scope_key(&drive_id)) {
                                         Ok(None) if !rt.delta_unsupported_drives.contains(&drive_id) => {
-                                            bootstrap_drive_with_delta(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref()).await
+                                            bootstrap_drive_with_delta(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref(), limit).await
                                         }
-                                        Ok(_) => sync_folder_once(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref()).await,
+                                        Ok(_) => sync_folder_once(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref(), limit).await,
                                         Err(err) => Err(err),
                                     },
                                 };
@@ -789,6 +811,7 @@ pub fn spawn_sync_engine(
                                         &mut rt,
                                         &did,
                                         focus.active_parent_id.as_deref(),
+                                        effective_folder_limit(focus.active_limit),
                                     )
                                     .await
                                     {
@@ -1110,6 +1133,7 @@ pub async fn bootstrap_drive_with_delta(
     rt: &mut DriveSyncRuntime,
     drive_id: &str,
     active_parent_id: Option<&str>,
+    limit: usize,
 ) -> Result<()> {
     let seed_link = match graph.get_drive_delta_latest_link(drive_id).await {
         Ok(link) => Some(link),
@@ -1121,7 +1145,7 @@ pub async fn bootstrap_drive_with_delta(
     };
 
     let page = graph
-        .list_children_detailed(drive_id, active_parent_id, Some(FOLDER_PAGE_SIZE))
+        .list_children_detailed(drive_id, active_parent_id, Some(limit))
         .await?;
     rt.note_folder_listing(drive_id, active_parent_id, page.complete);
     let mut inferred_root_id = if active_parent_id.is_none() {
@@ -1149,11 +1173,12 @@ pub async fn bootstrap_drive_with_delta(
             rt,
             drive_id,
             active_parent_id,
+            limit,
             &seed_url,
             inferred_root_id,
         )
         .await?;
-        cached_folder_page(storage, rt, drive_id, active_parent_id, FOLDER_PAGE_SIZE)?
+        cached_folder_page(storage, rt, drive_id, active_parent_id, limit)?
     } else {
         (page.items, !page.complete)
     };
@@ -1177,9 +1202,10 @@ pub async fn sync_drive_delta_once(
     rt: &mut DriveSyncRuntime,
     drive_id: &str,
     active_parent_id: Option<&str>,
+    limit: usize,
 ) -> Result<()> {
     if rt.delta_unsupported_drives.contains(drive_id) {
-        sync_folder_once(graph, storage, event_tx, rt, drive_id, active_parent_id).await?;
+        sync_folder_once(graph, storage, event_tx, rt, drive_id, active_parent_id, limit).await?;
         rt.last_delta_at.insert(drive_id.to_string(), Instant::now());
         return Ok(());
     }
@@ -1191,8 +1217,16 @@ pub async fn sync_drive_delta_once(
         .and_then(|c| c.delta_link.clone())
         .filter(|s| !s.trim().is_empty())
     else {
-        return bootstrap_drive_with_delta(graph, storage, event_tx, rt, drive_id, active_parent_id)
-            .await;
+        return bootstrap_drive_with_delta(
+            graph,
+            storage,
+            event_tx,
+            rt,
+            drive_id,
+            active_parent_id,
+            limit,
+        )
+        .await;
     };
 
     let mut known_root_id = decode_root_id(existing_cursor.as_ref());
@@ -1206,6 +1240,7 @@ pub async fn sync_drive_delta_once(
         rt,
         drive_id,
         active_parent_id,
+        limit,
         &saved_delta_link,
         known_root_id,
     )
@@ -1230,6 +1265,7 @@ async fn pull_delta_pages_once(
     rt: &DriveSyncRuntime,
     drive_id: &str,
     active_parent_id: Option<&str>,
+    limit: usize,
     start_url: &str,
     mut known_root_id: Option<String>,
 ) -> Result<DeltaPullStatus> {
@@ -1302,7 +1338,7 @@ async fn pull_delta_pages_once(
     // Read the active folder after any changed pass so the old parent loses moved items.
     if changed_items {
         let (items, truncated) =
-            cached_folder_page(storage, rt, drive_id, active_parent_id, FOLDER_PAGE_SIZE)?;
+            cached_folder_page(storage, rt, drive_id, active_parent_id, limit)?;
         let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
             drive_id: drive_id.to_string(),
             parent_id: active_parent_id.map(str::to_string),
@@ -1322,6 +1358,7 @@ async fn pull_delta_pages_and_emit(
     rt: &mut DriveSyncRuntime,
     drive_id: &str,
     active_parent_id: Option<&str>,
+    limit: usize,
     start_url: &str,
     known_root_id: Option<String>,
 ) -> Result<()> {
@@ -1332,6 +1369,7 @@ async fn pull_delta_pages_and_emit(
         rt,
         drive_id,
         active_parent_id,
+        limit,
         start_url,
         known_root_id,
     )
@@ -1349,6 +1387,7 @@ async fn pull_delta_pages_and_emit(
                 rt,
                 drive_id,
                 active_parent_id,
+                limit,
                 location,
                 known_root_id,
             )
@@ -1365,6 +1404,7 @@ async fn resync_drive_after_410_or_overflow(
     rt: &mut DriveSyncRuntime,
     drive_id: &str,
     active_parent_id: Option<&str>,
+    limit: usize,
     location: Option<String>,
     mut known_root_id: Option<String>,
 ) -> Result<()> {
@@ -1419,7 +1459,7 @@ async fn resync_drive_after_410_or_overflow(
                 // The resync enumerated the whole drive, so the cache is now the full picture.
                 rt.incomplete_folders.retain(|(drive, _)| drive != drive_id);
                 let (items, truncated) =
-                    cached_folder_page(storage, rt, drive_id, active_parent_id, FOLDER_PAGE_SIZE)?;
+                    cached_folder_page(storage, rt, drive_id, active_parent_id, limit)?;
                 let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
                     drive_id: drive_id.to_string(),
                     parent_id: active_parent_id.map(str::to_string),
@@ -1436,8 +1476,10 @@ async fn resync_drive_after_410_or_overflow(
     let fresh_seed = graph.get_drive_delta_latest_link(drive_id).await?;
 
     // Always reconcile root on overflow/410 so deleted/added root items are never stale.
+    // The root is listed in full only when it is the folder on screen.
+    let root_limit = if active_parent_id.is_none() { limit } else { FOLDER_PAGE_SIZE };
     let root_page = graph
-        .list_children_detailed(drive_id, None, Some(FOLDER_PAGE_SIZE))
+        .list_children_detailed(drive_id, None, Some(root_limit))
         .await?;
     rt.note_folder_listing(drive_id, None, root_page.complete);
     if let Some(det_root) = root_page
@@ -1459,7 +1501,7 @@ async fn resync_drive_after_410_or_overflow(
 
     if let Some(pid) = active_parent_id {
         let active_page = graph
-            .list_children_detailed(drive_id, Some(pid), Some(FOLDER_PAGE_SIZE))
+            .list_children_detailed(drive_id, Some(pid), Some(limit))
             .await?;
         rt.note_folder_listing(drive_id, Some(pid), active_page.complete);
         if active_page.complete {
@@ -1490,6 +1532,7 @@ async fn resync_drive_after_410_or_overflow(
         rt,
         drive_id,
         active_parent_id,
+        limit,
         &fresh_seed,
         known_root_id,
     )
@@ -1519,7 +1562,7 @@ async fn sync_core_discovery(
             let root_load = if storage.get_sync_cursor(&drive_cursor_scope_key(&drive.id)).is_ok_and(|cursor| cursor.is_none())
                 && !rt.delta_unsupported_drives.contains(&drive.id)
             {
-                let loaded = bootstrap_drive_with_delta(graph, storage, event_tx, rt, &drive.id, None).await.is_ok();
+                let loaded = bootstrap_drive_with_delta(graph, storage, event_tx, rt, &drive.id, None, FOLDER_PAGE_SIZE).await.is_ok();
                 Some((drive.id, loaded))
             } else {
                 None
@@ -1616,9 +1659,10 @@ async fn sync_folder_once(
     rt: &mut DriveSyncRuntime,
     drive_id: &str,
     parent_id: Option<&str>,
+    limit: usize,
 ) -> Result<()> {
     let page = graph
-        .list_children_detailed(drive_id, parent_id, Some(FOLDER_PAGE_SIZE))
+        .list_children_detailed(drive_id, parent_id, Some(limit))
         .await?;
     rt.note_folder_listing(drive_id, parent_id, page.complete);
     if page.complete {
@@ -1681,6 +1725,30 @@ pub fn sort_drives_for_persona(drives: &mut [DriveInfo], onedrive_first: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_limit_fields_default_for_older_peers() {
+        // Frames from a peer built before the limit existed carry neither field.
+        let focus: FocusTarget = serde_json::from_value(serde_json::json!({
+            "active_drive_id": "d1",
+            "active_parent_id": null,
+            "active_site_id": null,
+            "view_kind": "folder"
+        }))
+        .expect("old focus frame parses");
+        assert_eq!(focus.active_limit, None);
+
+        let cmd: SyncCommand = serde_json::from_value(serde_json::json!({
+            "SyncFolder": { "drive_id": "d1", "parent_id": null, "reuse_startup_root": false }
+        }))
+        .expect("old SyncFolder frame parses");
+        assert!(matches!(cmd, SyncCommand::SyncFolder { limit: None, .. }));
+
+        assert_eq!(effective_folder_limit(None), FOLDER_PAGE_SIZE);
+        assert_eq!(effective_folder_limit(Some(400)), 400);
+        assert_eq!(effective_folder_limit(Some(0)), 1);
+        assert_eq!(effective_folder_limit(Some(usize::MAX)), MAX_FOLDER_ITEMS);
+    }
 
     #[test]
     fn test_backoff_and_idle_multiplier() {

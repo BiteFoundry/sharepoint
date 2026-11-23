@@ -1658,6 +1658,7 @@ mod tests {
             active_parent_id: Some("folder-1".to_string()),
             active_site_id: None,
             view_kind: crate::sync::FocusViewKind::Folder,
+            active_limit: None,
         });
         tokio::time::timeout(Duration::from_secs(1), harness.focus_rx.changed())
             .await
