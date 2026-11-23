@@ -748,7 +748,8 @@ impl GraphClient {
                         continue;
                     }
                     return Err(err)
-                        .with_context(|| format!("Graph HTTP request failed ({method} {url})"));
+                        .with_context(|| format!("Graph HTTP request failed ({method} {url})"))
+                        .map_err(crate::net::annotate_tls_error);
                 }
             };
             let status = resp.status();

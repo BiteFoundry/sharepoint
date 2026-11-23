@@ -1278,7 +1278,8 @@ impl GraphClient {
                 }
                 Ok(Err(err)) => {
                     let retryable = err.is_connect() || err.is_timeout();
-                    (anyhow::Error::new(err).context(what.to_string()), retryable)
+                    let err = anyhow::Error::new(err).context(what.to_string());
+                    (crate::net::annotate_tls_error(err), retryable)
                 }
                 Err(_elapsed) => (
                     anyhow!(

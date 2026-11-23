@@ -166,7 +166,7 @@ impl AuthManager {
     }
 
     pub fn from_tokens(config: AppConfig, tokens: StoredTokens) -> Self {
-        let http = build_auth_http_client().unwrap_or_else(|_| reqwest::Client::new());
+        let http = build_auth_http_client_or_default();
         Self {
             config,
             http,
@@ -184,7 +184,7 @@ impl AuthManager {
 
     #[cfg(test)]
     pub(crate) fn empty_for_test(config: AppConfig) -> Self {
-        let http = build_auth_http_client().unwrap_or_else(|_| reqwest::Client::new());
+        let http = build_auth_http_client_or_default();
         Self {
             config,
             http,
@@ -1230,7 +1230,8 @@ impl AuthManager {
             .form(&[("client_id", client_id), ("scope", scope.as_str())])
             .send()
             .await
-            .context("Failed to send Device Code request")?;
+            .context("Failed to send Device Code request")
+            .map_err(crate::net::annotate_tls_error)?;
 
         let status = res.status();
         let body_text = res.text().await.unwrap_or_default();
@@ -1273,7 +1274,8 @@ impl AuthManager {
                 ])
                 .send()
                 .await
-                .context("Failed to poll Device Code token")?;
+                .context("Failed to poll Device Code token")
+                .map_err(crate::net::annotate_tls_error)?;
 
             let poll_status = poll_res.status();
             let poll_text = poll_res.text().await.unwrap_or_default();
@@ -1428,7 +1430,8 @@ impl AuthManager {
         let res = req
             .send()
             .await
-            .context("Failed to send OAuth token request")?;
+            .context("Failed to send OAuth token request")
+            .map_err(crate::net::annotate_tls_error)?;
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -1635,11 +1638,20 @@ fn generate_random_b64(num_bytes: usize) -> String {
 }
 
 fn build_auth_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::net::apply_tls_roots(reqwest::Client::builder())?
         .user_agent(concat!("sharepoint-cli/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()
         .context("Failed to initialize HTTP client")
+}
+
+/// For constructors that cannot fail: a client is still returned, but the reason the
+/// configured one could not be built (such as a bad SHAREPOINT_EXTRA_CA_PEM) is shown.
+fn build_auth_http_client_or_default() -> reqwest::Client {
+    build_auth_http_client().unwrap_or_else(|err| {
+        eprintln!("warning: {err:#}");
+        reqwest::Client::new()
+    })
 }
 
 fn is_truthy_env(val: Option<&str>) -> bool {

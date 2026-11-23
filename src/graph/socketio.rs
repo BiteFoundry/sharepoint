@@ -15,7 +15,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async, connect_async_tls_with_config, tungstenite::Message, Connector,
+};
 use url::Url;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -228,12 +230,33 @@ pub async fn run_socketio_session(
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let target = build_socketio_ws_target(notification_url)?;
+    // Extra CAs (SHAREPOINT_EXTRA_CA_PEM and friends) need an explicit rustls config;
+    // without them tokio-tungstenite's own OS + bundled roots are used.
+    let tls_config = crate::net::websocket_tls_config()?;
+    let connect = async {
+        match tls_config {
+            Some(config) => {
+                connect_async_tls_with_config(
+                    target.ws_url.as_str(),
+                    None,
+                    false,
+                    Some(Connector::Rustls(config)),
+                )
+                .await
+            }
+            None => connect_async(target.ws_url.as_str()).await,
+        }
+    };
     let (mut ws, _) = tokio::select! {
         _ = shutdown_rx.changed() => return Ok(()),
-        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&target.ws_url)) => {
+        result = tokio::time::timeout(CONNECT_TIMEOUT, connect) => {
             result
                 .map_err(|_| anyhow!("Socket.IO WebSocket connect timed out"))?
-                .map_err(|_| anyhow!("Socket.IO WebSocket connect failed"))?
+                .map_err(|err| {
+                    crate::net::annotate_tls_error(
+                        anyhow::Error::new(err).context("Socket.IO WebSocket connect failed"),
+                    )
+                })?
         }
     };
 

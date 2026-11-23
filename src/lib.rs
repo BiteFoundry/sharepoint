@@ -6,6 +6,7 @@ pub mod graph;
 pub mod img_preview;
 pub mod mcp;
 pub mod models;
+pub mod net;
 pub mod resolver;
 pub mod serve;
 pub mod storage;

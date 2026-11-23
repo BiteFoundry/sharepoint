@@ -37,22 +37,24 @@ open = "5"
 pulldown-cmark = { version = "0.13", default-features = false }
 rand = "0.8"
 ratatui = "0.28"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream", "http2", "gzip"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
 scraper = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 unicode-width = "0.2"
 url = "2"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
+webpki-roots = "1"
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }

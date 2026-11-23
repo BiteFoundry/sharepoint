@@ -74,6 +74,23 @@ sharepoint whoami --json
 
 For persistent environment configuration, set `SHAREPOINT_CLIENT_ID` and `SHAREPOINT_TENANT_ID`. The OneDrive launcher uses the same credentials.
 
+### Corporate proxy / custom CA
+
+HTTPS connections trust the operating system's certificate store and the bundled Mozilla roots. If a TLS-inspecting proxy re-signs traffic with a root CA that is in neither, requests fail with `TLS certificate was issued by an unknown authority`. Install that root CA in the OS store, or point the tool at a PEM bundle:
+
+| Variable | Read by | If the file cannot be used |
+| --- | --- | --- |
+| `SHAREPOINT_EXTRA_CA_PEM` (alias `ONEDRIVE_EXTRA_CA_PEM`) | both commands | the command stops with an error naming the variable |
+| `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS` | both commands, as extra roots | a one-line warning on stderr; the command continues |
+
+Every variable that is set is loaded, in addition to the OS and bundled roots, for Graph, sign-in, downloads, self-update and the realtime connection. The proxy itself is taken from `HTTPS_PROXY` / `NO_PROXY`.
+
+```sh
+export HTTPS_PROXY=http://proxy.corp.example:8080
+export SHAREPOINT_EXTRA_CA_PEM=/etc/ssl/certs/corp-root-ca.pem
+sharepoint whoami --json
+```
+
 ---
 
 ## Keybindings Cheat Sheet

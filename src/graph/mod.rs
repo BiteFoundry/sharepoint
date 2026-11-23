@@ -49,13 +49,13 @@ const USER_AGENT: &str = concat!("sharepoint-cli/", env!("CARGO_PKG_VERSION"));
 /// pre-authenticated and redirect URLs) and `http_no_redirect` (the Graph `/content` hop).
 /// Neither has a whole-request timeout, which would cut off any transfer longer than it.
 fn build_download_clients(read_timeout: Duration) -> Result<(reqwest::Client, reqwest::Client)> {
-    let http_download = reqwest::Client::builder()
+    let http_download = crate::net::apply_tls_roots(reqwest::Client::builder())?
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(read_timeout)
         .tcp_nodelay(true)
         .build()?;
-    let http_no_redirect = reqwest::Client::builder()
+    let http_no_redirect = crate::net::apply_tls_roots(reqwest::Client::builder())?
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
@@ -80,7 +80,7 @@ pub struct GraphClient {
 
 impl GraphClient {
     pub fn new(config: AppConfig, auth: AuthManager) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let http = crate::net::apply_tls_roots(reqwest::Client::builder())?
             .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
