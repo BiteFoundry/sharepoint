@@ -34,7 +34,8 @@ use crate::{
         GraphClient,
     },
     models::{
-        CoreEvent, DriveInfo, SharePointSite, SyncCursor, VirtualListAvailability, VirtualListKind,
+        CoreEvent, DriveInfo, DriveItem, SharePointSite, SyncCursor, VirtualListAvailability,
+        VirtualListKind,
         POLL_RETRY_SUMMARY,
     },
     storage::Storage,
@@ -388,11 +389,55 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// Rows the TUI loads for one folder before the user asks for more.
+pub const FOLDER_PAGE_SIZE: usize = 200;
+
 #[derive(Debug, Default)]
 pub struct DriveSyncRuntime {
     pub delta_unsupported_drives: HashSet<String>,
     pub virtual_unavailable: HashSet<VirtualListKind>,
     pub last_delta_at: HashMap<String, Instant>,
+    /// Folders whose last Graph listing stopped at the row limit, as `(drive_id, parent_id)`.
+    /// The cache holds only part of such a folder, so counting cached rows cannot show
+    /// that the server has more.
+    pub incomplete_folders: HashSet<(String, Option<String>)>,
+}
+
+fn folder_key(drive_id: &str, parent_id: Option<&str>) -> (String, Option<String>) {
+    let parent = parent_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "root")
+        .map(str::to_string);
+    (drive_id.to_string(), parent)
+}
+
+impl DriveSyncRuntime {
+    fn note_folder_listing(&mut self, drive_id: &str, parent_id: Option<&str>, complete: bool) {
+        let key = folder_key(drive_id, parent_id);
+        if complete {
+            self.incomplete_folders.remove(&key);
+        } else {
+            self.incomplete_folders.insert(key);
+        }
+    }
+
+    fn folder_is_incomplete(&self, drive_id: &str, parent_id: Option<&str>) -> bool {
+        self.incomplete_folders.contains(&folder_key(drive_id, parent_id))
+    }
+}
+
+/// Reads the active folder from the cache for a `FolderItemsUpdated` event.
+/// The folder counts as truncated when the cache holds more than `limit` rows or when the
+/// last Graph listing of it stopped early.
+fn cached_folder_page(
+    storage: &Storage,
+    rt: &DriveSyncRuntime,
+    drive_id: &str,
+    parent_id: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<DriveItem>, bool)> {
+    let (items, cut) = storage.list_folder_children_page(drive_id, parent_id, limit)?;
+    Ok((items, cut || rt.folder_is_incomplete(drive_id, parent_id)))
 }
 
 /// Performs an initial bootstrap of `/me/drive`, `/me/followedSites`, `/sites?search=*`,
@@ -688,12 +733,12 @@ pub fn spawn_sync_engine(
                                     .map(|(_, loaded)| *loaded);
                                 let result = match initial_result {
                                     Some(true) => Ok(()),
-                                    Some(false) => sync_folder_once(&graph, &storage, &event_tx, &drive_id, None).await,
+                                    Some(false) => sync_folder_once(&graph, &storage, &event_tx, &mut rt, &drive_id, None).await,
                                     None => match storage.get_sync_cursor(&drive_cursor_scope_key(&drive_id)) {
                                         Ok(None) if !rt.delta_unsupported_drives.contains(&drive_id) => {
                                             bootstrap_drive_with_delta(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref()).await
                                         }
-                                        Ok(_) => sync_folder_once(&graph, &storage, &event_tx, &drive_id, parent_id.as_deref()).await,
+                                        Ok(_) => sync_folder_once(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref()).await,
                                         Err(err) => Err(err),
                                     },
                                 };
@@ -1076,8 +1121,9 @@ pub async fn bootstrap_drive_with_delta(
     };
 
     let page = graph
-        .list_children_detailed(drive_id, active_parent_id, Some(200))
+        .list_children_detailed(drive_id, active_parent_id, Some(FOLDER_PAGE_SIZE))
         .await?;
+    rt.note_folder_listing(drive_id, active_parent_id, page.complete);
     let mut inferred_root_id = if active_parent_id.is_none() {
         page.items
             .iter()
@@ -1095,7 +1141,7 @@ pub async fn bootstrap_drive_with_delta(
     } else {
         storage.upsert_drive_items(&page.items)?;
     }
-    let items = if let Some(seed_url) = seed_link {
+    let (items, truncated) = if let Some(seed_url) = seed_link {
         pull_delta_pages_and_emit(
             graph,
             storage,
@@ -1107,14 +1153,15 @@ pub async fn bootstrap_drive_with_delta(
             inferred_root_id,
         )
         .await?;
-        storage.list_folder_children(drive_id, active_parent_id, None, 200)?
+        cached_folder_page(storage, rt, drive_id, active_parent_id, FOLDER_PAGE_SIZE)?
     } else {
-        page.items
+        (page.items, !page.complete)
     };
     let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
         drive_id: drive_id.to_string(),
         parent_id: active_parent_id.map(str::to_string),
         items,
+        truncated,
     });
     rt.last_delta_at.insert(drive_id.to_string(), Instant::now());
     Ok(())
@@ -1132,7 +1179,7 @@ pub async fn sync_drive_delta_once(
     active_parent_id: Option<&str>,
 ) -> Result<()> {
     if rt.delta_unsupported_drives.contains(drive_id) {
-        sync_folder_once(graph, storage, event_tx, drive_id, active_parent_id).await?;
+        sync_folder_once(graph, storage, event_tx, rt, drive_id, active_parent_id).await?;
         rt.last_delta_at.insert(drive_id.to_string(), Instant::now());
         return Ok(());
     }
@@ -1180,6 +1227,7 @@ async fn pull_delta_pages_once(
     graph: &GraphClient,
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    rt: &DriveSyncRuntime,
     drive_id: &str,
     active_parent_id: Option<&str>,
     start_url: &str,
@@ -1253,11 +1301,13 @@ async fn pull_delta_pages_once(
     // A replay might find an item's new parent already saved by a previous partial pull.
     // Read the active folder after any changed pass so the old parent loses moved items.
     if changed_items {
-        let items = storage.list_folder_children(drive_id, active_parent_id, None, 200)?;
+        let (items, truncated) =
+            cached_folder_page(storage, rt, drive_id, active_parent_id, FOLDER_PAGE_SIZE)?;
         let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
             drive_id: drive_id.to_string(),
             parent_id: active_parent_id.map(str::to_string),
             items,
+            truncated,
         });
     }
 
@@ -1269,7 +1319,7 @@ async fn pull_delta_pages_and_emit(
     graph: &GraphClient,
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
-    _rt: &mut DriveSyncRuntime,
+    rt: &mut DriveSyncRuntime,
     drive_id: &str,
     active_parent_id: Option<&str>,
     start_url: &str,
@@ -1279,6 +1329,7 @@ async fn pull_delta_pages_and_emit(
         graph,
         storage,
         event_tx,
+        rt,
         drive_id,
         active_parent_id,
         start_url,
@@ -1295,6 +1346,7 @@ async fn pull_delta_pages_and_emit(
                 graph,
                 storage,
                 event_tx,
+                rt,
                 drive_id,
                 active_parent_id,
                 location,
@@ -1310,6 +1362,7 @@ async fn resync_drive_after_410_or_overflow(
     graph: &GraphClient,
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    rt: &mut DriveSyncRuntime,
     drive_id: &str,
     active_parent_id: Option<&str>,
     location: Option<String>,
@@ -1363,11 +1416,15 @@ async fn resync_drive_after_410_or_overflow(
                     known_root_id.as_deref(),
                     &cursor,
                 )?;
-                let items = storage.list_folder_children(drive_id, active_parent_id, None, 200)?;
+                // The resync enumerated the whole drive, so the cache is now the full picture.
+                rt.incomplete_folders.retain(|(drive, _)| drive != drive_id);
+                let (items, truncated) =
+                    cached_folder_page(storage, rt, drive_id, active_parent_id, FOLDER_PAGE_SIZE)?;
                 let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
                     drive_id: drive_id.to_string(),
                     parent_id: active_parent_id.map(str::to_string),
                     items,
+                    truncated,
                 });
                 return Ok(());
             }
@@ -1380,8 +1437,9 @@ async fn resync_drive_after_410_or_overflow(
 
     // Always reconcile root on overflow/410 so deleted/added root items are never stale.
     let root_page = graph
-        .list_children_detailed(drive_id, None, Some(200))
+        .list_children_detailed(drive_id, None, Some(FOLDER_PAGE_SIZE))
         .await?;
+    rt.note_folder_listing(drive_id, None, root_page.complete);
     if let Some(det_root) = root_page
         .items
         .iter()
@@ -1401,8 +1459,9 @@ async fn resync_drive_after_410_or_overflow(
 
     if let Some(pid) = active_parent_id {
         let active_page = graph
-            .list_children_detailed(drive_id, Some(pid), Some(200))
+            .list_children_detailed(drive_id, Some(pid), Some(FOLDER_PAGE_SIZE))
             .await?;
+        rt.note_folder_listing(drive_id, Some(pid), active_page.complete);
         if active_page.complete {
             storage.replace_folder_children(drive_id, Some(pid), &active_page.items)?;
         } else {
@@ -1412,12 +1471,14 @@ async fn resync_drive_after_410_or_overflow(
             drive_id: drive_id.to_string(),
             parent_id: Some(pid.to_string()),
             items: active_page.items,
+            truncated: !active_page.complete,
         });
     } else {
         let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
             drive_id: drive_id.to_string(),
             parent_id: None,
             items: root_page.items,
+            truncated: !root_page.complete,
         });
     }
 
@@ -1426,6 +1487,7 @@ async fn resync_drive_after_410_or_overflow(
         graph,
         storage,
         event_tx,
+        rt,
         drive_id,
         active_parent_id,
         &fresh_seed,
@@ -1551,10 +1613,14 @@ async fn sync_folder_once(
     graph: &GraphClient,
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    rt: &mut DriveSyncRuntime,
     drive_id: &str,
     parent_id: Option<&str>,
 ) -> Result<()> {
-    let page = graph.list_children_detailed(drive_id, parent_id, Some(200)).await?;
+    let page = graph
+        .list_children_detailed(drive_id, parent_id, Some(FOLDER_PAGE_SIZE))
+        .await?;
+    rt.note_folder_listing(drive_id, parent_id, page.complete);
     if page.complete {
         storage.replace_folder_children(drive_id, parent_id, &page.items)?;
     } else {
@@ -1564,6 +1630,7 @@ async fn sync_folder_once(
         drive_id: drive_id.to_string(),
         parent_id: parent_id.map(str::to_string),
         items: page.items,
+        truncated: !page.complete,
     });
     Ok(())
 }

@@ -62,6 +62,146 @@ fn build_graph_client(base_url: String) -> GraphClient {
     GraphClient::new(cfg, auth).unwrap()
 }
 
+/// Serves a drive root whose size is the number in the drive id (`drv-250` holds 250 files),
+/// 200 per page, plus a delta feed that changes `file-001` once at token `t1`.
+async fn spawn_sized_folder_graph() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}/v1.0");
+    let base = base_url.clone();
+
+    fn sized_item(drive_id: &str, i: usize) -> serde_json::Value {
+        json!({
+            "id": format!("item-{i:03}"),
+            "name": format!("file-{i:03}.txt"),
+            "size": 10,
+            "file": { "mimeType": "text/plain" },
+            "parentReference": { "driveId": drive_id, "id": "real-root-id", "path": "/drive/root:" }
+        })
+    }
+
+    let app = Router::new()
+        .route(
+            "/v1.0/drives/{drive_id}/root/children",
+            get({
+                let base = base.clone();
+                move |Path(drive_id): Path<String>, Query(q): Query<HashMap<String, String>>| {
+                    let base = base.clone();
+                    async move {
+                        let total: usize = drive_id.trim_start_matches("drv-").parse().unwrap();
+                        let page: usize = q.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+                        let first = (page - 1) * 200 + 1;
+                        let last = (page * 200).min(total);
+                        let value: Vec<serde_json::Value> =
+                            (first..=last).map(|i| sized_item(&drive_id, i)).collect();
+                        let mut body = json!({ "value": value });
+                        if last < total {
+                            body["@odata.nextLink"] = json!(format!(
+                                "{base}/drives/{drive_id}/root/children?page={}",
+                                page + 1
+                            ));
+                        }
+                        Json(body)
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/root/delta",
+            get({
+                let base = base.clone();
+                move |Path(drive_id): Path<String>, Query(q): Query<HashMap<String, String>>| {
+                    let base = base.clone();
+                    async move {
+                        let link = |t: &str| format!("{base}/drives/{drive_id}/root/delta?token={t}");
+                        match q.get("token").map(String::as_str).unwrap_or("") {
+                            "latest" => Json(json!({ "value": [], "@odata.deltaLink": link("t0") })),
+                            "t0" => Json(json!({ "value": [], "@odata.deltaLink": link("t1") })),
+                            "t1" => Json(json!({
+                                "value": [
+                                    { "id": "real-root-id", "root": {} },
+                                    {
+                                        "id": "item-001",
+                                        "name": "file-001.txt",
+                                        "size": 99,
+                                        "file": { "mimeType": "text/plain" },
+                                        "parentReference": { "driveId": drive_id, "id": "real-root-id" }
+                                    }
+                                ],
+                                "@odata.deltaLink": link("t2")
+                            })),
+                            _ => Json(json!({ "value": [], "@odata.deltaLink": link("t2") })),
+                        }
+                    }
+                }
+            }),
+        );
+
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (base_url, server)
+}
+
+fn last_folder_event(rx: &mut mpsc::UnboundedReceiver<CoreEvent>) -> (usize, bool) {
+    let mut last = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let CoreEvent::FolderItemsUpdated { items, truncated, .. } = ev {
+            last = Some((items.len(), truncated));
+        }
+    }
+    last.expect("a FolderItemsUpdated event")
+}
+
+#[tokio::test]
+async fn folder_items_updated_reports_truncation() {
+    let (base_url, server) = spawn_sized_folder_graph().await;
+    let graph = build_graph_client(base_url);
+    let storage = Storage::open_in_memory().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<CoreEvent>();
+    let mut rt = DriveSyncRuntime::default();
+
+    // 250 files on the server: the first load shows 200 and says there are more.
+    bootstrap_drive_with_delta(&graph, &storage, &tx, &mut rt, "drv-250", None)
+        .await
+        .unwrap();
+    assert_eq!(last_folder_event(&mut rx), (200, true));
+    // The cache holds exactly one page, so the row count alone would say "complete".
+    assert_eq!(storage.list_folder_children("drv-250", None, None, 1000).unwrap().len(), 200);
+
+    // A delta-driven refresh reads the cache and must keep the mark.
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-250", None)
+        .await
+        .unwrap();
+    assert_eq!(last_folder_event(&mut rx), (200, true));
+    assert_eq!(storage.get_drive_item("drv-250", "item-001").unwrap().unwrap().size, 99);
+
+    // A truncated listing never prunes: a cached row beyond the first page survives it.
+    storage
+        .upsert_drive_items(&[sharepoint_cli::models::DriveItem {
+            id: "item-240".into(),
+            drive_id: "drv-250".into(),
+            name: "file-240.txt".into(),
+            parent_id: Some("real-root-id".into()),
+            ..Default::default()
+        }])
+        .unwrap();
+    rt.delta_unsupported_drives.insert("drv-250".to_string());
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-250", None)
+        .await
+        .unwrap();
+    assert_eq!(last_folder_event(&mut rx), (200, true));
+    assert!(storage.get_drive_item("drv-250", "item-240").unwrap().is_some());
+
+    // Exactly 200 files: everything is shown and nothing is marked.
+    bootstrap_drive_with_delta(&graph, &storage, &tx, &mut rt, "drv-200", None)
+        .await
+        .unwrap();
+    assert_eq!(last_folder_event(&mut rx), (200, false));
+
+    server.abort();
+}
+
 #[tokio::test]
 async fn bootstrap_gap_and_multipage_delta_cursor_atomicity_and_idempotent_retry() {
     #[derive(Clone)]

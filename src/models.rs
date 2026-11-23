@@ -486,6 +486,10 @@ pub enum CoreEvent {
         drive_id: String,
         parent_id: Option<String>,
         items: Vec<DriveItem>,
+        /// True when the folder holds more rows than `items` carries.
+        /// Defaults to false so frames from a daemon without this field still parse.
+        #[serde(default)]
+        truncated: bool,
     },
     RecentItemsUpdated(Vec<DriveItem>),
     SharedItemsUpdated(Vec<DriveItem>),
@@ -535,6 +539,32 @@ pub fn format_human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_event_folder_items_updated_deserializes_without_truncated() {
+        // A daemon built before the field existed sends the event without it.
+        let old_frame = serde_json::json!({
+            "event": "folder_items_updated",
+            "data": { "drive_id": "d1", "parent_id": null, "items": [] }
+        });
+        let event: CoreEvent = serde_json::from_value(old_frame).expect("old frame parses");
+        match event {
+            CoreEvent::FolderItemsUpdated { drive_id, truncated, .. } => {
+                assert_eq!(drive_id, "d1");
+                assert!(!truncated);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let new_frame = serde_json::to_value(CoreEvent::FolderItemsUpdated {
+            drive_id: "d1".into(),
+            parent_id: None,
+            items: Vec::new(),
+            truncated: true,
+        })
+        .unwrap();
+        assert_eq!(new_frame["data"]["truncated"], serde_json::json!(true));
+    }
 
     #[test]
     fn test_drive_item_helpers_and_badges() {

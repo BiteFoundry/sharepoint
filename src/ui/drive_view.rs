@@ -58,12 +58,17 @@ pub fn draw_list(
         + if show_refresh { refresh_w + 1 } else { 0 }
         + 1;
     let bc_budget = (area.width as usize).saturating_sub(pills_total as usize + 2);
-    let bc_text = format!(" {}", truncate_width(&breadcrumb, bc_budget));
-    let bc_w = unicode_width::UnicodeWidthStr::width(bc_text.as_str()) as u16;
+    // A truncated folder says so in the header. The note shares the breadcrumb budget, so
+    // the pills stay where they are; the path gives way before the note does.
+    let hint = truncation_hint_for_budget(app, &breadcrumb, bc_budget);
+    let hint_w = unicode_width::UnicodeWidthStr::width(hint.as_str());
+    let bc_text = format!(" {}", truncate_width(&breadcrumb, bc_budget.saturating_sub(hint_w)));
+    let bc_w = (unicode_width::UnicodeWidthStr::width(bc_text.as_str()) + hint_w) as u16;
     let pad = area.width.saturating_sub(bc_w + pills_total) as usize;
 
     let mut header_spans = vec![
         Span::styled(bc_text, theme.title(focused)),
+        Span::styled(hint, theme.muted_style()),
         Span::styled(" ".repeat(pad), header_bg),
         Span::styled(sort_label.clone(), theme.muted_style()),
     ];
@@ -737,6 +742,26 @@ pub fn draw_inspector(
     );
 }
 
+/// Narrowest breadcrumb worth keeping beside the short truncation note.
+const MIN_BREADCRUMB_WITH_HINT: usize = 8;
+
+/// Picks the truncation note that fits `budget` columns next to the breadcrumb: the full
+/// text when both fit, the short one when the path has to shrink, nothing when even that
+/// would leave no room for the path. The result is never wider than `budget`.
+fn truncation_hint_for_budget(app: &AppState, breadcrumb: &str, budget: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let Some((full, short)) = app.truncation_hint() else {
+        return String::new();
+    };
+    if breadcrumb.width() + full.width() <= budget {
+        full
+    } else if short.width() + MIN_BREADCRUMB_WITH_HINT <= budget {
+        short
+    } else {
+        String::new()
+    }
+}
+
 fn meta_line(label: &str, value: &str, theme: &crate::ui::theme::Theme) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!(" {:<10} ", label), theme.muted_style()),
@@ -809,6 +834,70 @@ mod tests {
             lines.push(row);
         }
         lines.join("\n")
+    }
+
+    fn render_list_header(app: &AppState, ui: &mut UiState, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 12)).expect("terminal");
+        let mut hitmap = HitMap::new();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_list(frame, area, app, ui, &mut hitmap);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        (0..width).map(|x| buf[(x, 0)].symbol()).collect()
+    }
+
+    /// Screen column of `needle` in a rendered row of single-width cells.
+    fn column_of(row: &str, needle: &str) -> Option<usize> {
+        row.find(needle).map(|byte| row[..byte].chars().count())
+    }
+
+    #[tokio::test]
+    async fn drive_view_shows_truncation_suffix() {
+        let (mut app, mut ui, _ui_rx) = build_test_app_and_ui();
+        app.active_source = crate::ui::app::ActiveViewSource::Drive {
+            drive_id: "d1".into(),
+            label: "Docs".into(),
+        };
+        app.current_items = (0..200)
+            .map(|i| DriveItem {
+                id: format!("it-{i}"),
+                drive_id: "d1".into(),
+                name: format!("file-{i:03}.txt"),
+                ..Default::default()
+            })
+            .collect();
+
+        for width in [60u16, 80, 120] {
+            app.folder_stack.clear();
+            app.current_items_truncated = false;
+            let plain = render_list_header(&app, &mut ui, width);
+            assert!(!plain.contains("200"), "width {width}: {plain}");
+            let pills_at = column_of(&plain, "[Sort:").expect("sort pill");
+
+            app.current_items_truncated = true;
+            let marked = render_list_header(&app, &mut ui, width);
+            assert!(marked.contains(" · "), "width {width}: {marked}");
+            assert!(marked.contains("200"), "width {width}: {marked}");
+            assert!(marked.contains("SharePoint"), "width {width}: {marked}");
+            assert_eq!(column_of(&marked, "[Sort:"), Some(pills_at), "width {width}: {marked}");
+
+            // A path that fills the header gives way to the short note; the pills stay put.
+            app.folder_stack = vec![("f1".into(), "A folder name long enough to fill any header".repeat(3))];
+            let deep = render_list_header(&app, &mut ui, width);
+            assert!(deep.contains(" · 200+"), "width {width}: {deep}");
+            assert_eq!(column_of(&deep, "[Sort:"), Some(pills_at), "width {width}: {deep}");
+        }
+
+        app.folder_stack.clear();
+        let wide = render_list_header(&app, &mut ui, 120);
+        assert!(wide.contains("first 200 shown, more on server"), "{wide}");
+
+        // Too narrow for any note beside the path: the header still renders.
+        let narrow = render_list_header(&app, &mut ui, 24);
+        assert!(narrow.contains("[Sort:"), "{narrow}");
     }
 
     #[tokio::test]

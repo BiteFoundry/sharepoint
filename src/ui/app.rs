@@ -341,6 +341,10 @@ pub struct AppState {
     /// Stack of `(item_id, display_name)` inside the currently selected drive.
     pub folder_stack: Vec<(String, String)>,
     pub current_items: Vec<DriveItem>,
+    /// True when the active folder holds more rows than `current_items`.
+    pub current_items_truncated: bool,
+    /// Folder the truncation state belongs to; a different target resets it.
+    listed_folder: Option<(String, Option<String>)>,
     pub sort_mode: SortMode,
     pub loading_folder: bool,
     pub sync_busy: bool,
@@ -400,6 +404,8 @@ impl AppState {
             shared_status: None,
             folder_stack: Vec::new(),
             current_items: Vec::new(),
+            current_items_truncated: false,
+            listed_folder: None,
             sort_mode: SortMode::NameAsc,
             loading_folder: false,
             sync_busy: false,
@@ -463,6 +469,19 @@ impl AppState {
             let trail: Vec<&str> = self.folder_stack.iter().map(|(_, n)| n.as_str()).collect();
             format!("{root} > {}", trail.join(" > "))
         }
+    }
+
+    /// Header note for a folder that holds more rows than are loaded, as `(full, short)`.
+    /// The short form is for a header too narrow for the full one.
+    pub fn truncation_hint(&self) -> Option<(String, String)> {
+        if !self.current_items_truncated || self.active_folder_target().is_none() {
+            return None;
+        }
+        let shown = self.current_items.len();
+        Some((
+            format!(" · first {shown} shown, more on server"),
+            format!(" · {shown}+"),
+        ))
     }
 
     pub fn sorted_visible_items(&self) -> Vec<DriveItem> {
@@ -880,6 +899,14 @@ impl AppState {
         let storage = self.storage.clone();
         self.loading_folder = true;
 
+        // Truncation belongs to one folder. Moving to another folder or to a virtual view
+        // starts clean; a refresh of the same folder keeps what the last listing said.
+        let target = self.active_folder_target();
+        if target != self.listed_folder {
+            self.listed_folder = target;
+            self.current_items_truncated = false;
+        }
+
         match &self.active_source {
             ActiveViewSource::Recent => {
                 self.sync_ctrl.set_focus(FocusTarget {
@@ -955,12 +982,16 @@ impl AppState {
         });
 
         // Show cached children immediately, then refresh from Graph
-        if let Ok(cached) =
-            self.storage
-                .list_folder_children(&drive_id, parent_id.as_deref(), None, 200)
-        {
+        if let Ok((cached, cache_truncated)) = self.storage.list_folder_children_page(
+            &drive_id,
+            parent_id.as_deref(),
+            crate::sync::FOLDER_PAGE_SIZE,
+        ) {
             if !cached.is_empty() {
                 self.current_items = cached;
+                // The cache can prove there is more, never that there is not: a folder whose
+                // last listing stopped early has exactly one page cached.
+                self.current_items_truncated |= cache_truncated;
                 self.reconcile_selection_after_items_update(ui);
             }
         }
@@ -1257,9 +1288,11 @@ impl AppState {
                 drive_id,
                 parent_id,
                 items,
+                truncated,
             } => {
                 if self.active_folder_target() == Some((drive_id, parent_id)) {
                     self.current_items = items;
+                    self.current_items_truncated = truncated;
                     self.loading_folder = false;
                     self.reconcile_selection_after_items_update(ui);
                     self.refresh_open_overlays_for_items(ui);
@@ -1818,6 +1851,89 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn folder_truncation_follows_events_and_resets_on_navigation() {
+        let (mut app, mut ui, _ui_rx) = test_app_and_ui_with_base_url(None);
+        app.active_source = ActiveViewSource::Drive {
+            drive_id: "d1".into(),
+            label: "Docs".into(),
+        };
+        app.navigate_to_active_folder(&mut ui);
+        assert!(!app.current_items_truncated);
+        assert!(app.truncation_hint().is_none());
+
+        let page: Vec<DriveItem> = (0..200)
+            .map(|i| make_text_file("d1", &format!("it-{i}"), &format!("f-{i:03}.txt"), "text/plain"))
+            .collect();
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "d1".into(),
+                parent_id: None,
+                items: page.clone(),
+                truncated: true,
+            },
+            &mut ui,
+        );
+        assert!(app.current_items_truncated);
+        let (full, short) = app.truncation_hint().expect("hint for a truncated folder");
+        assert!(full.contains("first 200 shown"), "{full}");
+        assert!(short.contains("200+"), "{short}");
+
+        // Refreshing the same folder keeps the mark until the next listing answers.
+        app.load_active_folder(&mut ui);
+        assert!(app.current_items_truncated);
+
+        // An event for another folder leaves it alone.
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "d1".into(),
+                parent_id: Some("elsewhere".into()),
+                items: Vec::new(),
+                truncated: false,
+            },
+            &mut ui,
+        );
+        assert!(app.current_items_truncated);
+
+        // Entering a subfolder starts clean, and so does a virtual view.
+        app.folder_stack.push(("sub".into(), "Sub".into()));
+        app.navigate_to_active_folder(&mut ui);
+        assert!(!app.current_items_truncated);
+
+        app.folder_stack.clear();
+        app.navigate_to_active_folder(&mut ui);
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "d1".into(),
+                parent_id: None,
+                items: page,
+                truncated: true,
+            },
+            &mut ui,
+        );
+        assert!(app.current_items_truncated);
+        dispatch(Action::OpenRecent, &mut app, &mut ui);
+        assert!(!app.current_items_truncated);
+        assert!(app.truncation_hint().is_none());
+
+        // A complete listing clears the mark.
+        app.active_source = ActiveViewSource::Drive {
+            drive_id: "d1".into(),
+            label: "Docs".into(),
+        };
+        app.navigate_to_active_folder(&mut ui);
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "d1".into(),
+                parent_id: None,
+                items: Vec::new(),
+                truncated: false,
+            },
+            &mut ui,
+        );
+        assert!(!app.current_items_truncated);
+    }
+
     #[test]
     fn raw_image_cache_evicts_oldest_within_both_limits() {
         let (mut app, _, _) = test_app_and_ui_with_base_url(None);
@@ -2022,6 +2138,7 @@ mod tests {
                 drive_id: "drv-2".into(),
                 parent_id: None,
                 items: vec![doc_d2.clone()],
+                truncated: false,
             },
             &mut ui,
         );
@@ -2113,6 +2230,7 @@ mod tests {
                 drive_id: "drv-2".into(),
                 parent_id: None,
                 items: vec![make_folder("drv-2", "fld-only", "OnlyFolder")],
+                truncated: false,
             },
             &mut ui,
         );
@@ -2517,6 +2635,7 @@ mod tests {
                 drive_id: "drv-1".into(),
                 parent_id: None,
                 items: vec![doc_v2.clone(), html_v2.clone(), img_v2.clone()],
+                truncated: false,
             },
             &mut ui,
         );
@@ -2583,6 +2702,7 @@ mod tests {
                 drive_id: "drv-1".into(),
                 parent_id: None,
                 items: vec![doc_v2.clone(), html_v2.clone(), img_v2.clone()],
+                truncated: false,
             },
             &mut ui,
         );
@@ -2644,6 +2764,7 @@ mod tests {
                 drive_id: "drv-1".into(),
                 parent_id: None,
                 items: vec![doc_v2.clone(), html_v2.clone(), img_v2.clone()],
+                truncated: false,
             },
             &mut ui,
         );
@@ -2783,6 +2904,7 @@ mod tests {
                     name: "sp.md".into(),
                     ..Default::default()
                 }],
+                truncated: false,
             },
             &mut ui,
         );
@@ -2822,6 +2944,7 @@ mod tests {
                     name: "a.md".into(),
                     ..Default::default()
                 }],
+                truncated: false,
             },
             &mut ui,
         );
@@ -2880,6 +3003,7 @@ mod tests {
                     name: "intruder.txt".into(),
                     ..Default::default()
                 }],
+                truncated: false,
             },
             &mut ui,
         );
@@ -2955,6 +3079,7 @@ mod tests {
                     drive_id: "drv-1".into(),
                     parent_id: None,
                     items: vec![item_v1.clone()],
+                    truncated: false,
                 },
                 &mut ui,
             );
@@ -2979,6 +3104,7 @@ mod tests {
                 drive_id: "drv-1".into(),
                 parent_id: None,
                 items: vec![item_renamed.clone()],
+                truncated: false,
             },
             &mut ui,
         );

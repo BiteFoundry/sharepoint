@@ -267,6 +267,20 @@ impl Storage {
         drives::list_folder_children(&conn, drive_id, parent_id, parent_path, limit)
     }
 
+    /// Reads up to `limit` cached children and reports whether the cache holds more than that.
+    pub fn list_folder_children_page(
+        &self,
+        drive_id: &str,
+        parent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<DriveItem>, bool)> {
+        let mut items =
+            self.list_folder_children(drive_id, parent_id, None, limit.saturating_add(1))?;
+        let truncated = items.len() > limit;
+        items.truncate(limit);
+        Ok((items, truncated))
+    }
+
     pub fn get_drive_item(&self, drive_id: &str, item_id: &str) -> Result<Option<DriveItem>> {
         let conn = self.read_conn()?;
         drives::get_drive_item(&conn, drive_id, item_id)
