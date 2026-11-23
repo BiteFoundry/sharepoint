@@ -45,8 +45,18 @@ const IDLE_THRESHOLD_SECS: u64 = 120;
 const DEEP_IDLE_THRESHOLD_SECS: u64 = 600;
 const AUTH_EXPIRY_PAUSE_SECS: u64 = 30;
 const MAX_ERROR_BACKOFF_MS: u64 = 300_000;
+/// Delta pages applied in one pull. A longer change feed is not abandoned: the pull
+/// stores the next page's link as the cursor and the following pull continues there.
 const MAX_DELTA_PAGES: usize = 20;
-const MAX_RESYNC_PAGES: usize = 20;
+/// Pulls one sync call may chain while the drive is still behind, so a long backlog is
+/// worked off quickly without holding the engine on one drive.
+const MAX_DELTA_PASSES_PER_SYNC: usize = 3;
+/// Pages a 410 resync collects in memory before it replaces the drive's cached rows.
+const MAX_RESYNC_PAGES: usize = 200;
+/// Folders above the active one that a partial resync re-lists.
+const MAX_RESYNC_ANCESTORS: usize = 16;
+/// Shown after a resync that could only re-list the folders on the way to the open one.
+pub const PARTIAL_RESYNC_SUMMARY: &str = "Resynced the open folder; other folders refresh when opened";
 const NOTIFICATION_COALESCE_MS: u64 = 80;
 const SOCKET_SAFETY_DELTA_SECS: u64 = 120;
 const SOCKET_RECONNECT_BASE_SECS: u64 = 2;
@@ -429,6 +439,19 @@ fn folder_key(drive_id: &str, parent_id: Option<&str>) -> (String, Option<String
 }
 
 impl DriveSyncRuntime {
+    /// Records where a delta pull left the drive. A drive that is still behind loses its
+    /// timestamp, so the next tick continues at once instead of waiting out the interval.
+    fn note_delta_progress(&mut self, drive_id: &str, progress: DeltaProgress) {
+        match progress {
+            DeltaProgress::CaughtUp => {
+                self.last_delta_at.insert(drive_id.to_string(), Instant::now());
+            }
+            DeltaProgress::MorePending => {
+                self.last_delta_at.remove(drive_id);
+            }
+        }
+    }
+
     fn note_folder_listing(&mut self, drive_id: &str, parent_id: Option<&str>, complete: bool) {
         let key = folder_key(drive_id, parent_id);
         if complete {
@@ -1165,8 +1188,8 @@ pub async fn bootstrap_drive_with_delta(
     } else {
         storage.upsert_drive_items(&page.items)?;
     }
-    let (items, truncated) = if let Some(seed_url) = seed_link {
-        pull_delta_pages_and_emit(
+    let (items, truncated, progress) = if let Some(seed_url) = seed_link {
+        let progress = pull_delta_pages_and_emit(
             graph,
             storage,
             event_tx,
@@ -1178,9 +1201,11 @@ pub async fn bootstrap_drive_with_delta(
             inferred_root_id,
         )
         .await?;
-        cached_folder_page(storage, rt, drive_id, active_parent_id, limit)?
+        let (items, truncated) =
+            cached_folder_page(storage, rt, drive_id, active_parent_id, limit)?;
+        (items, truncated, progress)
     } else {
-        (page.items, !page.complete)
+        (page.items, !page.complete, DeltaProgress::CaughtUp)
     };
     let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
         drive_id: drive_id.to_string(),
@@ -1188,7 +1213,7 @@ pub async fn bootstrap_drive_with_delta(
         items,
         truncated,
     });
-    rt.last_delta_at.insert(drive_id.to_string(), Instant::now());
+    rt.note_delta_progress(drive_id, progress);
     Ok(())
 }
 
@@ -1211,13 +1236,30 @@ pub async fn sync_drive_delta_once(
     }
 
     let scope_key = drive_cursor_scope_key(drive_id);
-    let existing_cursor = storage.get_sync_cursor(&scope_key)?;
-    let Some(saved_delta_link) = existing_cursor
-        .as_ref()
-        .and_then(|c| c.delta_link.clone())
-        .filter(|s| !s.trim().is_empty())
-    else {
-        return bootstrap_drive_with_delta(
+    for _ in 0..MAX_DELTA_PASSES_PER_SYNC {
+        let existing_cursor = storage.get_sync_cursor(&scope_key)?;
+        let Some(saved_delta_link) = existing_cursor
+            .as_ref()
+            .and_then(|c| c.delta_link.clone())
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return bootstrap_drive_with_delta(
+                graph,
+                storage,
+                event_tx,
+                rt,
+                drive_id,
+                active_parent_id,
+                limit,
+            )
+            .await;
+        };
+
+        let mut known_root_id = decode_root_id(existing_cursor.as_ref());
+        if known_root_id.is_none() {
+            known_root_id = graph.get_item_by_path(drive_id, "").await.ok().map(|root| root.id);
+        }
+        let progress = pull_delta_pages_and_emit(
             graph,
             storage,
             event_tx,
@@ -1225,32 +1267,32 @@ pub async fn sync_drive_delta_once(
             drive_id,
             active_parent_id,
             limit,
+            &saved_delta_link,
+            known_root_id,
         )
-        .await;
-    };
-
-    let mut known_root_id = decode_root_id(existing_cursor.as_ref());
-    if known_root_id.is_none() {
-        known_root_id = graph.get_item_by_path(drive_id, "").await.ok().map(|root| root.id);
+        .await?;
+        rt.note_delta_progress(drive_id, progress);
+        if progress == DeltaProgress::CaughtUp {
+            break;
+        }
+        // Still behind: the cursor now points at the next unread page, so go again.
     }
-    pull_delta_pages_and_emit(
-        graph,
-        storage,
-        event_tx,
-        rt,
-        drive_id,
-        active_parent_id,
-        limit,
-        &saved_delta_link,
-        known_root_id,
-    )
-    .await?;
-    rt.last_delta_at.insert(drive_id.to_string(), Instant::now());
     Ok(())
+}
+
+/// Where a delta pull left the drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeltaProgress {
+    /// The change feed was read to its end; the cursor is a `deltaLink`.
+    CaughtUp,
+    /// The page budget ran out first; the cursor is the `nextLink` to continue from.
+    MorePending,
 }
 
 enum DeltaPullStatus {
     Completed,
+    /// The page budget ran out; the cursor was saved at the next unread page.
+    MorePending,
     ResyncRequired {
         location: Option<String>,
         known_root_id: Option<String>,
@@ -1273,14 +1315,9 @@ async fn pull_delta_pages_once(
     let mut next_url = start_url.to_string();
     let mut changed_items = false;
     let mut pages_read = 0usize;
+    let mut more_pending = false;
 
     loop {
-        if pages_read >= MAX_DELTA_PAGES {
-            return Ok(DeltaPullStatus::ResyncRequired {
-                location: None,
-                known_root_id,
-            });
-        }
         pages_read += 1;
 
         match graph.get_drive_delta_page(drive_id, &next_url).await? {
@@ -1299,20 +1336,25 @@ async fn pull_delta_pages_once(
                     }
                 }
 
-                let is_final_page = page.next_link.is_none();
-                let commit_cursor = if is_final_page {
-                    let link = page.delta_link.as_ref().ok_or_else(|| {
+                // The cursor moves only with a page it belongs to, in that page's
+                // transaction: to the deltaLink on the last page, or, when the budget for
+                // this pull is spent, to the nextLink so the following pull continues
+                // there. Pages in between leave it alone, so a failure replays from the
+                // last saved position.
+                let budget_spent = pages_read >= MAX_DELTA_PAGES;
+                let resume_link = match &page.next_link {
+                    None => Some(page.delta_link.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("Graph final delta page returned no @odata.deltaLink")
-                    })?;
-                    Some(SyncCursor {
-                        scope_key: scope_key.clone(),
-                        delta_link: Some(link.clone()),
-                        history_next_link: encode_root_id(known_root_id.as_deref()),
-                        last_synced_at: now_rfc3339(),
-                    })
-                } else {
-                    None
+                    })?),
+                    Some(next) if budget_spent => Some(next),
+                    Some(_) => None,
                 };
+                let commit_cursor = resume_link.map(|link| SyncCursor {
+                    scope_key: scope_key.clone(),
+                    delta_link: Some(link.clone()),
+                    history_next_link: encode_root_id(known_root_id.as_deref()),
+                    last_synced_at: now_rfc3339(),
+                });
 
                 let outcome = storage.apply_delta_page(
                     drive_id,
@@ -1325,10 +1367,13 @@ async fn pull_delta_pages_once(
                 }
                 changed_items |= outcome.upserted_count > 0 || outcome.deleted_count > 0;
 
-                if let Some(next) = page.next_link {
-                    next_url = next;
-                } else {
-                    break;
+                match page.next_link {
+                    Some(_) if budget_spent => {
+                        more_pending = true;
+                        break;
+                    }
+                    Some(next) => next_url = next,
+                    None => break,
                 }
             }
         }
@@ -1347,7 +1392,11 @@ async fn pull_delta_pages_once(
         });
     }
 
-    Ok(DeltaPullStatus::Completed)
+    Ok(if more_pending {
+        DeltaPullStatus::MorePending
+    } else {
+        DeltaPullStatus::Completed
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1361,7 +1410,7 @@ async fn pull_delta_pages_and_emit(
     limit: usize,
     start_url: &str,
     known_root_id: Option<String>,
-) -> Result<()> {
+) -> Result<DeltaProgress> {
     match pull_delta_pages_once(
         graph,
         storage,
@@ -1375,7 +1424,8 @@ async fn pull_delta_pages_and_emit(
     )
     .await?
     {
-        DeltaPullStatus::Completed => Ok(()),
+        DeltaPullStatus::Completed => Ok(DeltaProgress::CaughtUp),
+        DeltaPullStatus::MorePending => Ok(DeltaProgress::MorePending),
         DeltaPullStatus::ResyncRequired {
             location,
             known_root_id,
@@ -1391,7 +1441,9 @@ async fn pull_delta_pages_and_emit(
                 location,
                 known_root_id,
             )
-            .await
+            .await?;
+            // A resync ends on a fresh deltaLink, so the drive is caught up.
+            Ok(DeltaProgress::CaughtUp)
         }
     }
 }
@@ -1475,6 +1527,14 @@ async fn resync_drive_after_410_or_overflow(
     // authoritatively reconciling root + active folder, then catch up any gap delta.
     let fresh_seed = graph.get_drive_delta_latest_link(drive_id).await?;
 
+    // The folders between the root and the open one are re-listed too, so walking back up
+    // the breadcrumb never shows rows the resync could not check. Read the chain from the
+    // cache before the root re-list can drop part of it.
+    let ancestors = match active_parent_id {
+        Some(pid) => cached_ancestor_ids(storage, drive_id, pid, known_root_id.as_deref())?,
+        None => Vec::new(),
+    };
+
     // Always reconcile root on overflow/410 so deleted/added root items are never stale.
     // The root is listed in full only when it is the folder on screen.
     let root_limit = if active_parent_id.is_none() { limit } else { FOLDER_PAGE_SIZE };
@@ -1509,20 +1569,30 @@ async fn resync_drive_after_410_or_overflow(
         } else {
             storage.upsert_drive_items(&active_page.items)?;
         }
-        let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
-            drive_id: drive_id.to_string(),
-            parent_id: Some(pid.to_string()),
-            items: active_page.items,
-            truncated: !active_page.complete,
-        });
-    } else {
-        let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
-            drive_id: drive_id.to_string(),
-            parent_id: None,
-            items: root_page.items,
-            truncated: !root_page.complete,
-        });
+        for ancestor in &ancestors {
+            // An ancestor that is gone or unreadable is left for its own visit to settle;
+            // it must not stop the open folder from being brought up to date.
+            let Ok(page) = graph
+                .list_children_detailed(drive_id, Some(ancestor), Some(FOLDER_PAGE_SIZE))
+                .await
+            else {
+                continue;
+            };
+            rt.note_folder_listing(drive_id, Some(ancestor), page.complete);
+            if page.complete {
+                storage.replace_folder_children(drive_id, Some(ancestor), &page.items)?;
+            } else {
+                storage.upsert_drive_items(&page.items)?;
+            }
+        }
     }
+    let (items, truncated) = cached_folder_page(storage, rt, drive_id, active_parent_id, limit)?;
+    let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
+        drive_id: drive_id.to_string(),
+        parent_id: active_parent_id.map(str::to_string),
+        items,
+        truncated,
+    });
 
     // Catch up any edits that occurred while reconciling root + active folder and commit cursor.
     match pull_delta_pages_once(
@@ -1538,9 +1608,44 @@ async fn resync_drive_after_410_or_overflow(
     )
     .await?
     {
-        DeltaPullStatus::Completed => Ok(()),
+        // Folders other than the root, the open one and its ancestors were not checked.
+        // Their cached rows stay (stale beats missing offline) and refresh when opened.
+        DeltaPullStatus::Completed | DeltaPullStatus::MorePending => {
+            let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                busy: false,
+                summary: PARTIAL_RESYNC_SUMMARY.to_string(),
+            });
+            Ok(())
+        }
         DeltaPullStatus::ResyncRequired { .. } => anyhow::bail!("Graph requested another drive resync"),
     }
+}
+
+/// The cached folders strictly between the drive root and `folder_id`, nearest first.
+/// Stops at the root, at a row the cache does not hold, or after `MAX_RESYNC_ANCESTORS`.
+fn cached_ancestor_ids(
+    storage: &Storage,
+    drive_id: &str,
+    folder_id: &str,
+    root_id: Option<&str>,
+) -> Result<Vec<String>> {
+    let is_root = |id: &str| id.trim().is_empty() || id == "root" || Some(id) == root_id;
+    let mut ancestors = Vec::new();
+    let mut current = folder_id.to_string();
+    while ancestors.len() < MAX_RESYNC_ANCESTORS {
+        let Some(item) = storage.get_drive_item(drive_id, &current)? else {
+            break;
+        };
+        let Some(parent) = item.parent_id.filter(|p| !is_root(p)) else {
+            break;
+        };
+        if parent == folder_id || ancestors.contains(&parent) {
+            break; // A cycle in a corrupt cache must not spin.
+        }
+        ancestors.push(parent.clone());
+        current = parent;
+    }
+    Ok(ancestors)
 }
 
 async fn sync_core_discovery(

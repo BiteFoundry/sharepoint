@@ -39,7 +39,7 @@ use sharepoint_cli::{
     sync::{
         bootstrap_drive_with_delta, drive_cursor_scope_key, spawn_sync_engine,
         sync_drive_delta_once, DriveSyncRuntime, FocusTarget, FocusViewKind, SyncCommand,
-        FOLDER_PAGE_SIZE,
+        FOLDER_PAGE_SIZE, PARTIAL_RESYNC_SUMMARY,
     },
 };
 
@@ -1028,4 +1028,385 @@ async fn direct_socketio_push_delta_fallback_reconnect_and_focus_gained() {
     ctrl.request(SyncCommand::Shutdown);
     http_server.abort();
     ws_server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Delta / resync caps (SP-07): a long change feed resumes from its nextLink, a long 410
+// resync still replaces the cache, and the fallback re-lists the open folder's ancestors.
+// ---------------------------------------------------------------------------
+
+type DeltaResponder = Arc<dyn Fn(&str, &str) -> axum::response::Response + Send + Sync>;
+
+#[derive(Clone)]
+struct CapGraph {
+    base_url: String,
+    delta: DeltaResponder,
+    /// Folder id ("root" for the drive root) -> the `value` array its children listing returns.
+    children: Arc<HashMap<String, Value>>,
+    /// Every request, as `delta:<token>` or `children:<folder>`.
+    log: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl CapGraph {
+    fn requests(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+async fn spawn_cap_graph(
+    delta: impl Fn(&str, &str) -> axum::response::Response + Send + Sync + 'static,
+    children: HashMap<String, Value>,
+) -> (CapGraph, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let st = CapGraph {
+        base_url: format!("http://{addr}/v1.0"),
+        delta: Arc::new(delta),
+        children: Arc::new(children),
+        log: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let list = |st: &CapGraph, folder: &str| {
+        st.log.lock().unwrap().push(format!("children:{folder}"));
+        match st.children.get(folder) {
+            Some(value) => Json(json!({ "value": value })).into_response(),
+            None => (StatusCode::NOT_FOUND, "no such folder").into_response(),
+        }
+    };
+    let app = Router::new()
+        .route(
+            "/v1.0/drives/{drive_id}/root/delta",
+            get(|State(st): State<CapGraph>, Query(q): Query<HashMap<String, String>>| async move {
+                let token = q.get("token").cloned().unwrap_or_default();
+                st.log.lock().unwrap().push(format!("delta:{token}"));
+                (st.delta)(&token, &st.base_url)
+            }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/root/children",
+            get(move |State(st): State<CapGraph>| async move { list(&st, "root") }),
+        )
+        .route(
+            "/v1.0/drives/{drive_id}/items/{item_id}/children",
+            get(move |State(st): State<CapGraph>, Path((_d, item_id)): Path<(String, String)>| async move {
+                list(&st, &item_id)
+            }),
+        )
+        .with_state(st.clone());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (st, server)
+}
+
+fn delta_url(base: &str, token: &str) -> String {
+    format!("{base}/drives/drv-1/root/delta?token={token}")
+}
+
+fn delta_file(id: &str, parent: &str) -> Value {
+    json!({
+        "id": id,
+        "name": format!("{id}.md"),
+        "size": 3,
+        "file": { "mimeType": "text/markdown" },
+        "parentReference": { "driveId": "drv-1", "id": parent }
+    })
+}
+
+fn delta_folder(id: &str, parent: &str) -> Value {
+    json!({
+        "id": id,
+        "name": id,
+        "folder": { "childCount": 1 },
+        "parentReference": { "driveId": "drv-1", "id": parent }
+    })
+}
+
+/// A cached row under `parent`, whose path from the drive root is `parent_path` ("" for root).
+fn cached_item(id: &str, parent: &str, parent_path: &str) -> sharepoint_cli::models::DriveItem {
+    sharepoint_cli::models::DriveItem {
+        id: id.into(),
+        drive_id: "drv-1".into(),
+        parent_id: Some(parent.into()),
+        parent_path: parent_path.into(),
+        name: format!("{id}.md"),
+        size: 3,
+        ..Default::default()
+    }
+}
+
+fn seed_cursor(storage: &Storage, url: String) {
+    storage
+        .upsert_sync_cursor(&sharepoint_cli::models::SyncCursor {
+            scope_key: drive_cursor_scope_key("drv-1"),
+            delta_link: Some(url),
+            history_next_link: Some("root_id:real-root".into()),
+            last_synced_at: "2026-11-20T00:00:00Z".into(),
+        })
+        .unwrap();
+}
+
+fn stored_cursor(storage: &Storage) -> String {
+    storage
+        .get_sync_cursor(&drive_cursor_scope_key("drv-1"))
+        .unwrap()
+        .unwrap()
+        .delta_link
+        .unwrap()
+}
+
+/// `count` delta pages `p1..p{count}`, one new file each. Page 64 (when served) adds a
+/// file inside a folder no listing ever opened.
+fn paged_delta(count: usize) -> impl Fn(&str, &str) -> axum::response::Response {
+    move |token, base| {
+        let Some(n) = token.strip_prefix('p').and_then(|n| n.parse::<usize>().ok()) else {
+            return (StatusCode::BAD_REQUEST, "unexpected token").into_response();
+        };
+        if n == 0 || n > count {
+            return (StatusCode::BAD_REQUEST, "unexpected page").into_response();
+        }
+        let parent = if n == 64 { "fld-never-opened" } else { "real-root" };
+        let mut body = json!({ "value": [delta_file(&format!("item-{n}"), parent)] });
+        if n < count {
+            body["@odata.nextLink"] = json!(delta_url(base, &format!("p{}", n + 1)));
+        } else {
+            body["@odata.deltaLink"] = json!(delta_url(base, "caught-up"));
+        }
+        Json(body).into_response()
+    }
+}
+
+#[tokio::test]
+async fn delta_overflow_resumes_from_next_link_without_reseed() {
+    let (graph_state, server) = spawn_cap_graph(paged_delta(65), HashMap::new()).await;
+    let base = graph_state.base_url.clone();
+    let graph = build_graph_client(base.clone());
+    let storage = Storage::open_in_memory().unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel::<CoreEvent>();
+    let mut rt = DriveSyncRuntime::default();
+    seed_cursor(&storage, delta_url(&base, "p1"));
+
+    // One sync call works off a bounded number of pages and parks the cursor at the next one.
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None, FOLDER_PAGE_SIZE)
+        .await
+        .unwrap();
+    let after_first = graph_state.requests();
+    assert_eq!(after_first.len(), 60, "three passes of 20 pages: {after_first:?}");
+    assert_eq!(stored_cursor(&storage), delta_url(&base, "p61"));
+    assert!(storage.get_drive_item("drv-1", "item-60").unwrap().is_some());
+    assert!(storage.get_drive_item("drv-1", "item-61").unwrap().is_none());
+
+    // The next call continues at page 61 and finishes the feed.
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None, FOLDER_PAGE_SIZE)
+        .await
+        .unwrap();
+    assert_eq!(stored_cursor(&storage), delta_url(&base, "caught-up"));
+    let requests = graph_state.requests();
+    assert_eq!(requests.len(), 65, "no page is fetched twice: {requests:?}");
+    assert_eq!(requests[60], "delta:p61");
+    assert!(
+        requests.iter().all(|r| r.starts_with("delta:p")),
+        "an overflow must not re-seed with token=latest or re-list folders: {requests:?}"
+    );
+    for n in 1..=65 {
+        assert!(
+            storage.get_drive_item("drv-1", &format!("item-{n}")).unwrap().is_some(),
+            "item-{n} from delta page {n} is cached"
+        );
+    }
+    let unopened = storage.get_drive_item("drv-1", "item-64").unwrap().unwrap();
+    assert_eq!(unopened.parent_id.as_deref(), Some("fld-never-opened"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn delta_more_pending_does_not_delay_next_pass() {
+    let (graph_state, server) = spawn_cap_graph(paged_delta(65), HashMap::new()).await;
+    let base = graph_state.base_url.clone();
+    let graph = build_graph_client(base.clone());
+    let storage = Storage::open_in_memory().unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel::<CoreEvent>();
+    let mut rt = DriveSyncRuntime::default();
+    seed_cursor(&storage, delta_url(&base, "p1"));
+    rt.last_delta_at.insert("drv-1".into(), Instant::now());
+
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None, FOLDER_PAGE_SIZE)
+        .await
+        .unwrap();
+    assert!(
+        !rt.last_delta_at.contains_key("drv-1"),
+        "a drive still behind must be due again at once"
+    );
+
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None, FOLDER_PAGE_SIZE)
+        .await
+        .unwrap();
+    assert!(
+        rt.last_delta_at.contains_key("drv-1"),
+        "a caught-up drive waits for its interval again"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn resync_tier1_handles_more_than_20_pages() {
+    let delta = |token: &str, base: &str| {
+        if token == "expired" {
+            let loc = delta_url(base, "r1");
+            return (StatusCode::GONE, [(header::LOCATION, loc)], Json(json!({"error": {"code": "resyncRequired"}})))
+                .into_response();
+        }
+        let Some(n) = token.strip_prefix('r').and_then(|n| n.parse::<usize>().ok()) else {
+            return (StatusCode::BAD_REQUEST, "unexpected token").into_response();
+        };
+        let mut value = vec![delta_file(&format!("resync-{n}"), "real-root")];
+        if n == 1 {
+            value.insert(0, json!({ "id": "real-root", "root": {} }));
+        }
+        let mut body = json!({ "value": value });
+        if n < 30 {
+            body["@odata.nextLink"] = json!(delta_url(base, &format!("r{}", n + 1)));
+        } else {
+            body["@odata.deltaLink"] = json!(delta_url(base, "after-resync"));
+        }
+        Json(body).into_response()
+    };
+    let (graph_state, server) = spawn_cap_graph(delta, HashMap::new()).await;
+    let base = graph_state.base_url.clone();
+    let graph = build_graph_client(base.clone());
+    let storage = Storage::open_in_memory().unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel::<CoreEvent>();
+    let mut rt = DriveSyncRuntime::default();
+    storage.upsert_drive_items(&[cached_item("stale-root-item", "real-root", "")]).unwrap();
+    seed_cursor(&storage, delta_url(&base, "expired"));
+
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None, FOLDER_PAGE_SIZE)
+        .await
+        .unwrap();
+
+    assert_eq!(stored_cursor(&storage), delta_url(&base, "after-resync"));
+    assert!(
+        storage.get_drive_item("drv-1", "stale-root-item").unwrap().is_none(),
+        "the authoritative replace prunes rows the resync did not return"
+    );
+    for n in 1..=30 {
+        assert!(storage.get_drive_item("drv-1", &format!("resync-{n}")).unwrap().is_some());
+    }
+    let requests = graph_state.requests();
+    assert!(
+        !requests.iter().any(|r| r == "delta:latest" || r.starts_with("children:")),
+        "30 resync pages must not fall through to the partial fallback: {requests:?}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn resync_tier2_reconciles_active_folder_ancestors() {
+    let delta = |token: &str, base: &str| match token {
+        "expired" => (StatusCode::GONE, Json(json!({"error": {"code": "syncStateNotFound"}}))).into_response(),
+        "latest" => Json(json!({ "value": [], "@odata.deltaLink": delta_url(base, "fresh") })).into_response(),
+        "fresh" => Json(json!({ "value": [], "@odata.deltaLink": delta_url(base, "fresh-done") })).into_response(),
+        _ => (StatusCode::BAD_REQUEST, "unexpected token").into_response(),
+    };
+    let mut children = HashMap::new();
+    children.insert("root".to_string(), json!([delta_folder("lvl-1", "real-root")]));
+    children.insert("lvl-1".to_string(), json!([delta_folder("lvl-2", "lvl-1")]));
+    children.insert("lvl-2".to_string(), json!([delta_folder("lvl-3", "lvl-2")]));
+    children.insert("lvl-3".to_string(), json!([delta_file("leaf", "lvl-3")]));
+    let (graph_state, server) = spawn_cap_graph(delta, children).await;
+    let base = graph_state.base_url.clone();
+    let graph = build_graph_client(base.clone());
+    let storage = Storage::open_in_memory().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<CoreEvent>();
+    let mut rt = DriveSyncRuntime::default();
+    storage
+        .upsert_drive_items(&[
+            cached_item("lvl-1", "real-root", ""),
+            cached_item("lvl-2", "lvl-1", "/lvl-1"),
+            cached_item("lvl-3", "lvl-2", "/lvl-1/lvl-2"),
+            cached_item("gone-from-lvl-1", "lvl-1", "/lvl-1"),
+            cached_item("gone-from-lvl-2", "lvl-2", "/lvl-1/lvl-2"),
+            cached_item("other-folder-child", "other-folder", "/other-folder"),
+        ])
+        .unwrap();
+    seed_cursor(&storage, delta_url(&base, "expired"));
+
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", Some("lvl-3"), FOLDER_PAGE_SIZE)
+        .await
+        .unwrap();
+
+    let requests = graph_state.requests();
+    for folder in ["root", "lvl-1", "lvl-2", "lvl-3"] {
+        assert!(
+            requests.contains(&format!("children:{folder}")),
+            "{folder} is re-listed: {requests:?}"
+        );
+    }
+    assert!(storage.get_drive_item("drv-1", "gone-from-lvl-1").unwrap().is_none());
+    assert!(storage.get_drive_item("drv-1", "gone-from-lvl-2").unwrap().is_none());
+    assert!(storage.get_drive_item("drv-1", "leaf").unwrap().is_some());
+    assert!(
+        storage.get_drive_item("drv-1", "other-folder-child").unwrap().is_some(),
+        "folders the fallback could not check keep their cached rows"
+    );
+    assert_eq!(stored_cursor(&storage), delta_url(&base, "fresh-done"));
+
+    let mut summaries = Vec::new();
+    let mut opened_folder_shown = false;
+    while let Ok(evt) = rx.try_recv() {
+        match evt {
+            CoreEvent::SyncStateChanged { summary, .. } => summaries.push(summary),
+            CoreEvent::FolderItemsUpdated { parent_id, items, .. } => {
+                opened_folder_shown |=
+                    parent_id.as_deref() == Some("lvl-3") && items.iter().any(|i| i.id == "leaf");
+            }
+            _ => {}
+        }
+    }
+    assert!(opened_folder_shown, "the open folder is refreshed on screen");
+    assert!(
+        summaries.iter().any(|s| s == PARTIAL_RESYNC_SUMMARY),
+        "the partial resync is reported: {summaries:?}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn stale_next_link_cursor_falls_back_to_resync() {
+    let delta = |token: &str, base: &str| match token {
+        // A nextLink parked by an earlier pull that Graph has since expired.
+        "p21" => (StatusCode::GONE, Json(json!({"error": {"code": "resyncRequired"}}))).into_response(),
+        "latest" => Json(json!({ "value": [], "@odata.deltaLink": delta_url(base, "fresh") })).into_response(),
+        "fresh" | "fresh-again" => {
+            Json(json!({ "value": [], "@odata.deltaLink": delta_url(base, "fresh-again") })).into_response()
+        }
+        _ => (StatusCode::BAD_REQUEST, "unexpected token").into_response(),
+    };
+    let mut children = HashMap::new();
+    children.insert("root".to_string(), json!([delta_file("root-live", "real-root")]));
+    let (graph_state, server) = spawn_cap_graph(delta, children).await;
+    let base = graph_state.base_url.clone();
+    let graph = build_graph_client(base.clone());
+    let storage = Storage::open_in_memory().unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel::<CoreEvent>();
+    let mut rt = DriveSyncRuntime::default();
+    seed_cursor(&storage, delta_url(&base, "p21"));
+
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None, FOLDER_PAGE_SIZE)
+        .await
+        .expect("an expired nextLink cursor resyncs instead of failing");
+    assert_eq!(stored_cursor(&storage), delta_url(&base, "fresh-again"));
+    assert!(storage.get_drive_item("drv-1", "root-live").unwrap().is_some());
+
+    // The following pass reads the fresh cursor; nothing loops back to the expired link.
+    let before = graph_state.requests().len();
+    sync_drive_delta_once(&graph, &storage, &tx, &mut rt, "drv-1", None, FOLDER_PAGE_SIZE)
+        .await
+        .unwrap();
+    assert_eq!(graph_state.requests()[before..], ["delta:fresh-again".to_string()]);
+
+    server.abort();
 }
