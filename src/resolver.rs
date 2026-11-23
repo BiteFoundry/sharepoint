@@ -148,13 +148,14 @@ pub async fn resolve_site(
         }
     }
 
-    // Fetch followed + discovered sites
+    // Followed sites + a Graph search for the query itself. Searching for the query (not
+    // `*`) is what finds a site in a tenant with more sites than one result page.
     let mut combined = graph.list_followed_sites().await.unwrap_or_default();
-    let discovered = graph.list_sites(Some("*"), 100).await.unwrap_or_default();
-    for s in discovered {
-        if !combined.iter().any(|existing| existing.id == s.id) {
-            combined.push(s);
-        }
+    let mut search_error: Option<anyhow::Error> = None;
+    match graph.list_sites(Some(q), SITE_RESOLVE_SEARCH_LIMIT).await {
+        Ok(found) => merge_sites(&mut combined, found),
+        // Kept: an auth or throttling failure must not be reported as "not found".
+        Err(err) => search_error = Some(err),
     }
     if !combined.is_empty() {
         let _ = storage.upsert_sites(&combined);
@@ -164,10 +165,58 @@ pub async fn resolve_site(
             Err(_) => {}
         }
     }
+
+    // Second chance: Graph site search is keyword-based, while the local matcher also
+    // accepts substrings and URL fragments, so list broadly and match locally once more.
+    let before = combined.len();
+    let wildcard = graph
+        .list_sites(Some("*"), SITE_RESOLVE_SEARCH_LIMIT)
+        .await
+        .unwrap_or_default();
+    merge_sites(&mut combined, wildcard);
+    if combined.len() > before {
+        let _ = storage.upsert_sites(&combined[before..]);
+        match resolve_site_from_slice(&combined, q) {
+            Ok(found) => return Ok(found),
+            Err(err) if err.downcast_ref::<AmbiguousMatch>().is_some() => return Err(err),
+            Err(_) => {}
+        }
+    }
+
     // Direct lookup fallback when user passes an exact site ID
-    let direct = graph.get_site(q).await?;
-    let _ = storage.upsert_sites(std::slice::from_ref(&direct));
-    Ok(direct)
+    match graph.get_site(q).await {
+        Ok(direct) => {
+            let _ = storage.upsert_sites(std::slice::from_ref(&direct));
+            Ok(direct)
+        }
+        // `/sites/{display name}` answers 400 (malformed ID) or 404: the site was not found.
+        Err(err) if matches!(crate::graph::graph_error_status(&err), Some(400 | 404)) => {
+            // The search itself failed for a reason other than "no such thing": report that.
+            if let Some(search_err) = search_error {
+                if !matches!(
+                    crate::graph::graph_error_status(&search_err),
+                    Some(400 | 404)
+                ) {
+                    return Err(search_err);
+                }
+            }
+            bail!(
+                "SharePoint site not found: {q}. Run 'sharepoint sites {q}' to search, or pass the site ID or URL."
+            )
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Result cap of the Graph site searches `resolve_site` runs.
+const SITE_RESOLVE_SEARCH_LIMIT: usize = 100;
+
+fn merge_sites(combined: &mut Vec<SharePointSite>, more: Vec<SharePointSite>) {
+    for s in more {
+        if !combined.iter().any(|existing| existing.id == s.id) {
+            combined.push(s);
+        }
+    }
 }
 
 pub fn resolve_drive_from_slice(drives: &[DriveInfo], query: &str) -> Result<DriveInfo> {
