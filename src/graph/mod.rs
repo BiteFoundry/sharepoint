@@ -37,12 +37,42 @@ pub(crate) fn is_graph_not_found_error(err: &anyhow::Error) -> bool {
     graph_error_status(err) == Some(404)
 }
 
+/// How long a download hop may take to answer with response headers.
+pub(crate) const DOWNLOAD_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a download body may stay silent between two reads. This is an inactivity
+/// limit, not a cap on the whole transfer: a large file may take as long as it needs.
+pub(crate) const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+const USER_AGENT: &str = concat!("sharepoint-cli/", env!("CARGO_PKG_VERSION"));
+
+/// The two clients that carry file bodies: `http_download` (follows redirects, used for
+/// pre-authenticated and redirect URLs) and `http_no_redirect` (the Graph `/content` hop).
+/// Neither has a whole-request timeout, which would cut off any transfer longer than it.
+fn build_download_clients(read_timeout: Duration) -> Result<(reqwest::Client, reqwest::Client)> {
+    let http_download = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(read_timeout)
+        .tcp_nodelay(true)
+        .build()?;
+    let http_no_redirect = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(read_timeout)
+        .tcp_nodelay(true)
+        .build()?;
+    Ok((http_download, http_no_redirect))
+}
+
 #[derive(Clone)]
 pub struct GraphClient {
     auth: AuthManager,
     config: AppConfig,
     http: reqwest::Client,
     http_no_redirect: reqwest::Client,
+    http_download: reqwest::Client,
+    download_header_timeout: Duration,
     my_user_id: Option<String>,
     cached_my_user_id: Arc<OnceLock<String>>,
     resolve_user_mutex: Arc<tokio::sync::Mutex<()>>,
@@ -50,9 +80,8 @@ pub struct GraphClient {
 
 impl GraphClient {
     pub fn new(config: AppConfig, auth: AuthManager) -> Result<Self> {
-        let ua = concat!("sharepoint-cli/", env!("CARGO_PKG_VERSION"));
         let http = reqwest::Client::builder()
-            .user_agent(ua)
+            .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .tcp_nodelay(true)
@@ -60,18 +89,14 @@ impl GraphClient {
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30))
             .build()?;
-        let http_no_redirect = reqwest::Client::builder()
-            .user_agent(ua)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(300))
-            .tcp_nodelay(true)
-            .build()?;
+        let (http_download, http_no_redirect) = build_download_clients(DOWNLOAD_READ_TIMEOUT)?;
         Ok(Self {
             auth,
             config,
             http,
             http_no_redirect,
+            http_download,
+            download_header_timeout: DOWNLOAD_HEADER_TIMEOUT,
             my_user_id: None,
             cached_my_user_id: Arc::new(OnceLock::new()),
             resolve_user_mutex: Arc::new(tokio::sync::Mutex::new(())),
@@ -107,5 +132,25 @@ impl GraphClient {
 
     pub(crate) fn http_no_redirect(&self) -> &reqwest::Client {
         &self.http_no_redirect
+    }
+
+    /// Client for file bodies fetched from pre-authenticated or redirect URLs.
+    pub(crate) fn http_download(&self) -> &reqwest::Client {
+        &self.http_download
+    }
+
+    pub(crate) fn download_header_timeout(&self) -> Duration {
+        self.download_header_timeout
+    }
+
+    /// Overrides the download deadlines (`header`: time until response headers; `read`:
+    /// longest silence in a body). For tests, which cannot wait for the 60 s defaults.
+    #[doc(hidden)]
+    pub fn with_download_timeouts(mut self, header: Duration, read: Duration) -> Result<Self> {
+        let (http_download, http_no_redirect) = build_download_clients(read)?;
+        self.http_download = http_download;
+        self.http_no_redirect = http_no_redirect;
+        self.download_header_timeout = header;
+        Ok(self)
     }
 }

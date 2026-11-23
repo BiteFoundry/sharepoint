@@ -14,7 +14,7 @@ use super::GraphClient;
 use crate::models::UserProfile;
 
 const MAX_BATCH_SIZE: usize = 20;
-const MAX_THROTTLE_RETRIES: usize = 3;
+pub(crate) const MAX_THROTTLE_RETRIES: usize = 3;
 const MAX_RETRY_AFTER_SECS: u64 = 30;
 const STANDARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MEDIA_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);

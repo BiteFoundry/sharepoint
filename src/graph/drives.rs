@@ -7,10 +7,11 @@
 //! - Simple upload (`< 4 MiB` `PUT .../content`) and resumable chunked upload session (`>= 4 MiB` `POST .../createUploadSession`)
 //! - Folder creation (`mkdir`), rename/move (`PATCH`), delete (`DELETE`), drive search & cross-site search.
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
+use rand::Rng;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
@@ -18,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     graph::{
-        client::{GraphGetOrGone, GraphListPage},
+        client::{parse_retry_after_secs, GraphGetOrGone, GraphListPage, MAX_THROTTLE_RETRIES},
         media::{deduplicate_dest_path, guess_mime_type, sanitize_filename},
         GraphClient,
     },
@@ -1240,49 +1241,128 @@ impl GraphClient {
     // Downloads (with explicit redirect Authorization header stripping!)
     // -----------------------------------------------------------------------
 
+    /// Sends one download hop and returns its response once the headers have arrived.
+    ///
+    /// `build` creates the request afresh for each attempt; this helper never adds a
+    /// token itself (pre-authenticated and redirect URLs must not carry one). Retries
+    /// happen only here, before any body byte is read: up to `MAX_THROTTLE_RETRIES` on
+    /// 429/502/503/504 honouring `Retry-After`, and once on a connect error or timeout.
+    async fn send_download_hop<F>(&self, what: &str, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        let header_timeout = self.download_header_timeout();
+        let mut throttle_attempt = 0usize;
+        let mut transport_retried = false;
+        loop {
+            let failure = match tokio::time::timeout(header_timeout, build().send()).await {
+                Ok(Ok(resp)) => {
+                    if matches!(
+                        resp.status(),
+                        StatusCode::TOO_MANY_REQUESTS
+                            | StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::BAD_GATEWAY
+                            | StatusCode::GATEWAY_TIMEOUT
+                    ) && throttle_attempt < MAX_THROTTLE_RETRIES
+                    {
+                        let delay_secs = parse_retry_after_secs(resp.headers(), throttle_attempt);
+                        throttle_attempt += 1;
+                        let jitter_ms: u64 = rand::thread_rng().gen_range(0..=250);
+                        tokio::time::sleep(
+                            Duration::from_secs(delay_secs) + Duration::from_millis(jitter_ms),
+                        )
+                        .await;
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Ok(Err(err)) => {
+                    let retryable = err.is_connect() || err.is_timeout();
+                    (anyhow::Error::new(err).context(what.to_string()), retryable)
+                }
+                Err(_elapsed) => (
+                    anyhow!(
+                        "{what}: no response within {:.0?}",
+                        header_timeout
+                    ),
+                    true,
+                ),
+            };
+            let (err, retryable) = failure;
+            if retryable && !transport_retried {
+                transport_retried = true;
+                let jitter_ms: u64 = rand::thread_rng().gen_range(0..=250);
+                tokio::time::sleep(Duration::from_millis(100 + jitter_ms)).await;
+                continue;
+            }
+            return Err(err);
+        }
+    }
+
     async fn fetch_content_response(
         &self,
         drive_id: &str,
         item_id: &str,
         download_url: Option<&str>,
     ) -> Result<reqwest::Response> {
+        let mut preauth_failure: Option<String> = None;
         if let Some(preauth_url) = download_url.map(str::trim).filter(|s| !s.is_empty()) {
             // Pre-authenticated `@microsoft.graph.downloadUrl`: never attach Bearer auth!
-            let resp = self
-                .http()
-                .get(preauth_url)
-                .send()
+            match self
+                .send_download_hop("Failed to fetch pre-authenticated download URL", || {
+                    self.http_download().get(preauth_url)
+                })
                 .await
-                .with_context(|| format!("Failed to fetch pre-authenticated download URL"))?;
-            if resp.status().is_success() {
-                return Ok(resp);
+            {
+                Ok(resp) if resp.status().is_success() => return Ok(resp),
+                // Expired pre-authenticated URL (401/403/410, ...): fall through to `/content`.
+                Ok(resp) => {
+                    preauth_failure = Some(format!("it answered {}", resp.status()));
+                }
+                // Unreachable or stalled: `/content` may still work, so fall through as well.
+                Err(err) => preauth_failure = Some(format!("{err:#}")),
             }
-            // Fall through to `/content` if pre-authenticated URL expired (401/403/410)
         }
 
+        match self.fetch_content_via_graph(drive_id, item_id).await {
+            Ok(resp) => Ok(resp),
+            Err(err) => match preauth_failure {
+                Some(first) => Err(err.context(format!(
+                    "Download failed on both routes; the pre-authenticated download URL had failed first ({first})"
+                ))),
+                None => Err(err),
+            },
+        }
+    }
+
+    /// `GET /drives/{drive}/items/{item}/content` with Bearer auth, then the redirect it
+    /// answers with (fetched without the token).
+    async fn fetch_content_via_graph(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+    ) -> Result<reqwest::Response> {
         let enc_drive = urlencoding::encode(drive_id.trim());
         let enc_item = urlencoding::encode(item_id.trim());
         let content_url = self.resolve_url(&format!("/drives/{enc_drive}/items/{enc_item}/content"));
 
         let mut token = self.auth().valid_access_token().await?;
         let mut resp = self
-            .http_no_redirect()
-            .get(&content_url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .with_context(|| format!("Graph content download failed (GET {content_url})"))?;
+            .send_download_hop(
+                &format!("Graph content download failed (GET {content_url})"),
+                || self.http_no_redirect().get(&content_url).bearer_auth(&token),
+            )
+            .await?;
 
         if resp.status() == StatusCode::UNAUTHORIZED {
             if self.auth().refresh_for_failed_token(&token).await.is_ok() {
                 token = self.auth().valid_access_token().await?;
                 resp = self
-                    .http_no_redirect()
-                    .get(&content_url)
-                    .bearer_auth(&token)
-                    .send()
-                    .await
-                    .with_context(|| format!("Graph content download retry failed (GET {content_url})"))?;
+                    .send_download_hop(
+                        &format!("Graph content download retry failed (GET {content_url})"),
+                        || self.http_no_redirect().get(&content_url).bearer_auth(&token),
+                    )
+                    .await?;
             }
         }
 
@@ -1305,11 +1385,10 @@ impl GraphClient {
             };
 
             let redirected = self
-                .http()
-                .get(&redirect_url)
-                .send()
-                .await
-                .with_context(|| format!("Failed to follow content download redirect"))?;
+                .send_download_hop("Failed to follow content download redirect", || {
+                    self.http_download().get(&redirect_url)
+                })
+                .await?;
             if !redirected.status().is_success() {
                 let st = redirected.status();
                 let body = redirected.text().await.unwrap_or_default();
