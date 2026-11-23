@@ -1,11 +1,15 @@
 //! Local HTTP JSON API (`sharepoint serve` / `bitefoundry-onedrive serve`, default port `8790`) + OpenAPI 3.1 powered by `axum`.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     extract::{Path, Query, Request, State},
-    http::{header, Method, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -36,7 +40,18 @@ use crate::{
 pub struct ServeOptions {
     pub bind: String,
     pub port: u16,
+    /// Bearer key required on `/v1`. When absent on a loopback bind, `run` generates a
+    /// random per-process key unless `allow_keyless` is set.
     pub api_key: Option<String>,
+    /// Explicit opt-out of the generated key: serve `/v1` without authentication
+    /// (loopback binds only).
+    pub allow_keyless: bool,
+    /// Allow `local_path` uploads and `dir` downloads on a keyless server.
+    pub allow_local_paths: bool,
+    /// Extra `Host` header values accepted besides the loopback names.
+    pub allowed_hosts: Vec<String>,
+    /// Extra browser origins allowed by CORS besides loopback origins.
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for ServeOptions {
@@ -45,6 +60,38 @@ impl Default for ServeOptions {
             bind: "127.0.0.1".to_string(),
             port: config::DEFAULT_SERVE_PORT,
             api_key: None,
+            allow_keyless: false,
+            allow_local_paths: false,
+            allowed_hosts: Vec::new(),
+            cors_origins: Vec::new(),
+        }
+    }
+}
+
+/// Access policy of one router, decided once at startup.
+#[derive(Debug, Clone, Default)]
+pub struct RouterPolicy {
+    /// Bearer key required on `/v1`; `None` (or blank) serves `/v1` without authentication.
+    pub api_key: Option<String>,
+    /// Whether requests may name server-side filesystem paths (`local_path` uploads,
+    /// `dir` / `out_dir` downloads).
+    pub allow_local_paths: bool,
+    /// `Host` header values accepted besides `localhost`, `127.0.0.1` and `::1`.
+    pub allowed_hosts: Vec<String>,
+    /// Browser origins allowed by CORS besides loopback origins (exact match).
+    pub cors_origins: Vec<String>,
+}
+
+impl RouterPolicy {
+    /// Policy used by `build_router`: a configured key enables local paths; only the
+    /// loopback host names and loopback browser origins are accepted.
+    pub fn from_api_key(api_key: Option<String>) -> Self {
+        let api_key = normalize_api_key(api_key);
+        Self {
+            allow_local_paths: api_key.is_some(),
+            api_key,
+            allowed_hosts: Vec::new(),
+            cors_origins: Vec::new(),
         }
     }
 }
@@ -54,6 +101,8 @@ pub struct AppState {
     pub graph: GraphClient,
     pub storage: Storage,
     pub api_key: Option<String>,
+    pub allow_local_paths: bool,
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -72,6 +121,10 @@ impl ApiError {
 
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, message)
     }
 }
 
@@ -258,27 +311,214 @@ pub struct DownloadBody {
     pub dir: Option<String>,
 }
 
+/// A blank or whitespace-only key counts as "no key" everywhere.
+fn normalize_api_key(api_key: Option<String>) -> Option<String> {
+    api_key
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
+const LOOPBACK_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+
+/// Normalise a host name for the allow-list: trimmed, lower-cased, without IPv6 brackets.
+fn normalize_host_name(raw: &str) -> String {
+    let raw = raw.trim();
+    let raw = raw
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(raw);
+    raw.to_ascii_lowercase()
+}
+
+/// Host part of a `Host` header (or URI authority): port and IPv6 brackets removed,
+/// lower-cased. `None` when the value is empty or malformed.
+pub(crate) fn host_without_port(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let host = if let Some(rest) = raw.strip_prefix('[') {
+        let (inner, tail) = rest.split_once(']')?;
+        if !(tail.is_empty()
+            || tail
+                .strip_prefix(':')
+                .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())))
+        {
+            return None;
+        }
+        inner
+    } else {
+        match raw.rsplit_once(':') {
+            Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                host
+            }
+            Some(_) => return None,
+            None => raw,
+        }
+    };
+    if host.is_empty() || host.contains(['/', '@', ' ', '[', ']']) {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+/// Whether a `Host` header value names this server: a loopback name or an explicitly
+/// allowed host. Blocks DNS-rebinding requests, which carry the attacker's host name.
+pub(crate) fn is_allowed_host(raw: &str, allowed_hosts: &[String]) -> bool {
+    let Some(host) = host_without_port(raw) else {
+        return false;
+    };
+    LOOPBACK_HOSTS.contains(&host.as_str()) || allowed_hosts.iter().any(|h| *h == host)
+}
+
+/// Exact loopback-origin check for CORS. Accepts only `http://localhost`,
+/// `http://127.0.0.1` (any IPv4 loopback) and `http://[::1]`, with any port and nothing
+/// else in the URL. Prefix look-alikes such as `http://localhost.evil.com` are rejected.
+pub(crate) fn is_allowed_origin(origin: &str) -> bool {
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    if !(url.path().is_empty() || url.path() == "/")
+        || origin.trim_end().ends_with('/')
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// Canonical form of an explicitly allowed origin (`--cors-origin`): scheme, host and port
+/// only. Rejects anything that is not a plain `http(s)://host[:port]` origin.
+pub fn normalize_cors_origin(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let url = url::Url::parse(trimmed)
+        .with_context(|| format!("Invalid --cors-origin '{trimmed}': not a URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("Invalid --cors-origin '{trimmed}': scheme must be http or https");
+    }
+    if url.host().is_none() || !url.username().is_empty() || url.password().is_some() {
+        bail!("Invalid --cors-origin '{trimmed}': expected scheme://host[:port]");
+    }
+    if !(url.path().is_empty() || url.path() == "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("Invalid --cors-origin '{trimmed}': an origin has no path, query or fragment");
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+/// Whether `origin` exactly equals one of the configured (already normalised) origins.
+fn matches_extra_origin(origin: &str, cors_origins: &[String]) -> bool {
+    if cors_origins.is_empty() {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || !(url.path().is_empty() || url.path() == "/")
+        || origin.trim_end().ends_with('/')
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let canonical = url.origin().ascii_serialization();
+    cors_origins.iter().any(|allowed| *allowed == canonical)
+}
+
+/// Refuse to expose the API beyond loopback without a key.
+pub(crate) fn validate_bind(addr: SocketAddr, has_key: bool) -> Result<()> {
+    if !addr.ip().is_loopback() && !has_key {
+        bail!(
+            "Refusing to serve on {addr} without --api-key: the HTTP API would be open to the network. Pass --api-key <secret> or bind to 127.0.0.1."
+        );
+    }
+    Ok(())
+}
+
+/// Random 32-byte Bearer key (hex) for a loopback server started without `--api-key`.
+pub(crate) fn generate_api_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// `Host` values accepted for a server bound to `bind_ip`, besides the loopback names:
+/// the literal bind address when it is a specific one, plus every `--allowed-host`.
+pub(crate) fn allowed_hosts_for(bind_ip: IpAddr, extra: &[String]) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    if !bind_ip.is_unspecified() {
+        hosts.push(bind_ip.to_string().to_ascii_lowercase());
+    }
+    for raw in extra {
+        // Accept `name`, `name:port` and `[v6]:port`; only the host part is compared.
+        let host = host_without_port(raw).unwrap_or_else(|| normalize_host_name(raw));
+        if !host.is_empty() {
+            hosts.push(host);
+        }
+    }
+    hosts.retain(|h| !LOOPBACK_HOSTS.contains(&h.as_str()));
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Router with the default policy for `api_key`: a configured key enables `local_path` /
+/// `dir`; without one `/v1` is unauthenticated and those parameters are refused. Use
+/// `build_router_with` to choose the policy explicitly.
 pub fn build_router(
     config: AppConfig,
     graph: GraphClient,
     storage: Storage,
     api_key: Option<String>,
 ) -> Router {
-    let has_key = api_key.as_deref().is_some_and(|t| !t.trim().is_empty());
+    build_router_with(config, graph, storage, RouterPolicy::from_api_key(api_key))
+}
+
+pub fn build_router_with(
+    config: AppConfig,
+    graph: GraphClient,
+    storage: Storage,
+    policy: RouterPolicy,
+) -> Router {
+    let cors_origins: Vec<String> = policy
+        .cors_origins
+        .iter()
+        .filter_map(|o| normalize_cors_origin(o).ok())
+        .collect();
+    let allowed_hosts: Vec<String> = policy
+        .allowed_hosts
+        .iter()
+        .map(|h| host_without_port(h).unwrap_or_else(|| normalize_host_name(h)))
+        .filter(|h| !h.is_empty())
+        .collect();
     let state = Arc::new(AppState {
         config,
         graph,
         storage,
-        api_key: if has_key { api_key } else { None },
+        api_key: normalize_api_key(policy.api_key),
+        allow_local_paths: policy.allow_local_paths,
+        allowed_hosts,
     });
 
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin, _| {
-            origin.to_str().is_ok_and(|o| {
-                o.starts_with("http://127.0.0.1")
-                    || o.starts_with("http://localhost")
-                    || o.starts_with("http://[::1]")
-            })
+        .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {
+            origin
+                .to_str()
+                .is_ok_and(|o| is_allowed_origin(o) || matches_extra_origin(o, &cors_origins))
         }))
         .allow_methods([
             Method::GET,
@@ -313,12 +553,59 @@ pub fn build_router(
         .route("/download", post(handle_download))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
+    // Layer order (outermost first): Host guard -> CORS -> routes (`/v1` adds the key
+    // check). The Host guard therefore covers `/health`, `/openapi.yaml` and preflights,
+    // and CORS still answers preflights for allowed origins before the key check.
     Router::new()
         .route("/health", get(handle_health))
         .route("/openapi.yaml", get(handle_openapi))
         .nest("/v1", v1)
         .layer(cors)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            host_guard_middleware,
+        ))
         .with_state(state)
+}
+
+/// What `run` will serve, derived from the command-line options before any socket opens.
+#[derive(Debug, Clone)]
+pub(crate) struct ServePlan {
+    pub bind_addr: SocketAddr,
+    pub policy: RouterPolicy,
+    /// The key in `policy` was generated for this run (it must be shown to the operator).
+    pub generated_key: bool,
+}
+
+pub(crate) fn plan_serve(opts: &ServeOptions) -> Result<ServePlan> {
+    let bind_addr: SocketAddr = format!("{}:{}", opts.bind, opts.port)
+        .parse()
+        .with_context(|| format!("Invalid bind address '{}:{}'", opts.bind, opts.port))?;
+    let mut api_key = normalize_api_key(opts.api_key.clone());
+    // Checked against the key the operator passed: a generated key never unlocks a
+    // non-loopback bind, and --allow-keyless cannot override the refusal.
+    validate_bind(bind_addr, api_key.is_some())?;
+    let cors_origins = opts
+        .cors_origins
+        .iter()
+        .map(|o| normalize_cors_origin(o))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut generated_key = false;
+    if api_key.is_none() && !opts.allow_keyless {
+        api_key = Some(generate_api_key());
+        generated_key = true;
+    }
+    Ok(ServePlan {
+        bind_addr,
+        policy: RouterPolicy {
+            allow_local_paths: api_key.is_some() || opts.allow_local_paths,
+            api_key,
+            allowed_hosts: allowed_hosts_for(bind_addr.ip(), &opts.allowed_hosts),
+            cors_origins,
+        },
+        generated_key,
+    })
 }
 
 pub async fn run(
@@ -327,18 +614,62 @@ pub async fn run(
     storage: Storage,
     opts: ServeOptions,
 ) -> Result<()> {
-    let bind_addr: SocketAddr = format!("{}:{}", opts.bind, opts.port)
-        .parse()
-        .with_context(|| format!("Invalid bind address '{}:{}'", opts.bind, opts.port))?;
-    let router = build_router(config, graph, storage, opts.api_key);
+    let ServePlan {
+        bind_addr,
+        policy,
+        generated_key,
+    } = plan_serve(&opts)?;
+    let api_key = policy.api_key.clone();
+    let allow_local_paths = policy.allow_local_paths;
+    let router = build_router_with(config, graph, storage, policy);
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("Failed to bind HTTP server on {bind_addr}"))?;
+    // Everything below goes to stderr; stdout stays free for callers that capture it.
     eprintln!(
         "sharepoint HTTP API listening on http://{bind_addr} (GET /health, GET /openapi.yaml)"
     );
+    let auth_line = match (api_key.as_deref(), generated_key) {
+        (Some(_), true) => "Bearer key required on /v1 (generated for this run)",
+        (Some(_), false) => "Bearer key required on /v1 (--api-key)",
+        (None, _) => "DISABLED (--allow-keyless): any local process can call /v1",
+    };
+    eprintln!(
+        "  auth: {auth_line}; local paths (local_path / dir): {}",
+        if allow_local_paths { "enabled" } else { "disabled" }
+    );
+    if let (Some(key), true) = (api_key.as_deref(), generated_key) {
+        eprintln!("  No --api-key given: generated a random key for this run (shown once).");
+        eprintln!("  Authorization: Bearer {key}");
+        eprintln!(
+            "  Pass --api-key <secret> for a stable key, or --allow-keyless to serve without one."
+        );
+    }
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+/// Rejects requests whose `Host` header does not name this server (DNS rebinding).
+async fn host_guard_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        // HTTP/2 carries the authority in the request target instead of a Host header.
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()));
+    match host.as_deref() {
+        Some(value) if is_allowed_host(value, &state.allowed_hosts) => next.run(req).await,
+        other => ApiError::forbidden(format!(
+            "Host header not allowed: {}. Use --allowed-host to permit it.",
+            other.unwrap_or("(missing)")
+        ))
+        .into_response(),
+    }
 }
 
 async fn auth_middleware(
@@ -588,10 +919,19 @@ async fn handle_create_folder(
     Ok(Json(json!({ "item": created })))
 }
 
+const LOCAL_PATH_UPLOAD_DISABLED: &str = "local_path uploads are disabled on a server started without an API key. Send content_base64 or content_text, or restart with --api-key or --allow-local-paths.";
+const DOWNLOAD_DIR_DISABLED: &str = "dir / out_dir is disabled on a server started without an API key. Omit it to use the configured download directory, or restart with --api-key or --allow-local-paths.";
+
 async fn handle_upload(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UploadBody>,
 ) -> Result<Json<Value>, ApiError> {
+    // Checked before anything is resolved: a refused request makes no Graph call.
+    if !state.allow_local_paths
+        && body.local_path.as_deref().is_some_and(|p| !p.trim().is_empty())
+    {
+        return Err(ApiError::forbidden(LOCAL_PATH_UPLOAD_DISABLED));
+    }
     let if_match = explicit_if_match(body.if_match.as_deref())
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let drive = resolver::resolve_target_drive(
@@ -858,6 +1198,10 @@ async fn handle_download(
     State(state): State<Arc<AppState>>,
     Json(body): Json<DownloadBody>,
 ) -> Result<Json<Value>, ApiError> {
+    // Checked before anything is resolved or fetched: a refused request makes no Graph call.
+    if !state.allow_local_paths && body.dir.as_deref().is_some_and(|d| !d.trim().is_empty()) {
+        return Err(ApiError::forbidden(DOWNLOAD_DIR_DISABLED));
+    }
     let target = body
         .item_id
         .as_deref()
@@ -898,4 +1242,225 @@ async fn handle_download_by_id(
 ) -> Result<Json<Value>, ApiError> {
     body.item_id = Some(id);
     handle_download(State(state), Json(body)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_exact_match_rejects_prefix_lookalikes() {
+        for rejected in [
+            "http://localhost.evil.com",
+            "http://localhost.evil.com:8790",
+            "http://127.0.0.1.evil.com",
+            "http://localhost:1@evil.com",
+            "http://localhostevil.com",
+            "http://[::1].evil.com",
+            "https://localhost",
+            "null",
+            "",
+            "http://localhost/path",
+            "http://localhost/",
+            "http://localhost.",
+            "http://user@localhost",
+            "http://localhost?x=1",
+            "http://localhost#frag",
+            "file://localhost",
+            "http://192.168.0.10:8790",
+        ] {
+            assert!(!is_allowed_origin(rejected), "must reject {rejected:?}");
+        }
+        for accepted in [
+            "http://localhost",
+            "http://localhost:5173",
+            "http://LOCALHOST:3000",
+            "http://127.0.0.1:8790",
+            "http://127.0.0.1",
+            "http://[::1]:8790",
+        ] {
+            assert!(is_allowed_origin(accepted), "must accept {accepted:?}");
+        }
+    }
+
+    #[test]
+    fn cors_origin_flag_is_exact_and_validated() {
+        assert_eq!(
+            normalize_cors_origin(" https://App.Example.com ").unwrap(),
+            "https://app.example.com"
+        );
+        assert_eq!(
+            normalize_cors_origin("https://app.example.com:8443/").unwrap(),
+            "https://app.example.com:8443"
+        );
+        for bad in ["*", "app.example.com", "ftp://app.example.com", "https://app.example.com/x", "https://u:p@app.example.com"] {
+            assert!(normalize_cors_origin(bad).is_err(), "must reject {bad:?}");
+        }
+
+        let allowed = vec![normalize_cors_origin("https://app.example.com").unwrap()];
+        assert!(matches_extra_origin("https://app.example.com", &allowed));
+        assert!(matches_extra_origin("https://APP.example.com", &allowed));
+        assert!(!matches_extra_origin("https://app.example.com.evil.com", &allowed));
+        assert!(!matches_extra_origin("http://app.example.com", &allowed));
+        assert!(!matches_extra_origin("https://app.example.com:444", &allowed));
+        assert!(!matches_extra_origin("https://app.example.com@evil.com", &allowed));
+        assert!(!matches_extra_origin("https://app.example.com", &[]));
+    }
+
+    #[test]
+    fn host_header_parsing_and_allow_list() {
+        assert_eq!(host_without_port("127.0.0.1:8790").as_deref(), Some("127.0.0.1"));
+        assert_eq!(host_without_port("LocalHost").as_deref(), Some("localhost"));
+        assert_eq!(host_without_port("[::1]:8790").as_deref(), Some("::1"));
+        assert_eq!(host_without_port("[::1]").as_deref(), Some("::1"));
+        assert_eq!(host_without_port(""), None);
+        assert_eq!(host_without_port("localhost:"), None);
+        assert_eq!(host_without_port("localhost:80:90x"), None);
+        assert_eq!(host_without_port("[::1]evil"), None);
+        assert_eq!(host_without_port("user@localhost"), None);
+
+        let none: Vec<String> = Vec::new();
+        for ok in ["localhost", "localhost:8790", "127.0.0.1:8790", "[::1]:8790", "LOCALHOST:1"] {
+            assert!(is_allowed_host(ok, &none), "must accept {ok:?}");
+        }
+        for bad in [
+            "attacker.example",
+            "attacker.example:8790",
+            "localhost.attacker.example",
+            "127.0.0.1.attacker.example:8790",
+            "localhost.",
+            "",
+            "192.168.0.10:8790",
+        ] {
+            assert!(!is_allowed_host(bad, &none), "must reject {bad:?}");
+        }
+        let extra = allowed_hosts_for("127.0.0.1".parse().unwrap(), &["Files.Corp.Example:443".to_string()]);
+        assert_eq!(extra, vec!["files.corp.example".to_string()]);
+        assert!(is_allowed_host("files.corp.example:8790", &extra));
+        assert!(!is_allowed_host("attacker.example", &extra));
+    }
+
+    #[test]
+    fn allowed_hosts_follow_the_bind_address() {
+        // A specific non-loopback bind address is reachable under its own literal.
+        let lan = allowed_hosts_for("192.168.0.10".parse().unwrap(), &[]);
+        assert_eq!(lan, vec!["192.168.0.10".to_string()]);
+        assert!(is_allowed_host("192.168.0.10:8790", &lan));
+        // An unspecified bind has no single literal: loopback names + --allowed-host only.
+        let any = allowed_hosts_for("0.0.0.0".parse().unwrap(), &[]);
+        assert!(any.is_empty());
+        assert!(!is_allowed_host("192.168.0.10:8790", &any));
+        assert!(is_allowed_host("127.0.0.1:8790", &any));
+    }
+
+    #[test]
+    fn run_refuses_non_loopback_bind_without_api_key() {
+        let lan: SocketAddr = "0.0.0.0:8790".parse().unwrap();
+        let err = validate_bind(lan, false).unwrap_err().to_string();
+        assert!(err.contains("--api-key"), "{err}");
+        assert!(validate_bind(lan, true).is_ok());
+        assert!(validate_bind("192.168.0.10:8790".parse().unwrap(), false).is_err());
+        assert!(validate_bind("[::]:8790".parse().unwrap(), false).is_err());
+        assert!(validate_bind("127.0.0.1:8790".parse().unwrap(), false).is_ok());
+        assert!(validate_bind("[::1]:8790".parse().unwrap(), false).is_ok());
+
+        // A blank or whitespace-only key is "no key" for the refusal and for the policy.
+        for blank in ["", "   "] {
+            let key = normalize_api_key(Some(blank.to_string()));
+            assert!(key.is_none());
+            assert!(validate_bind(lan, key.is_some()).is_err());
+            let policy = RouterPolicy::from_api_key(Some(blank.to_string()));
+            assert!(policy.api_key.is_none());
+            assert!(!policy.allow_local_paths);
+        }
+        let keyed = RouterPolicy::from_api_key(Some(" secret ".to_string()));
+        assert_eq!(keyed.api_key.as_deref(), Some("secret"));
+        assert!(keyed.allow_local_paths);
+    }
+
+    #[test]
+    fn serve_plan_generates_a_key_unless_keyless_is_explicit() {
+        // Default: loopback, no key -> a generated key guards /v1 and unlocks local paths.
+        let plan = plan_serve(&ServeOptions::default()).unwrap();
+        assert!(plan.generated_key);
+        assert_eq!(plan.policy.api_key.as_deref().map(str::len), Some(64));
+        assert!(plan.policy.allow_local_paths);
+        assert!(plan.bind_addr.ip().is_loopback());
+
+        // An explicit key is used as given and never reported as generated.
+        let keyed = plan_serve(&ServeOptions {
+            api_key: Some("secret".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!keyed.generated_key);
+        assert_eq!(keyed.policy.api_key.as_deref(), Some("secret"));
+        assert!(keyed.policy.allow_local_paths);
+
+        // A blank --api-key is no key: one is generated instead of serving open.
+        let blank = plan_serve(&ServeOptions {
+            api_key: Some("  ".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(blank.generated_key);
+
+        // --allow-keyless: no key, and local paths stay off without their own opt-in.
+        let keyless = plan_serve(&ServeOptions {
+            allow_keyless: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!keyless.generated_key);
+        assert!(keyless.policy.api_key.is_none());
+        assert!(!keyless.policy.allow_local_paths);
+        let keyless_paths = plan_serve(&ServeOptions {
+            allow_keyless: true,
+            allow_local_paths: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(keyless_paths.policy.api_key.is_none());
+        assert!(keyless_paths.policy.allow_local_paths);
+
+        // Non-loopback: refused without an explicit key, whatever else is passed.
+        for allow_keyless in [false, true] {
+            let err = plan_serve(&ServeOptions {
+                bind: "0.0.0.0".to_string(),
+                allow_keyless,
+                allow_local_paths: true,
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("--api-key"), "{err}");
+        }
+        let lan = plan_serve(&ServeOptions {
+            bind: "192.168.0.10".to_string(),
+            api_key: Some("secret".to_string()),
+            allowed_hosts: vec!["files.corp.example".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            lan.policy.allowed_hosts,
+            vec!["192.168.0.10".to_string(), "files.corp.example".to_string()]
+        );
+
+        // A malformed --cors-origin stops startup instead of being silently dropped.
+        assert!(plan_serve(&ServeOptions {
+            cors_origins: vec!["*".to_string()],
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn generated_api_key_is_32_random_bytes_hex() {
+        let a = generate_api_key();
+        let b = generate_api_key();
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 }

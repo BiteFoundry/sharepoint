@@ -412,12 +412,29 @@ pub enum Command {
     /// Start the local HTTP JSON API server (default port 8790)
     #[command(visible_alias = "api")]
     Serve {
+        /// Address to listen on. A non-loopback address requires --api-key
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
         #[arg(long, default_value_t = config::DEFAULT_SERVE_PORT)]
         port: u16,
+        /// Bearer key clients must send. Without it a random key is generated at startup
+        /// and printed once to stderr
         #[arg(long)]
         api_key: Option<String>,
+        /// Serve without any key instead of generating one (loopback binds only)
+        #[arg(long, conflicts_with = "api_key")]
+        allow_keyless: bool,
+        /// Allow local_path uploads and dir downloads on a server running without a key
+        #[arg(long)]
+        allow_local_paths: bool,
+        /// Extra Host header value to accept besides localhost / 127.0.0.1 / ::1
+        /// (repeatable), e.g. a reverse-proxy hostname
+        #[arg(long = "allowed-host", value_name = "NAME")]
+        allowed_hosts: Vec<String>,
+        /// Extra browser origin allowed by CORS besides loopback origins (repeatable),
+        /// e.g. https://app.example.com
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origins: Vec<String>,
     },
     /// Start the Model Context Protocol (MCP) server over stdio
     #[command(visible_alias = "mcp-server")]
@@ -1711,6 +1728,10 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             bind,
             port,
             api_key,
+            allow_keyless,
+            allow_local_paths,
+            allowed_hosts,
+            cors_origins,
         }) => {
             let (_, graph, storage) = init_runtime(&config, false).await?;
             serve::run(
@@ -1721,6 +1742,10 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     bind,
                     port,
                     api_key,
+                    allow_keyless,
+                    allow_local_paths,
+                    allowed_hosts,
+                    cors_origins,
                 },
             )
             .await

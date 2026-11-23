@@ -3723,7 +3723,16 @@ async fn regression_sharepoint_sp_07_http_content_uses_decode_text_file_and_retu
     });
 
     let (cfg, graph, storage) = make_graph_and_storage(&base_url);
-    let api_router = serve::build_router(cfg, graph, storage, None);
+    // Keyless router that still accepts `dir`: local paths are an explicit opt-in.
+    let api_router = serve::build_router_with(
+        cfg,
+        graph,
+        storage,
+        serve::RouterPolicy {
+            allow_local_paths: true,
+            ..Default::default()
+        },
+    );
     let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api_addr = api_listener.local_addr().unwrap();
     let api_server = tokio::spawn(async move {
