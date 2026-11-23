@@ -369,6 +369,8 @@ pub struct AppState {
     inflight_raw_images: HashMap<String, PendingImageDownload>,
     pub search_results: Vec<DriveItem>,
     pub active_selected_id: Option<String>,
+    /// True once the user has toggled the rendered-preview setting in this session.
+    render_markup_user_set: bool,
     /// Lazy localhost Axum HTML server (`0 MB` idle until `o` is pressed).
     pub html_server: NativeHtmlServer,
 }
@@ -439,6 +441,7 @@ impl AppState {
             inflight_raw_images: HashMap::new(),
             search_results: Vec::new(),
             active_selected_id: None,
+            render_markup_user_set: false,
             html_server: NativeHtmlServer::new(),
         }
     }
@@ -1767,21 +1770,71 @@ impl AppState {
         }
     }
 
+    /// Saves the preferences the user can change in the TUI, and nothing else: not the
+    /// rest of the config, and not the image protocol the terminal probe came up with.
     pub fn save_ui_prefs(&mut self, ui: &UiState) {
+        // `render_markup` may have come from the environment. It becomes the user's own
+        // setting, worth writing down, the first time they toggle it.
+        if ui.render_markup != self.config.render_markup {
+            self.render_markup_user_set = true;
+        }
         self.config.notify = ui.notify;
         self.config.show_nav_rail = ui.show_nav_rail;
         self.config.inline_images = ui.inline_images;
         self.config.render_markup = ui.render_markup;
         self.config.density = ui.density;
         self.config.theme = ui.theme_preset;
-        self.config.image_protocol = match ui.graphics_caps.protocol {
-            TerminalImageProtocol::Kitty => ImageProtocolPreference::Kitty,
-            TerminalImageProtocol::ITerm2 => ImageProtocolPreference::Iterm2,
-            TerminalImageProtocol::Sixel => ImageProtocolPreference::Sixel,
-            TerminalImageProtocol::Halfblock => ImageProtocolPreference::Halfblock,
-        };
-        let _ = self.config.save();
+        self.persist_prefs(&ui_pref_updates(ui, self.render_markup_user_set));
     }
+
+    /// Saves the image protocol the user picked by hand. `auto` stays `auto` until then.
+    pub fn save_image_protocol_choice(&mut self, ui: &UiState) {
+        let choice = image_protocol_preference(ui.graphics_caps.protocol);
+        self.config.image_protocol = choice;
+        self.persist_prefs(&[("image_protocol", pref_value(choice))]);
+    }
+
+    fn persist_prefs(&self, updates: &[(&'static str, toml::Value)]) {
+        if let Err(err) = crate::config::persist_config_keys(updates) {
+            let _ = self.ui_tx.send(UiMsg::Toast {
+                message: format!("Settings not saved: {err:#}"),
+                kind: ToastKind::Error,
+            });
+        }
+    }
+}
+
+fn image_protocol_preference(protocol: TerminalImageProtocol) -> ImageProtocolPreference {
+    match protocol {
+        TerminalImageProtocol::Kitty => ImageProtocolPreference::Kitty,
+        TerminalImageProtocol::ITerm2 => ImageProtocolPreference::Iterm2,
+        TerminalImageProtocol::Sixel => ImageProtocolPreference::Sixel,
+        TerminalImageProtocol::Halfblock => ImageProtocolPreference::Halfblock,
+    }
+}
+
+/// A preference as it is written in `config.toml`.
+fn pref_value<T: serde::Serialize>(value: T) -> toml::Value {
+    // Preferences are booleans and unit enums; neither can fail to become a TOML value.
+    toml::Value::try_from(value).expect("a preference serializes to a TOML value")
+}
+
+/// The config keys `save_ui_prefs` writes, with their values.
+///
+/// `image_protocol` is never among them: what the UI holds is the probe's answer for this
+/// terminal, not a choice. `render_markup` is included only once the user has toggled it.
+pub fn ui_pref_updates(ui: &UiState, render_markup_user_set: bool) -> Vec<(&'static str, toml::Value)> {
+    let mut updates = vec![
+        ("notify", pref_value(ui.notify)),
+        ("show_nav_rail", pref_value(ui.show_nav_rail)),
+        ("inline_images", pref_value(ui.inline_images)),
+        ("density", pref_value(ui.density)),
+        ("theme", pref_value(ui.theme_preset)),
+    ];
+    if render_markup_user_set {
+        updates.push(("render_markup", pref_value(ui.render_markup)));
+    }
+    updates
 }
 
 fn text_preview_key_matches(key: &str, drive_id: &str, item_id: &str) -> bool {
@@ -2070,6 +2123,82 @@ mod tests {
             crate::ui::event::key_to_action(shift_l, Focus::Overlay, &keymap, true),
             Some(Action::Input('L'))
         );
+    }
+
+    #[tokio::test]
+    async fn ui_pref_updates_never_include_image_protocol() {
+        let keys = |updates: &[(&'static str, toml::Value)]| -> Vec<&'static str> {
+            updates.iter().map(|(k, _)| *k).collect()
+        };
+        let ui_only = UiState::from_config(&AppConfig::default());
+        assert_eq!(
+            keys(&ui_pref_updates(&ui_only, false)),
+            ["notify", "show_nav_rail", "inline_images", "density", "theme"]
+        );
+        assert_eq!(
+            keys(&ui_pref_updates(&ui_only, true)),
+            ["notify", "show_nav_rail", "inline_images", "density", "theme", "render_markup"]
+        );
+
+        // The same through the real actions, against a config file of our own.
+        let _env_lock = crate::config::TEST_ENV_LOCK.lock().await;
+        let _clean = crate::config::EnvVarGuard::clear_auth_env();
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let _env = crate::config::EnvVarGuard::set(&[(
+            "SHAREPOINT_CONFIG_DIR",
+            Some(dir_str.as_str()),
+        )]);
+        let path = crate::config::config_file_path();
+        assert!(path.starts_with(dir.path()));
+        let read = || -> toml::Table {
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+
+        let (mut app, mut ui, mut ui_rx) = test_app_and_ui_with_base_url(None);
+        ui.graphics_caps.protocol = TerminalImageProtocol::Kitty; // what a probe would find
+        assert_eq!(app.config.image_protocol, ImageProtocolPreference::Auto);
+
+        dispatch(Action::ToggleDensity, &mut app, &mut ui);
+        let saved = read();
+        assert_eq!(saved.len(), 5, "only the UI preferences: {saved:?}");
+        assert!(!saved.contains_key("image_protocol"), "{saved:?}");
+        assert!(!saved.contains_key("render_markup"), "{saved:?}");
+        assert!(!saved.contains_key("graph_base_url"), "{saved:?}");
+        assert_eq!(saved["density"], toml::Value::try_from(ui.density).unwrap());
+        assert_eq!(AppConfig::load_from(&path).unwrap().density, ui.density);
+        assert_eq!(app.config.image_protocol, ImageProtocolPreference::Auto);
+
+        // Toggled by the user: saved from now on, also when toggled back.
+        let rendered_at_start = ui.render_markup;
+        dispatch(Action::TogglePreviewRenderMode, &mut app, &mut ui);
+        assert_eq!(read()["render_markup"].as_bool(), Some(!rendered_at_start));
+        dispatch(Action::TogglePreviewRenderMode, &mut app, &mut ui);
+        assert_eq!(read()["render_markup"].as_bool(), Some(rendered_at_start));
+        assert!(!read().contains_key("image_protocol"));
+
+        // Picking a protocol by hand is a choice, and that is saved.
+        dispatch(Action::CycleImageProtocol, &mut app, &mut ui);
+        assert_eq!(ui.graphics_caps.protocol, TerminalImageProtocol::ITerm2);
+        assert_eq!(read()["image_protocol"].as_str(), Some("iterm2"));
+        assert_eq!(app.config.image_protocol, ImageProtocolPreference::Iterm2);
+        assert_eq!(
+            AppConfig::load_from(&path).unwrap().image_protocol,
+            ImageProtocolPreference::Iterm2
+        );
+
+        // A config file that does not parse is left alone, and the user is told.
+        while ui_rx.try_recv().is_ok() {}
+        std::fs::write(&path, "notify = = true\n").unwrap();
+        dispatch(Action::ToggleNotify, &mut app, &mut ui);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "notify = = true\n");
+        let mut told = false;
+        while let Ok(msg) = ui_rx.try_recv() {
+            if let UiMsg::Toast { message, .. } = msg {
+                told |= message.contains("Settings not saved");
+            }
+        }
+        assert!(told, "a failed save must reach the user");
     }
 
     #[test]

@@ -448,10 +448,15 @@ impl AppConfig {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 
+    /// Writes this whole struct to the config file.
+    ///
+    /// A loaded config carries values taken from the environment, so this writes those into
+    /// the file as well. To change single settings use [`persist_config_keys`].
     pub fn save(&self) -> Result<()> {
         self.save_to(&config_file_path())
     }
 
+    /// Writes this whole struct to `path`. See [`AppConfig::save`] for when not to use it.
     pub fn save_to(&self, path: &Path) -> Result<()> {
         ensure_parent(path)?;
         let raw = toml::to_string_pretty(self).context("Failed to serialize config")?;
@@ -525,6 +530,41 @@ pub fn legacy_teams_config_dir() -> Option<PathBuf> {
 
 pub fn config_file_path() -> PathBuf {
     config_dir().join("config.toml")
+}
+
+/// Sets `updates` in the config file at `path` and leaves every other key as it is,
+/// whether this version knows the key or not.
+///
+/// Nothing but the given keys is written, so a value that came from an environment
+/// variable for this run never ends up in the file. A missing file is created with just
+/// these keys. A file that exists but does not parse is left untouched and reported.
+pub fn persist_keys(path: &Path, updates: &[(&str, toml::Value)]) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut table = match fs::read_to_string(path) {
+        Ok(raw) => toml::from_str::<toml::Table>(&raw).with_context(|| {
+            format!(
+                "Config file {} does not parse; fix or remove it before settings can be saved",
+                path.display()
+            )
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("Failed to read config file: {}", path.display()))
+        }
+    };
+    for (key, value) in updates {
+        table.insert((*key).to_string(), value.clone());
+    }
+    let raw = toml::to_string_pretty(&table).context("Failed to serialize config")?;
+    write_atomic(path, raw.as_bytes())
+}
+
+/// [`persist_keys`] on the user's config file.
+pub fn persist_config_keys(updates: &[(&str, toml::Value)]) -> Result<()> {
+    persist_keys(&config_file_path(), updates)
 }
 
 pub fn credential_fallback_path() -> PathBuf {
@@ -831,6 +871,109 @@ mod tests {
         assert_eq!(loaded.theme, ThemePreset::Light);
         assert_eq!(loaded.density, DensityMode::Compact);
         assert_eq!(loaded.pinned_sites, vec!["site-1".to_string()]);
+    }
+
+    fn read_table(path: &Path) -> toml::Table {
+        toml::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn persist_keys_does_not_bake_env_overrides() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let _clean = EnvVarGuard::clear_auth_env();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, format!("graph_base_url = \"{DEFAULT_GRAPH_BASE_URL}\"\nnotify = true\n")).unwrap();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let _env = EnvVarGuard::set(&[
+            ("SHAREPOINT_CONFIG_DIR", Some(dir_str.as_str())),
+            ("SHAREPOINT_GRAPH_BASE_URL", Some("http://127.0.0.1:9/mock/v1.0")),
+            ("SHAREPOINT_CLIENT_ID", Some("client-id-from-env")),
+            ("SHAREPOINT_IMAGE_PROTOCOL", Some("sixel")),
+        ]);
+
+        // This run sees the environment's values...
+        let loaded = AppConfig::load();
+        assert_eq!(loaded.graph_base_url, "http://127.0.0.1:9/mock/v1.0");
+        assert_eq!(loaded.client_id, "client-id-from-env");
+        assert_eq!(loaded.image_protocol, ImageProtocolPreference::Sixel);
+
+        // ...and saving one setting writes that setting only.
+        persist_config_keys(&[("notify", toml::Value::Boolean(false))]).unwrap();
+        let table = read_table(&path);
+        assert_eq!(table["graph_base_url"].as_str(), Some(DEFAULT_GRAPH_BASE_URL));
+        assert_eq!(table["notify"].as_bool(), Some(false));
+        assert_eq!(table.len(), 2, "no other key may appear: {table:?}");
+
+        // The whole-struct save is what used to bake them in.
+        let baked = dir.path().join("baked.toml");
+        loaded.save_to(&baked).unwrap();
+        assert_eq!(
+            read_table(&baked)["graph_base_url"].as_str(),
+            Some("http://127.0.0.1:9/mock/v1.0")
+        );
+    }
+
+    #[test]
+    fn persist_keys_preserves_unrelated_and_unknown_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "theme = \"light\"\npinned_sites = [\"site-1\"]\nfuture_setting = \"keep me\"\n\n[future_table]\nanswer = 42\n",
+        )
+        .unwrap();
+
+        persist_keys(
+            &path,
+            &[
+                ("density", toml::Value::try_from(DensityMode::Compact).unwrap()),
+                ("theme", toml::Value::try_from(ThemePreset::Dark).unwrap()),
+            ],
+        )
+        .unwrap();
+
+        let table = read_table(&path);
+        assert_eq!(table["future_setting"].as_str(), Some("keep me"));
+        assert_eq!(table["future_table"]["answer"].as_integer(), Some(42));
+        assert_eq!(table["pinned_sites"].as_array().map(Vec::len), Some(1));
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.density, DensityMode::Compact);
+        assert_eq!(loaded.theme, ThemePreset::Dark, "an existing key takes the new value");
+        assert_eq!(loaded.pinned_sites, vec!["site-1".to_string()]);
+
+        // No updates, no write.
+        let before = fs::read(&path).unwrap();
+        persist_keys(&path, &[]).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn persist_keys_creates_minimal_file_when_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("not-yet").join("config.toml");
+        persist_keys(&path, &[("notify", toml::Value::Boolean(false))]).unwrap();
+
+        let table = read_table(&path);
+        assert_eq!(table.len(), 1, "{table:?}");
+        // Everything else comes from the defaults at load time.
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert!(!loaded.notify);
+        assert!(loaded.show_nav_rail);
+        assert_eq!(loaded.active_poll_ms, 10_000);
+    }
+
+    #[test]
+    fn persist_keys_refuses_to_clobber_unparsable_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let broken = "notify = = true\n# half-edited by hand\n";
+        fs::write(&path, broken).unwrap();
+
+        let err = persist_keys(&path, &[("notify", toml::Value::Boolean(false))])
+            .expect_err("a file that does not parse must not be replaced");
+        assert!(format!("{err:#}").contains("does not parse"), "{err:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
     }
 
     #[test]

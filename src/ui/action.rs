@@ -882,7 +882,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::CycleImageProtocol => {
             ui.graphics_caps.protocol = ui.graphics_caps.protocol.next_manual();
             app.rendered_images.clear();
-            app.save_ui_prefs(ui);
+            app.save_image_protocol_choice(ui);
             ui.toast(
                 format!("Image protocol: {}", ui.graphics_caps.protocol.label()),
                 ToastKind::Info,

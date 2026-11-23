@@ -783,7 +783,11 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             if let Some(tf) = token_file {
                 cfg.token_file = tf.to_string_lossy().into_owned();
                 let tok = read_external_token_file(&tf, &cfg)?;
-                cfg.save()?;
+                // Only this key: `cfg` also holds whatever the environment set for this run.
+                config::persist_config_keys(&[(
+                    "token_file",
+                    toml::Value::String(cfg.token_file.clone()),
+                )])?;
                 if as_json {
                     println!(
                         "{}",
