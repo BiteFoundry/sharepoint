@@ -51,6 +51,32 @@ const SOCKET_SAFETY_DELTA_SECS: u64 = 120;
 const SOCKET_RECONNECT_BASE_SECS: u64 = 2;
 const SOCKET_RECONNECT_MAX_SECS: u64 = 60;
 const SOCKET_UNSUPPORTED_RETRY_SECS: u64 = 300;
+/// Sites listed for the sidebar besides the followed ones. A bounded bootstrap: sites
+/// beyond it are reached through search (`/`) or `sharepoint sites <name>`.
+const SIDEBAR_SITE_DISCOVERY_LIMIT: usize = 50;
+/// Sites whose libraries are fetched up front. The rest load when their row is opened.
+const SIDEBAR_DRIVE_PREFETCH_SITES: usize = 12;
+
+/// Sidebar site list: followed sites first, then discovered sites not already present.
+/// The order matters: `sites_for_drive_prefetch` takes the head of this list.
+fn merge_sidebar_sites(
+    followed: Vec<SharePointSite>,
+    discovered: Vec<SharePointSite>,
+) -> Vec<SharePointSite> {
+    let mut sites = followed;
+    for site in discovered {
+        if !sites.iter().any(|existing| existing.id == site.id) {
+            sites.push(site);
+        }
+    }
+    sites
+}
+
+/// The sites whose libraries are prefetched: the head of the merged list, i.e. followed
+/// sites before discovered ones.
+fn sites_for_drive_prefetch(sites: &[SharePointSite]) -> &[SharePointSite] {
+    &sites[..sites.len().min(SIDEBAR_DRIVE_PREFETCH_SITES)]
+}
 
 pub(crate) struct SyncSharedState {
     epoch: Instant,
@@ -381,21 +407,20 @@ pub async fn bootstrap_sharepoint(graph: &GraphClient, storage: &Storage) -> Res
 
     let followed_res = graph.list_followed_sites().await;
     let authoritative_follow = followed_res.is_ok();
-    let mut sites = followed_res.unwrap_or_default();
-    if let Ok(discovered) = graph.list_sites(Some("*"), 50).await {
-        for s in discovered {
-            if !sites.iter().any(|existing| existing.id == s.id) {
-                sites.push(s);
-            }
-        }
-    }
+    let sites = merge_sidebar_sites(
+        followed_res.unwrap_or_default(),
+        graph
+            .list_sites(Some("*"), SIDEBAR_SITE_DISCOVERY_LIMIT)
+            .await
+            .unwrap_or_default(),
+    );
     if authoritative_follow {
         let _ = storage.upsert_sites_with_follow_state(&sites);
     } else if !sites.is_empty() {
         let _ = storage.upsert_sites(&sites);
     }
     if !sites.is_empty() {
-        for site in sites.iter().take(6) {
+        for site in sites_for_drive_prefetch(&sites) {
             if let Ok(drives) = graph
                 .list_site_drives(&site.id, Some(site.effective_name()))
                 .await
@@ -1493,14 +1518,13 @@ async fn sync_sites_once(
 ) {
     let followed_res = graph.list_followed_sites().await;
     let authoritative_follow = followed_res.is_ok();
-    let mut combined: Vec<SharePointSite> = followed_res.unwrap_or_default();
-    if let Ok(discovered) = graph.list_sites(Some("*"), 50).await {
-        for site in discovered {
-            if !combined.iter().any(|existing| existing.id == site.id) {
-                combined.push(site);
-            }
-        }
-    }
+    let combined: Vec<SharePointSite> = merge_sidebar_sites(
+        followed_res.unwrap_or_default(),
+        graph
+            .list_sites(Some("*"), SIDEBAR_SITE_DISCOVERY_LIMIT)
+            .await
+            .unwrap_or_default(),
+    );
     if authoritative_follow {
         let _ = storage.upsert_sites_with_follow_state(&combined);
     } else if !combined.is_empty() {
@@ -1508,7 +1532,7 @@ async fn sync_sites_once(
     }
     if !combined.is_empty() || authoritative_follow {
         let _ = event_tx.send(CoreEvent::SitesUpdated(combined.clone()));
-        for site in combined.iter().take(6) {
+        for site in sites_for_drive_prefetch(&combined) {
             if let Ok(drives) = graph
                 .list_site_drives(&site.id, Some(site.effective_name()))
                 .await
@@ -1604,5 +1628,45 @@ mod tests {
         assert!(b.is_backed_off(now));
         assert!(b.record_success());
         assert!(!b.is_backed_off(now));
+    }
+
+    fn test_site(id: &str, is_followed: bool) -> SharePointSite {
+        SharePointSite {
+            id: id.to_string(),
+            name: id.to_string(),
+            display_name: id.to_string(),
+            description: None,
+            web_url: None,
+            is_followed,
+            created_at: None,
+            last_modified_at: None,
+        }
+    }
+
+    #[test]
+    fn drive_prefetch_prioritises_followed_sites() {
+        // More discovered sites than the prefetch budget, and two followed sites that the
+        // discovery listing also returns (late in its order).
+        let followed = vec![test_site("followed-a", true), test_site("followed-b", true)];
+        let mut discovered: Vec<SharePointSite> = (0..SIDEBAR_SITE_DISCOVERY_LIMIT)
+            .map(|i| test_site(&format!("discovered-{i}"), false))
+            .collect();
+        discovered.push(test_site("followed-b", false));
+
+        let merged = merge_sidebar_sites(followed, discovered);
+        assert_eq!(merged.len(), SIDEBAR_SITE_DISCOVERY_LIMIT + 2, "no duplicate of followed-b");
+        assert_eq!(merged[0].id, "followed-a");
+        assert_eq!(merged[1].id, "followed-b");
+        assert!(merged[1].is_followed, "the followed entry wins over the discovered duplicate");
+
+        let prefetch = sites_for_drive_prefetch(&merged);
+        assert_eq!(prefetch.len(), SIDEBAR_DRIVE_PREFETCH_SITES);
+        assert_eq!(prefetch[0].id, "followed-a");
+        assert_eq!(prefetch[1].id, "followed-b");
+
+        // Fewer sites than the budget: all of them, no panic.
+        let few = merge_sidebar_sites(vec![test_site("only", true)], Vec::new());
+        assert_eq!(sites_for_drive_prefetch(&few).len(), 1);
+        assert!(sites_for_drive_prefetch(&[]).is_empty());
     }
 }

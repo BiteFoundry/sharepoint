@@ -1055,6 +1055,27 @@ fn select_list_index(idx: usize, app: &mut AppState, ui: &mut UiState) {
     app.ensure_inspector_loaded(ui);
 }
 
+/// Applies one activation of a SharePoint site row and returns whether its libraries must
+/// be fetched.
+///
+/// A site whose libraries are not loaded renders as expanded-but-empty, so its first
+/// activation must load them and leave the row expanded (toggling here would collapse an
+/// empty row and need a second activation). Only a loaded site toggles collapse.
+pub(crate) fn site_row_activation(
+    collapsed_sites: &mut std::collections::HashSet<String>,
+    site_id: &str,
+    drives_loaded: bool,
+) -> bool {
+    if !drives_loaded {
+        collapsed_sites.remove(site_id);
+        return true;
+    }
+    if !collapsed_sites.remove(site_id) {
+        collapsed_sites.insert(site_id.to_string());
+    }
+    false
+}
+
 fn activate_nav_row(row_idx: usize, app: &mut AppState, ui: &mut UiState) {
     let rows = build_nav_rows(app, ui);
     let Some(row) = rows.get(row_idx).cloned() else {
@@ -1076,9 +1097,8 @@ fn activate_nav_row(row_idx: usize, app: &mut AppState, ui: &mut UiState) {
             let _ = dispatch(Action::OpenSharedWithMe, app, ui);
         }
         NavRow::SharePointSite { site_id, label, .. } => {
-            if !ui.collapsed_sites.remove(&site_id) {
-                ui.collapsed_sites.insert(site_id.clone());
-            } else if !app.site_drives.contains_key(&site_id) {
+            let drives_loaded = app.site_drives.contains_key(&site_id);
+            if site_row_activation(&mut ui.collapsed_sites, &site_id, drives_loaded) {
                 let graph = app.graph.clone();
                 let storage = app.storage.clone();
                 let tx = app.ui_tx.clone();
@@ -1257,4 +1277,41 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::site_row_activation;
+
+    #[test]
+    fn site_row_first_activation_loads_libraries_and_stays_expanded() {
+        // Libraries not loaded yet: one activation requests them and never collapses.
+        let mut collapsed: HashSet<String> = HashSet::new();
+        assert!(site_row_activation(&mut collapsed, "site-a", false));
+        assert!(!collapsed.contains("site-a"), "first activation must not collapse the row");
+
+        // Still not loaded (request in flight or failed): asks again, still expanded.
+        assert!(site_row_activation(&mut collapsed, "site-a", false));
+        assert!(!collapsed.contains("site-a"));
+
+        // A site collapsed earlier without libraries expands on activation.
+        collapsed.insert("site-b".to_string());
+        assert!(site_row_activation(&mut collapsed, "site-b", false));
+        assert!(!collapsed.contains("site-b"));
+    }
+
+    #[test]
+    fn site_row_with_loaded_libraries_toggles_collapse() {
+        let mut collapsed: HashSet<String> = HashSet::new();
+        assert!(!site_row_activation(&mut collapsed, "site-a", true));
+        assert!(collapsed.contains("site-a"));
+        assert!(!site_row_activation(&mut collapsed, "site-a", true));
+        assert!(!collapsed.contains("site-a"));
+        // Other sites are untouched.
+        collapsed.insert("site-b".to_string());
+        assert!(!site_row_activation(&mut collapsed, "site-a", true));
+        assert!(collapsed.contains("site-a") && collapsed.contains("site-b"));
+    }
 }
