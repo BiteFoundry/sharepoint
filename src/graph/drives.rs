@@ -1602,8 +1602,10 @@ impl GraphClient {
         }
 
         // Explicit `fail` or `rename` conflict policy on non-conditional uploads:
-        // prefer documented `createUploadSession` conflictBehavior for non-empty payloads,
-        // and check up front for zero-length `fail` so servers ignoring PUT headers still reject.
+        // prefer documented `createUploadSession` conflictBehavior for non-empty payloads.
+        // A zero-length payload cannot use an upload session, and the simple `PUT .../content`
+        // has no documented conflict parameter (it replaces), so the policy is applied up
+        // front instead: `fail` rejects an existing name, `rename` uploads under a free name.
         if matches!(
             options.conflict_behavior,
             Some(ConflictBehavior::Fail | ConflictBehavior::Rename)
@@ -1620,6 +1622,21 @@ impl GraphClient {
                         file_name,
                         &bytes,
                         DEFAULT_UPLOAD_CHUNK_BYTES,
+                        options,
+                    )
+                    .await;
+            }
+            let targets_item_id = options
+                .target_item_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            if options.conflict_behavior == Some(ConflictBehavior::Rename) && !targets_item_id {
+                return self
+                    .upload_empty_file_with_rename(
+                        drive_id,
+                        parent_item_id,
+                        file_name,
+                        content_type,
                         options,
                     )
                     .await;
@@ -1656,6 +1673,74 @@ impl GraphClient {
             options,
         )
         .await
+    }
+
+    /// Zero-length upload with conflict behavior `rename`: never replaces an existing file.
+    ///
+    /// The name is used as given when it is free. Otherwise the first free `name N.ext`
+    /// (the form Graph itself uses when it renames) is looked up and the empty file is
+    /// created there, so the existing file is never the target of the `PUT`.
+    async fn upload_empty_file_with_rename(
+        &self,
+        drive_id: &str,
+        parent_item_id: Option<&str>,
+        file_name: &str,
+        content_type: Option<&str>,
+        options: &UploadOptions,
+    ) -> Result<DriveItem> {
+        let existing = match self
+            .get_item_by_parent_and_name(drive_id, parent_item_id, file_name)
+            .await
+        {
+            Ok(existing) => existing,
+            Err(err) if is_not_found_error(&err) => {
+                return self
+                    .upload_file_simple_put(
+                        drive_id,
+                        parent_item_id,
+                        file_name,
+                        Vec::new(),
+                        content_type,
+                        options,
+                    )
+                    .await;
+            }
+            Err(err) => return Err(err),
+        };
+
+        for n in 1..=MAX_RENAME_CANDIDATES {
+            let candidate = renamed_file_name(file_name, n);
+            match self
+                .get_item_by_parent_and_name(drive_id, parent_item_id, &candidate)
+                .await
+            {
+                Ok(_taken) => continue,
+                Err(err) if is_not_found_error(&err) => {
+                    let created = self
+                        .upload_file_simple_put(
+                            drive_id,
+                            parent_item_id,
+                            &candidate,
+                            Vec::new(),
+                            content_type,
+                            options,
+                        )
+                        .await?;
+                    if created.id == existing.id {
+                        // Must not be reported as a successful rename.
+                        bail!(
+                            "Upload of empty '{file_name}' with conflict behavior 'rename' did not create a new file: the server returned the existing item (id: {}), which may have been replaced. Check the file's version history.",
+                            existing.id
+                        );
+                    }
+                    return Ok(created);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        bail!(
+            "Upload conflict for '{file_name}': no free name found after {MAX_RENAME_CANDIDATES} attempts with conflict behavior 'rename'. Upload under a different name."
+        )
     }
 
     async fn upload_item_content_put(
@@ -2284,6 +2369,19 @@ impl GraphClient {
     }
 }
 
+/// How many `name N.ext` candidates a zero-length `rename` upload probes.
+const MAX_RENAME_CANDIDATES: usize = 100;
+
+/// `notes.txt` -> `notes 1.txt`, `README` -> `README 1`, `.env` -> `.env 1`: the suffix
+/// goes before the last extension, as in the names Graph generates when it renames.
+fn renamed_file_name(file_name: &str, n: usize) -> String {
+    let name = file_name.trim();
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => format!("{stem} {n}.{ext}"),
+        _ => format!("{name} {n}"),
+    }
+}
+
 fn is_not_found_error(err: &anyhow::Error) -> bool {
     let lower = format!("{err:#}").to_ascii_lowercase();
     lower.contains("404") || lower.contains("itemnotfound") || lower.contains("not found")
@@ -2354,5 +2452,16 @@ mod tests {
         assert_eq!(normalize_graph_parent_path("/drive/root:/Docs/"), "/Docs");
         assert_eq!(encode_graph_path("/Projects/Q4 Plan/deck.pptx"), "Projects/Q4%20Plan/deck.pptx");
         assert_eq!(encode_graph_path("/"), "");
+    }
+
+    #[test]
+    fn renamed_file_name_puts_the_suffix_before_the_extension() {
+        assert_eq!(renamed_file_name("notes.txt", 1), "notes 1.txt");
+        assert_eq!(renamed_file_name("notes.txt", 12), "notes 12.txt");
+        assert_eq!(renamed_file_name("archive.tar.gz", 2), "archive.tar 2.gz");
+        assert_eq!(renamed_file_name("README", 1), "README 1");
+        assert_eq!(renamed_file_name(".env", 1), ".env 1");
+        assert_eq!(renamed_file_name("trailing.", 1), "trailing. 1");
+        assert_eq!(renamed_file_name("  보고서 v1.docx ", 3), "보고서 v1 3.docx");
     }
 }
