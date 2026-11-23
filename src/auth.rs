@@ -372,6 +372,11 @@ impl AuthManager {
     }
 
     fn resolve_shared_teams_token_file_path(&self) -> Option<PathBuf> {
+        // With sharing switched off there is no shared file to find. Checked here, not at
+        // the callers, so every path that asks for the file honours the setting.
+        if !self.config.share_m365_auth {
+            return None;
+        }
         #[cfg(test)]
         if self.token_path_override.is_some()
             && self.legacy_teams_dir_override.is_none()
@@ -3264,6 +3269,101 @@ mod tests {
             .with_token_path(sp_cred_path)
             .with_legacy_teams_dir(teams_dir);
         assert!(mgr_disabled.current_tokens().await.is_none());
+    }
+
+    /// A teams-cli config dir whose `token_file` holds a valid, SharePoint-eligible token,
+    /// and no SharePoint session of our own. Returns `(tempdir, teams_dir, sp_cred_path, token)`.
+    fn shared_teams_token_file_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
+        let dir = tempdir().unwrap();
+        let teams_dir = dir.path().join("teams-cli");
+        std::fs::create_dir_all(&teams_dir).unwrap();
+        let teams_tok_path = dir.path().join("shared_teams_token.txt");
+        std::fs::write(
+            teams_dir.join("config.toml"),
+            format!(
+                "token_file = \"{}\"\n",
+                teams_tok_path.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let sp_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "exp": chrono::Utc::now().timestamp() + 3600,
+                "scp": "User.Read Files.ReadWrite Sites.Read.All"
+            }),
+            false,
+        );
+        std::fs::write(&teams_tok_path, &sp_jwt).unwrap();
+        let sp_cred_path = dir.path().join("sharepoint_creds.json");
+        (dir, teams_dir, sp_cred_path, sp_jwt)
+    }
+
+    fn auth_manager_for_sharing(share: bool, sp_cred_path: PathBuf, teams_dir: PathBuf) -> AuthManager {
+        let cfg = AppConfig {
+            share_m365_auth: share,
+            // Nothing listens here: a refresh that reaches OAuth fails fast instead of
+            // leaving the machine.
+            auth_base_url: "http://127.0.0.1:1".into(),
+            ..AppConfig::default()
+        };
+        AuthManager::empty_for_test(cfg)
+            .with_token_path(sp_cred_path)
+            .with_legacy_teams_dir(teams_dir)
+    }
+
+    #[tokio::test]
+    async fn refresh_now_ignores_shared_teams_token_file_when_sharing_disabled() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+        let (_dir, teams_dir, sp_cred_path, sp_jwt) = shared_teams_token_file_fixture();
+
+        let disabled = auth_manager_for_sharing(false, sp_cred_path.clone(), teams_dir.clone());
+        match disabled.refresh_now().await {
+            Ok(tok) => panic!(
+                "sharing is off, yet refresh_now returned a token (auth_mode {}, shared: {})",
+                tok.auth_mode,
+                tok.access_token == sp_jwt
+            ),
+            Err(err) => assert!(
+                !format!("{err:#}").contains("Shared Teams token file"),
+                "the shared file must not be consulted at all: {err:#}"
+            ),
+        }
+        assert!(disabled.current_tokens().await.is_none());
+
+        // Control: with the default (sharing on) the same setup hands out the Teams token.
+        let enabled = auth_manager_for_sharing(true, sp_cred_path, teams_dir);
+        let tok = enabled.refresh_now().await.expect("shared token when sharing is on");
+        assert_eq!(tok.access_token, sp_jwt);
+        assert_eq!(tok.auth_mode, "shared_teams_token_file");
+    }
+
+    #[tokio::test]
+    async fn refresh_for_failed_token_ignores_shared_teams_token_file_when_sharing_disabled() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::clear_auth_env();
+        let (_dir, teams_dir, sp_cred_path, sp_jwt) = shared_teams_token_file_fixture();
+
+        let disabled = auth_manager_for_sharing(false, sp_cred_path.clone(), teams_dir.clone());
+        match disabled.refresh_for_failed_token("rejected-token").await {
+            Ok(tok) => panic!(
+                "sharing is off, yet the 401 path returned a token (auth_mode {}, shared: {})",
+                tok.auth_mode,
+                tok.access_token == sp_jwt
+            ),
+            Err(err) => assert!(
+                !format!("{err:#}").contains("Shared Teams token file"),
+                "the shared file must not be consulted at all: {err:#}"
+            ),
+        }
+
+        // Control: with sharing on, the 401 path picks up the Teams token.
+        let enabled = auth_manager_for_sharing(true, sp_cred_path, teams_dir);
+        let tok = enabled
+            .refresh_for_failed_token("rejected-token")
+            .await
+            .expect("shared token when sharing is on");
+        assert_eq!(tok.access_token, sp_jwt);
     }
 
     #[tokio::test]
