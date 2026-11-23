@@ -31,6 +31,22 @@ sharepoint mcp
 19. `list_columns`
 20. `update_list_item_field`
 
+## Request cost
+
+Tool descriptions state what a call costs, so an agent can pick the cheap form:
+
+| Tool | Cost |
+| --- | --- |
+| `list_sites` | One or two Graph requests (followed sites, then the site search). `offline: true` reads the cache. |
+| `list_drives` | Without `site`, one Graph request per site, up to 200 sites; this can take many seconds. Pass `site`, or `offline: true` to read the cache. |
+| `list_files`, `list_recent`, `list_shared_with_me` | One Graph request per 200 items. `offline: true` reads the cache. |
+| `search_files` | With `remote` (the default), one Graph search request, at most 100 hits across sites. `remote: false` searches only the local cache. |
+| `read_text_file` | Downloads at most `max_bytes` (default 256 KiB). |
+| `download_file` | Transfers the whole file. |
+| `upload_file` | An upload session sends the file in chunks of about 3 MiB, one request each. |
+| `list_versions` | Without `limit`, pages through the full history. |
+| `list_items` | One Graph request per page. |
+
 ## Drives
 
 Without `site`, `list_drives` scans up to 200 followed and discovered SharePoint

@@ -952,27 +952,27 @@ async fn call_tool(
 pub fn tool_catalog() -> Vec<Value> {
     vec![
         tool_def("whoami", "Show current Microsoft 365 user identity, persona, and OAuth scope diagnostics", json!({ "type": "object", "properties": {} })),
-        tool_def("list_sites", "List followed and discovered SharePoint sites", json!({ "type": "object", "properties": { "search": { "type": "string" }, "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
-        tool_def("list_drives", "List Personal OneDrive and SharePoint document libraries. Without site, scans up to 200 followed and discovered sites.", json!({ "type": "object", "properties": { "site": { "type": "string" }, "offline": { "type": "boolean" } } })),
-        tool_def("list_files", "List files and folders inside a OneDrive or SharePoint drive", json!({ "type": "object", "properties": { "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" }, "path": { "type": "string" }, "limit": { "type": "integer", "description": "Maximum items (default 100). has_more reports whether the folder holds more." }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Return the drive ID and core item fields" } } })),
+        tool_def("list_sites", "List followed and discovered SharePoint sites. Makes one or two Graph requests (followed sites, then the site search); offline: true reads the cache without a request.", json!({ "type": "object", "properties": { "search": { "type": "string" }, "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
+        tool_def("list_drives", "List Personal OneDrive and SharePoint document libraries. Without site, scans up to 200 followed and discovered sites, one Graph request per site, which can take many seconds; pass site, or offline: true to read the cache.", json!({ "type": "object", "properties": { "site": { "type": "string" }, "offline": { "type": "boolean" } } })),
+        tool_def("list_files", "List files and folders inside a OneDrive or SharePoint drive. One Graph request per 200 items; offline: true reads the cache.", json!({ "type": "object", "properties": { "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" }, "path": { "type": "string" }, "limit": { "type": "integer", "description": "Maximum items (default 100). has_more reports whether the folder holds more." }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Return the drive ID and core item fields" } } })),
         tool_def("get_file_info", "Get detailed metadata for a file or folder by item_id or path", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Default true: core item fields, eTag, omitted field names and a hint. Pass false for every field." } } })),
-        tool_def("read_text_file", "Read UTF-8 or BOM-marked UTF-16 text up to the original byte cap. Use download_file for binary files.", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "max_bytes": { "type": "integer" } } })),
-        tool_def("download_file", "Download a OneDrive or SharePoint file to local disk, returning { ok, path, file_name, mime_type, size_bytes, is_image, drive_id, item_id, e_tag, c_tag }", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "dir": { "type": "string" } } })),
-        tool_def("upload_file", "Upload a local file, base64 bytes, or text content. Files at least 4 MiB and conditional replacements use an upload session.", json!({ "type": "object", "properties": { "local_path": { "type": "string" }, "file_name": { "type": "string" }, "content_base64": { "type": "string" }, "content_text": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string", "description": "Folder item ID, or a path starting with / such as /Team Docs" }, "item_id": { "type": "string" }, "if_match": { "type": "string", "description": "eTag precondition for replacement via an upload session at any size" }, "conflict_behavior": { "type": "string", "enum": ["replace", "fail", "rename"] } } })),
+        tool_def("read_text_file", "Read UTF-8 or BOM-marked UTF-16 text up to the original byte cap. Downloads at most max_bytes (default 256 KiB). Use download_file for binary files.", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "max_bytes": { "type": "integer" } } })),
+        tool_def("download_file", "Download a OneDrive or SharePoint file to local disk, returning { ok, path, file_name, mime_type, size_bytes, is_image, drive_id, item_id, e_tag, c_tag }. Transfers the whole file, so the call takes longer as the file grows.", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "dir": { "type": "string" } } })),
+        tool_def("upload_file", "Upload a local file, base64 bytes, or text content. Files at least 4 MiB and conditional replacements use an upload session, which sends the file in chunks of about 3 MiB, one request each.", json!({ "type": "object", "properties": { "local_path": { "type": "string" }, "file_name": { "type": "string" }, "content_base64": { "type": "string" }, "content_text": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string", "description": "Folder item ID, or a path starting with / such as /Team Docs" }, "item_id": { "type": "string" }, "if_match": { "type": "string", "description": "eTag precondition for replacement via an upload session at any size" }, "conflict_behavior": { "type": "string", "enum": ["replace", "fail", "rename"] } } })),
         tool_def("create_folder", "Create a new folder inside OneDrive or a SharePoint document library", json!({ "type": "object", "required": ["name"], "properties": { "name": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string", "description": "Folder item ID, or a path starting with / such as /Team Docs" } } })),
         tool_def("move_or_rename_item", "Rename and/or move a OneDrive or SharePoint item to another folder", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "new_name": { "type": "string" }, "new_parent_id": { "type": "string", "description": "Folder item ID, or a path starting with / such as /Team Docs" }, "drive": { "type": "string" }, "site": { "type": "string" } } })),
         tool_def("delete_item", "Delete a OneDrive or SharePoint file or folder (requires confirm: true)", json!({ "type": "object", "required": ["confirm"], "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "confirm": { "type": "boolean" } } })),
-        tool_def("search_files", "Search files in local SQLite FTS5 cache and/or Microsoft Graph", json!({ "type": "object", "required": ["query"], "properties": { "query": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "remote": { "type": "boolean", "description": "Default true: query Microsoft Graph and fill remaining slots from the local cache. false searches the local cache only." }, "limit": { "type": "integer" } } })),
+        tool_def("search_files", "Search files in local SQLite FTS5 cache and/or Microsoft Graph. With remote (the default) this costs one Graph search request, at most 100 hits across sites; remote: false searches only the local cache, with no request.", json!({ "type": "object", "required": ["query"], "properties": { "query": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "remote": { "type": "boolean", "description": "Default true: query Microsoft Graph and fill remaining slots from the local cache. false searches the local cache only." }, "limit": { "type": "integer" } } })),
         tool_def("create_share_link", "Create a SharePoint/OneDrive sharing link (view, edit, or embed)", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "type": { "type": "string", "enum": ["view", "edit", "embed"] }, "scope": { "type": "string", "enum": ["organization", "anonymous"] }, "expires": { "type": "string" } } })),
-        tool_def("list_recent", "List recently accessed OneDrive files", json!({ "type": "object", "properties": { "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
-        tool_def("list_shared_with_me", "List files shared with the signed-in user", json!({ "type": "object", "properties": { "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
-        tool_def("list_versions", "List version history for a OneDrive or SharePoint file", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "limit": { "type": "integer", "minimum": 0, "description": "Maximum versions to fetch. Omit to read the full history. has_more reports whether older versions remain." } } })),
+        tool_def("list_recent", "List recently accessed OneDrive files. One Graph request per 200 items; offline: true reads the cache.", json!({ "type": "object", "properties": { "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
+        tool_def("list_shared_with_me", "List files shared with the signed-in user. One Graph request per 200 items; offline: true reads the cache.", json!({ "type": "object", "properties": { "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
+        tool_def("list_versions", "List version history for a OneDrive or SharePoint file. Without limit this pages through the full history; set limit for a quick look.", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "limit": { "type": "integer", "minimum": 0, "description": "Maximum versions to fetch. Omit to read the full history. has_more reports whether older versions remain." } } })),
         tool_def("list_lists", "List SharePoint Lists in a site to discover list_id values", json!({
             "type": "object", "required": ["site_id"], "properties": {
                 "site_id": { "type": "string" }
             }
         })),
-        tool_def("list_items", "Read one page of rows and field values from a SharePoint List", json!({
+        tool_def("list_items", "Read one page of rows and field values from a SharePoint List. One Graph request per page.", json!({
             "type": "object", "required": ["site_id", "list_id"], "properties": {
                 "site_id": { "type": "string" }, "list_id": { "type": "string" },
                 "fields": { "type": "array", "items": { "type": "string" }, "description": "Internal column names to select" },
@@ -1118,6 +1118,62 @@ mod tests {
             "update_list_item_field",
         ] {
             assert!(names.contains(&required), "missing MCP tool: {required}");
+        }
+    }
+
+    #[test]
+    fn tool_catalog_is_stable_and_heavy_tools_carry_cost_notes() {
+        let tools = tool_catalog();
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "whoami",
+                "list_sites",
+                "list_drives",
+                "list_files",
+                "get_file_info",
+                "read_text_file",
+                "download_file",
+                "upload_file",
+                "create_folder",
+                "move_or_rename_item",
+                "delete_item",
+                "search_files",
+                "create_share_link",
+                "list_recent",
+                "list_shared_with_me",
+                "list_versions",
+                "list_lists",
+                "list_items",
+                "list_columns",
+                "update_list_item_field",
+            ],
+            "cost notes change descriptions only; the 20 tools stay as they are"
+        );
+        for tool in &tools {
+            assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
+        }
+        let description = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .and_then(|t| t["description"].as_str())
+                .unwrap()
+                .to_string()
+        };
+        for (tool, note) in [
+            ("list_drives", "one Graph request per site"),
+            ("list_drives", "offline: true"),
+            ("search_files", "remote: false searches only the local cache"),
+            ("download_file", "Transfers the whole file"),
+            ("list_versions", "pages through the full history"),
+            ("read_text_file", "256 KiB"),
+        ] {
+            assert!(description(tool).contains(note), "{tool}: missing {note:?}");
         }
     }
 
