@@ -1,20 +1,34 @@
 openapi: 3.1.0
 info:
   title: "@bitefoundry/sharepoint Local HTTP API"
-  version: 0.1.0
-  description: Local HTTP JSON API for Microsoft SharePoint & OneDrive (`sharepoint serve`, default port 8790).
+  version: 0.4.1
+  description: >-
+    Local HTTP JSON API for Microsoft SharePoint & OneDrive (`sharepoint serve`, default
+    127.0.0.1:8790). Every /v1 route needs a Bearer key unless the server was started with
+    --allow-keyless. Requests whose Host header does not name this server get 403 on every
+    route. See docs/API.md for the access rules.
 servers:
   - url: http://127.0.0.1:8790
+components:
+  securitySchemes:
+    bearerKey:
+      type: http
+      scheme: bearer
+      description: The --api-key value, or the key printed to stderr at startup.
+security:
+  - bearerKey: []
 paths:
   /health:
     get:
       summary: Health check
+      security: []
       responses:
         "200":
           description: Service status
   /openapi.yaml:
     get:
       summary: OpenAPI 3.1 specification
+      security: []
       responses:
         "200":
           description: OpenAPI YAML document
@@ -24,21 +38,111 @@ paths:
       responses:
         "200":
           description: Identity and scope diagnostics
+        "401":
+          description: Missing or wrong Bearer key
   /v1/sites:
     get:
       summary: List followed and discovered SharePoint sites
+      parameters:
+        - name: search
+          in: query
+          required: false
+          description: Site name or keyword.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Maximum items to return.
+          schema:
+            type: integer
+        - name: offline
+          in: query
+          required: false
+          description: Answer from the local cache without a Graph request.
+          schema:
+            type: boolean
+        - name: refresh
+          in: query
+          required: false
+          description: Ask Graph even when offline=true is set.
+          schema:
+            type: boolean
       responses:
         "200":
           description: Sites list
   /v1/drives:
     get:
       summary: List Personal OneDrive and SharePoint document libraries
+      description: Without site, makes one Graph request per site (up to 200 sites).
+      parameters:
+        - name: site
+          in: query
+          required: false
+          description: Limit to one site (name, URL or ID).
+          schema:
+            type: string
+        - name: offline
+          in: query
+          required: false
+          description: Answer from the local cache without a Graph request.
+          schema:
+            type: boolean
+        - name: refresh
+          in: query
+          required: false
+          description: Ask Graph even when offline=true is set.
+          schema:
+            type: boolean
       responses:
         "200":
           description: Drives list
   /v1/items:
     get:
       summary: List folder items in a OneDrive or SharePoint drive
+      parameters:
+        - name: drive
+          in: query
+          required: false
+          description: Drive name or ID.
+          schema:
+            type: string
+        - name: site
+          in: query
+          required: false
+          description: Site name, URL or ID.
+          schema:
+            type: string
+        - name: parent_id
+          in: query
+          required: false
+          description: Folder item ID.
+          schema:
+            type: string
+        - name: path
+          in: query
+          required: false
+          description: Folder path such as /Team Docs.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Maximum items to return.
+          schema:
+            type: integer
+        - name: offline
+          in: query
+          required: false
+          description: Answer from the local cache without a Graph request.
+          schema:
+            type: boolean
+        - name: refresh
+          in: query
+          required: false
+          description: Ask Graph even when offline=true is set.
+          schema:
+            type: boolean
       responses:
         "200":
           description: Drive items list
@@ -54,6 +158,8 @@ paths:
       responses:
         "200":
           description: Uploaded DriveItem
+        "403":
+          description: local_path sent to a server started without a key and without --allow-local-paths
   /v1/items/{id}:
     get:
       summary: Get item metadata
@@ -73,6 +179,37 @@ paths:
   /v1/items/{id}/children:
     get:
       summary: List child items of a folder
+      parameters:
+        - name: drive
+          in: query
+          required: false
+          description: Drive name or ID.
+          schema:
+            type: string
+        - name: site
+          in: query
+          required: false
+          description: Site name, URL or ID.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Maximum items to return.
+          schema:
+            type: integer
+        - name: offline
+          in: query
+          required: false
+          description: Answer from the local cache without a Graph request.
+          schema:
+            type: boolean
+        - name: refresh
+          in: query
+          required: false
+          description: Ask Graph even when offline=true is set.
+          schema:
+            type: boolean
       responses:
         "200":
           description: Child DriveItems
@@ -94,15 +231,49 @@ paths:
       responses:
         "200":
           description: Share link result
+  /v1/items/{id}/download:
+    post:
+      summary: Download a file by item ID to local disk
+      responses:
+        "200":
+          description: "{ ok, path, file_name, mime_type, size_bytes, is_image }"
+        "403":
+          description: dir sent to a server started without a key and without --allow-local-paths
   /v1/recent:
     get:
       summary: List recently accessed OneDrive files
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum items to return.
+          schema:
+            type: integer
+        - name: offline
+          in: query
+          required: false
+          description: Answer from the local cache without a Graph request.
+          schema:
+            type: boolean
       responses:
         "200":
           description: Recent items
   /v1/shared:
     get:
       summary: List files shared with me
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum items to return.
+          schema:
+            type: integer
+        - name: offline
+          in: query
+          required: false
+          description: Answer from the local cache without a Graph request.
+          schema:
+            type: boolean
       responses:
         "200":
           description: Shared items
@@ -118,3 +289,5 @@ paths:
       responses:
         "200":
           description: "{ ok, path, file_name, mime_type, size_bytes, is_image }"
+        "403":
+          description: dir sent to a server started without a key and without --allow-local-paths

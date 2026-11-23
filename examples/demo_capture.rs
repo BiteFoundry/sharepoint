@@ -1,5 +1,16 @@
 //! Captures real 120x34 Ratatui TUI frames for `@bitefoundry/sharepoint` using synthetic English demo
 //! data and renders `assets/demo.gif` via the shared `render_tui_gif.py` script.
+//!
+//! The renderer is not part of this repository. Point at it with environment variables:
+//!
+//! - `DEMO_RENDERER_SCRIPT`: path to `render_tui_gif.py`
+//!   (default: `scripts/render_tui_gif.py` in this repository)
+//! - `DEMO_PREVIEW_DIR`: where the per-frame preview PNGs go
+//!   (default: `target/demo-previews/sharepoint` in this repository)
+//!
+//! ```sh
+//! DEMO_RENDERER_SCRIPT=/path/to/render_tui_gif.py cargo run --example demo_capture
+//! ```
 
 use std::{
     path::{Path, PathBuf},
@@ -42,8 +53,31 @@ use tokio::sync::{mpsc, watch};
 
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 34;
-const RENDER_SCRIPT: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\render_tui_gif.py";
-const PREVIEW_DIR: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\gif-previews\sharepoint";
+
+fn env_path(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `DEMO_RENDERER_SCRIPT`, else `scripts/render_tui_gif.py` in this repository.
+fn renderer_script() -> PathBuf {
+    env_path("DEMO_RENDERER_SCRIPT").unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("render_tui_gif.py")
+    })
+}
+
+/// `DEMO_PREVIEW_DIR`, else `target/demo-previews/sharepoint` in this repository.
+fn preview_dir() -> PathBuf {
+    env_path("DEMO_PREVIEW_DIR").unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("demo-previews")
+            .join("sharepoint")
+    })
+}
 
 fn color_to_json(c: Color) -> Value {
     match c {
@@ -899,14 +933,25 @@ fn main() -> Result<()> {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out_gif = repo_root.join("assets").join("demo.gif");
 
+    let render_script = renderer_script();
+    if !render_script.is_file() {
+        bail!(
+            "render_tui_gif.py not found at {}. Set DEMO_RENDERER_SCRIPT to its path.",
+            render_script.display()
+        );
+    }
+    let preview_dir = preview_dir();
+    std::fs::create_dir_all(&preview_dir)
+        .with_context(|| format!("Failed to create {}", preview_dir.display()))?;
+
     let status = Command::new("python")
-        .arg(RENDER_SCRIPT)
+        .arg(&render_script)
         .arg(&frames_path)
         .arg(&out_gif)
         .arg("--preview-png")
-        .arg(PREVIEW_DIR)
+        .arg(&preview_dir)
         .status()
-        .context("Failed to execute render_tui_gif.py")?;
+        .with_context(|| format!("Failed to execute {}", render_script.display()))?;
 
     if !status.success() {
         bail!("render_tui_gif.py exited with status {status}");
@@ -914,6 +959,6 @@ fn main() -> Result<()> {
 
     println!("Wrote frames spec: {}", frames_path.display());
     println!("Wrote demo GIF:    {}", out_gif.display());
-    println!("Preview PNG dir:   {PREVIEW_DIR}");
+    println!("Preview PNG dir:   {}", preview_dir.display());
     Ok(())
 }

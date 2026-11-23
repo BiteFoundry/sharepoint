@@ -207,6 +207,8 @@ curl -H "Authorization: Bearer dev-secret" \
   "http://127.0.0.1:8790/v1/search?q=gateway&remote=true&limit=10"
 ```
 
+The API always needs a Bearer key. Without `--api-key`, `serve` generates one and prints it once to stderr; `--allow-keyless` turns the key off on a loopback address. A non-loopback `--bind` requires `--api-key`. The server answers only requests whose `Host` names it (add a proxy name with `--allowed-host`) and allows CORS from loopback origins plus any `--cors-origin`. Uploads from `local_path` and downloads into `dir` need a key or `--allow-local-paths`.
+
 Full route reference & OpenAPI 3.1 spec: [docs/API.md](docs/API.md) · [docs/openapi.yaml](docs/openapi.yaml).
 
 ### Model Context Protocol (`sharepoint mcp`)
