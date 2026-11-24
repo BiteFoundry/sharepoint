@@ -7,7 +7,7 @@
 //! - Simple upload (`< 4 MiB` `PUT .../content`) and resumable chunked upload session (`>= 4 MiB` `POST .../createUploadSession`)
 //! - Folder creation (`mkdir`), rename/move (`PATCH`), delete (`DELETE`), drive search & cross-site search.
 
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
@@ -344,9 +344,25 @@ struct GraphFolderFacet {
 }
 
 #[derive(Debug, Deserialize)]
+struct GraphFileHashes {
+    #[serde(rename = "sha256Hash", default)]
+    sha256_hash: Option<String>,
+    #[serde(rename = "quickXorHash", default)]
+    quick_xor_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GraphFileFacet {
     #[serde(rename = "mimeType", default)]
     mime_type: Option<String>,
+    #[serde(default)]
+    hashes: Option<GraphFileHashes>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphListItemFacet {
+    #[serde(default)]
+    fields: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,6 +381,8 @@ struct GraphRemoteItem {
     folder: Option<GraphFolderFacet>,
     #[serde(default)]
     file: Option<GraphFileFacet>,
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default)]
     size: Option<u64>,
     #[serde(rename = "webUrl", default)]
@@ -406,6 +424,8 @@ struct GraphDriveItem {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     size: Option<u64>,
     #[serde(default)]
     folder: Option<GraphFolderFacet>,
@@ -433,10 +453,43 @@ struct GraphDriveItem {
     shared: Option<GraphSharedFacet>,
     #[serde(rename = "remoteItem", default)]
     remote_item: Option<GraphRemoteItem>,
+    #[serde(rename = "listItem", default)]
+    list_item: Option<GraphListItemFacet>,
     #[serde(default)]
     deleted: Option<GraphDeletedFacet>,
     #[serde(default)]
     root: Option<serde_json::Value>,
+}
+
+fn is_empty_json_value(val: &serde_json::Value) -> bool {
+    match val {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        serde_json::Value::Array(arr) => arr.is_empty(),
+        serde_json::Value::Object(obj) => obj.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+    }
+}
+
+fn extract_list_item_fields(
+    facet: Option<GraphListItemFacet>,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut out = BTreeMap::new();
+    let Some(fields) = facet.and_then(|li| li.fields) else {
+        return out;
+    };
+    for (key, value) in fields {
+        let trimmed = key.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("@odata.")
+            || trimmed.contains("@odata.")
+            || is_empty_json_value(&value)
+        {
+            continue;
+        }
+        out.insert(key, value);
+    }
+    out
 }
 
 impl GraphDriveItem {
@@ -500,6 +553,25 @@ impl GraphDriveItem {
         let is_folder = folder_facet.is_some();
         let child_count = folder_facet.and_then(|f| f.child_count);
         let mime_type = file_facet.and_then(|f| f.mime_type.clone());
+        let sha256_hash = file_facet
+            .and_then(|f| f.hashes.as_ref())
+            .and_then(|h| h.sha256_hash.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let quick_xor_hash = file_facet
+            .and_then(|f| f.hashes.as_ref())
+            .and_then(|h| h.quick_xor_hash.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let description = self
+            .description
+            .as_deref()
+            .or_else(|| self.remote_item.as_ref().and_then(|r| r.description.as_deref()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let size = self
             .size
             .or_else(|| self.remote_item.as_ref().and_then(|r| r.size))
@@ -511,6 +583,7 @@ impl GraphDriveItem {
             .shared
             .and_then(|s| s.scope)
             .or_else(|| self.remote_item.and_then(|r| r.shared).and_then(|s| s.scope));
+        let list_item_fields = extract_list_item_fields(self.list_item);
 
         DriveItem {
             id: self.id,
@@ -533,6 +606,10 @@ impl GraphDriveItem {
             shared_scope,
             remote_drive_id,
             remote_item_id,
+            description,
+            sha256_hash,
+            quick_xor_hash,
+            list_item_fields,
         }
     }
 }
@@ -991,12 +1068,22 @@ impl GraphClient {
         })
     }
 
+    async fn get_drive_item_with_list_fields(&self, base_endpoint: &str) -> Result<GraphDriveItem> {
+        let expanded = format!("{base_endpoint}?$expand=listItem($expand=fields)");
+        match self.get_json::<GraphDriveItem>(&expanded).await {
+            Ok(raw) => Ok(raw),
+            Err(err) if is_list_item_expand_unsupported(&err) => {
+                self.get_json::<GraphDriveItem>(base_endpoint).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn get_item(&self, drive_id: &str, item_id: &str) -> Result<DriveItem> {
         let enc_drive = urlencoding::encode(drive_id.trim());
         let enc_item = urlencoding::encode(item_id.trim());
-        let raw: GraphDriveItem = self
-            .get_json(&format!("/drives/{enc_drive}/items/{enc_item}"))
-            .await?;
+        let endpoint = format!("/drives/{enc_drive}/items/{enc_item}");
+        let raw = self.get_drive_item_with_list_fields(&endpoint).await?;
         Ok(raw.into_model(drive_id))
     }
 
@@ -1008,7 +1095,7 @@ impl GraphClient {
         } else {
             format!("/drives/{enc_drive}/root:/{encoded_path}:")
         };
-        let raw: GraphDriveItem = self.get_json(&endpoint).await?;
+        let raw = self.get_drive_item_with_list_fields(&endpoint).await?;
         Ok(raw.into_model(drive_id))
     }
 
@@ -2388,6 +2475,16 @@ fn is_not_found_error(err: &anyhow::Error) -> bool {
     lower.contains("404") || lower.contains("itemnotfound") || lower.contains("not found")
 }
 
+fn is_list_item_expand_unsupported(err: &anyhow::Error) -> bool {
+    let lower = format!("{err:#}").to_ascii_lowercase();
+    lower.contains("400 bad request")
+        || lower.contains("501 not implemented")
+        || lower.contains("notsupported")
+        || lower.contains("not supported")
+        || lower.contains("invalidrequest")
+        || lower.contains("badrequest")
+}
+
 fn align_chunk_size(requested: usize) -> usize {
     if requested < UPLOAD_CHUNK_GRANULARITY {
         return requested.max(1);
@@ -2464,5 +2561,198 @@ mod tests {
         assert_eq!(renamed_file_name(".env", 1), ".env 1");
         assert_eq!(renamed_file_name("trailing.", 1), "trailing. 1");
         assert_eq!(renamed_file_name("  보고서 v1.docx ", 3), "보고서 v1 3.docx");
+    }
+
+    #[tokio::test]
+    async fn get_item_and_by_path_expand_list_item_fields_and_fallback_on_400() {
+        use std::sync::{Arc, Mutex};
+        use axum::{
+            extract::{Query, State},
+            http::StatusCode as AxumStatus,
+            response::IntoResponse,
+            routing::get,
+            Json, Router,
+        };
+        use tokio::net::TcpListener;
+        use crate::{
+            auth::{AuthManager, StoredTokens},
+            config::AppConfig,
+        };
+
+        let seen_queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen_queries.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/drives/sp-drive/items/doc-1",
+                get(
+                    |State(seen): State<Arc<Mutex<Vec<String>>>>,
+                     Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                        seen.lock()
+                            .unwrap()
+                            .push(q.get("$expand").cloned().unwrap_or_default());
+                        Json(json!({
+                            "id": "doc-1",
+                            "name": "Q4-Plan.docx",
+                            "description": "Quarterly plan",
+                            "size": 4096,
+                            "file": {
+                                "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                "hashes": {
+                                    "sha256Hash": "AABBCCDD",
+                                    "quickXorHash": "Q123=="
+                                }
+                            },
+                            "listItem": {
+                                "id": "7",
+                                "fields": {
+                                    "@odata.etag": "\"7,1\"",
+                                    "Owner@odata.type": "#String",
+                                    "Status": "Approved",
+                                    "Owner": "Alice",
+                                    "Priority": 2,
+                                    "Reviewed": true,
+                                    "EmptyStr": "   ",
+                                    "NullField": null,
+                                    "EmptyArr": [],
+                                    "EmptyObj": {}
+                                }
+                            }
+                        }))
+                    },
+                ),
+            )
+            .route(
+                "/v1.0/drives/personal-drive/items/od-1",
+                get(
+                    |State(seen): State<Arc<Mutex<Vec<String>>>>,
+                     Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                        let expand = q.get("$expand").cloned().unwrap_or_default();
+                        seen.lock().unwrap().push(expand.clone());
+                        if !expand.is_empty() {
+                            return (
+                                AxumStatus::BAD_REQUEST,
+                                Json(json!({
+                                    "error": {
+                                        "code": "invalidRequest",
+                                        "message": "expand listItem is not supported on personal drives"
+                                    }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        (
+                            AxumStatus::OK,
+                            Json(json!({
+                                "id": "od-1",
+                                "name": "notes.txt",
+                                "description": "Personal notes",
+                                "size": 128,
+                                "file": {
+                                    "mimeType": "text/plain",
+                                    "hashes": { "sha256Hash": "112233" }
+                                }
+                            })),
+                        )
+                            .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/v1.0/drives/personal-drive/root:/Docs/notes.txt:",
+                get(
+                    |State(seen): State<Arc<Mutex<Vec<String>>>>,
+                     Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                        let expand = q.get("$expand").cloned().unwrap_or_default();
+                        seen.lock().unwrap().push(expand.clone());
+                        if !expand.is_empty() {
+                            return (
+                                AxumStatus::BAD_REQUEST,
+                                Json(json!({
+                                    "error": { "code": "notSupported", "message": "not supported" }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        (
+                            AxumStatus::OK,
+                            Json(json!({
+                                "id": "od-2",
+                                "name": "notes.txt",
+                                "size": 64
+                            })),
+                        )
+                            .into_response()
+                    },
+                ),
+            )
+            .with_state(seen_clone);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("{base}/v1.0"),
+            ..AppConfig::default()
+        };
+        let auth = AuthManager::from_tokens(
+            cfg.clone(),
+            StoredTokens {
+                access_token: "test-token".into(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".into(),
+                tenant_id: "tid".into(),
+                user_id: Some("u1".into()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "test".into(),
+            },
+        );
+        let graph = GraphClient::new(cfg, auth).unwrap();
+
+        // 1. SharePoint Document Library item returns custom columns, description, and hashes;
+        //    internal @odata.* keys and empty/null values are filtered out.
+        let sp_item = graph.get_item("sp-drive", "doc-1").await.unwrap();
+        assert_eq!(sp_item.description.as_deref(), Some("Quarterly plan"));
+        assert_eq!(sp_item.sha256_hash.as_deref(), Some("AABBCCDD"));
+        assert_eq!(sp_item.quick_xor_hash.as_deref(), Some("Q123=="));
+        assert_eq!(
+            sp_item.list_item_fields.keys().cloned().collect::<Vec<_>>(),
+            vec!["Owner", "Priority", "Reviewed", "Status"]
+        );
+        assert_eq!(sp_item.list_item_fields["Status"], json!("Approved"));
+        assert_eq!(sp_item.list_item_fields["Owner"], json!("Alice"));
+        assert_eq!(sp_item.list_item_fields["Priority"], json!(2));
+        assert_eq!(sp_item.list_item_fields["Reviewed"], json!(true));
+
+        // 2. Personal drive returning 400 on $expand transparently falls back to unexpanded GET.
+        let od_item = graph.get_item("personal-drive", "od-1").await.unwrap();
+        assert_eq!(od_item.id, "od-1");
+        assert_eq!(od_item.description.as_deref(), Some("Personal notes"));
+        assert_eq!(od_item.sha256_hash.as_deref(), Some("112233"));
+        assert!(od_item.list_item_fields.is_empty());
+
+        // 3. get_item_by_path also transparently falls back on 400.
+        let od_by_path = graph
+            .get_item_by_path("personal-drive", "/Docs/notes.txt")
+            .await
+            .unwrap();
+        assert_eq!(od_by_path.id, "od-2");
+
+        let recorded = seen_queries.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![
+                "listItem($expand=fields)",
+                "listItem($expand=fields)",
+                "",
+                "listItem($expand=fields)",
+                "",
+            ]
+        );
+
+        server.abort();
     }
 }

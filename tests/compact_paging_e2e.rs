@@ -907,7 +907,7 @@ async fn mcp_get_file_info_compact_default_and_full() {
     assert_eq!(item.as_object().unwrap().len(), 10);
     assert_eq!(
         item["hint"],
-        "Call get_file_info with item_id \"f000\", drive \"d1\" and compact:false for every field."
+        "Call get_file_info with item_id \"f000\", drive \"d1\" and fields: [...] for specific fields or compact:false for every field."
     );
     assert_eq!(item["omitted"]["versions"], Value::Null);
 

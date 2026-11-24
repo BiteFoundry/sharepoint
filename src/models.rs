@@ -1,6 +1,6 @@
 //! Shared domain models and wire-independent contracts across Graph, Storage, Sync, TUI, CLI, HTTP, and MCP.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -140,6 +140,19 @@ pub struct DriveItem {
     /// Populated for `sharedWithMe` / remote shortcut items pointing into another drive.
     pub remote_drive_id: Option<String>,
     pub remote_item_id: Option<String>,
+    /// Optional item description from Microsoft Graph `driveItem.description`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// SHA-256 content hash from `file.hashes.sha256Hash` when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256_hash: Option<String>,
+    /// QuickXorHash content hash from `file.hashes.quickXorHash` when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quick_xor_hash: Option<String>,
+    /// Populated custom SharePoint Document Library metadata columns from `listItem.fields`
+    /// (excluding internal `@odata.*` metadata keys and null/empty values).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub list_item_fields: BTreeMap<String, serde_json::Value>,
 }
 
 impl DriveItem {
@@ -343,6 +356,23 @@ impl DriveItem {
             _ => "FILE",
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListColumn {
+    pub id: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub read_only: Option<bool>,
+    pub hidden: Option<bool>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

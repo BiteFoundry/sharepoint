@@ -413,6 +413,26 @@ async fn call_tool(
                 Some(Value::Bool(flag)) => *flag,
                 Some(_) => return Err("compact must be a boolean".to_string()),
             };
+            let fields: Option<Vec<String>> = match args.get("fields") {
+                None | Some(Value::Null) => None,
+                Some(val) => {
+                    let parsed = serde_json::from_value::<Vec<String>>(val.clone())
+                        .map_err(|_| "fields must be an array of field names".to_string())?;
+                    let cleaned: Vec<String> = parsed
+                        .into_iter()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if cleaned.is_empty() {
+                        None
+                    } else {
+                        Some(cleaned)
+                    }
+                }
+            };
+            if let Some(requested) = fields {
+                return Ok(cli::file_info_fields_json(&item, &requested));
+            }
             Ok(cli::file_info_json(&item, !compact, cli::DetailHint::Mcp, false))
         }
         "read_text_file" => {
@@ -955,7 +975,7 @@ pub fn tool_catalog() -> Vec<Value> {
         tool_def("list_sites", "List followed and discovered SharePoint sites. Makes one or two Graph requests (followed sites, then the site search); offline: true reads the cache without a request.", json!({ "type": "object", "properties": { "search": { "type": "string" }, "limit": { "type": "integer" }, "offline": { "type": "boolean" } } })),
         tool_def("list_drives", "List Personal OneDrive and SharePoint document libraries. Without site, scans up to 200 followed and discovered sites, one Graph request per site, which can take many seconds; pass site, or offline: true to read the cache.", json!({ "type": "object", "properties": { "site": { "type": "string" }, "offline": { "type": "boolean" } } })),
         tool_def("list_files", "List files and folders inside a OneDrive or SharePoint drive. One Graph request per 200 items; offline: true reads the cache.", json!({ "type": "object", "properties": { "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string" }, "path": { "type": "string" }, "limit": { "type": "integer", "description": "Maximum items (default 100). has_more reports whether the folder holds more." }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Return the drive ID and core item fields" } } })),
-        tool_def("get_file_info", "Get detailed metadata for a file or folder by item_id or path", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Default true: core item fields, eTag, omitted field names and a hint. Pass false for every field." } } })),
+        tool_def("get_file_info", "Get detailed metadata for a file or folder by item_id or path", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "offline": { "type": "boolean" }, "compact": { "type": "boolean", "description": "Default true: core item fields, eTag, omitted field names and a hint. Pass false for every field, or pass fields: [...] to select specific fields or custom library columns." }, "fields": { "type": "array", "items": { "type": "string" }, "description": "Selective field projection matching standard DriveItem fields (description, hashes, created_by, web_url, list_item_fields, etc.) and case-insensitive custom SharePoint document library column names." } } })),
         tool_def("read_text_file", "Read UTF-8 or BOM-marked UTF-16 text up to the original byte cap. Downloads at most max_bytes (default 256 KiB). Use download_file for binary files.", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "max_bytes": { "type": "integer" } } })),
         tool_def("download_file", "Download a OneDrive or SharePoint file to local disk, returning { ok, path, file_name, mime_type, size_bytes, is_image, drive_id, item_id, e_tag, c_tag }. Transfers the whole file, so the call takes longer as the file grows.", json!({ "type": "object", "properties": { "item_id": { "type": "string" }, "path": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "dir": { "type": "string" } } })),
         tool_def("upload_file", "Upload a local file, base64 bytes, or text content. Files at least 4 MiB and conditional replacements use an upload session, which sends the file in chunks of about 3 MiB, one request each.", json!({ "type": "object", "properties": { "local_path": { "type": "string" }, "file_name": { "type": "string" }, "content_base64": { "type": "string" }, "content_text": { "type": "string" }, "drive": { "type": "string" }, "site": { "type": "string" }, "parent_id": { "type": "string", "description": "Folder item ID, or a path starting with / such as /Team Docs" }, "item_id": { "type": "string" }, "if_match": { "type": "string", "description": "eTag precondition for replacement via an upload session at any size" }, "conflict_behavior": { "type": "string", "enum": ["replace", "fail", "rename"] } } })),
@@ -1196,5 +1216,186 @@ mod tests {
         assert_eq!(sc["authenticated"], false);
         assert!(sc["persona"].is_string());
         assert!(sc["auth_source"].is_string());
+    }
+
+    #[tokio::test]
+    async fn mcp_get_file_info_compact_omitted_list_item_fields_and_selective_fields_projection() {
+        use axum::{routing::get, Json, Router};
+        use tokio::net::TcpListener;
+
+        let app = Router::new()
+            .route(
+                "/v1.0/drives/sp-lib",
+                get(|| async {
+                    Json(json!({
+                        "id": "sp-lib",
+                        "name": "Documents",
+                        "driveType": "documentLibrary"
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/drives/sp-lib/items/doc-42",
+                get(|| async {
+                    Json(json!({
+                        "id": "doc-42",
+                        "name": "Policy.pdf",
+                        "description": "Annual security policy",
+                        "size": 8192,
+                        "eTag": "\"e-42\"",
+                        "cTag": "\"c-42\"",
+                        "webUrl": "https://contoso.sharepoint.com/Docs/Policy.pdf",
+                        "createdBy": { "user": { "displayName": "Bob" } },
+                        "lastModifiedDateTime": "2026-03-01T10:00:00Z",
+                        "parentReference": { "driveId": "sp-lib", "id": "root", "path": "/drives/sp-lib/root:/Compliance" },
+                        "file": {
+                            "mimeType": "application/pdf",
+                            "hashes": {
+                                "sha256Hash": "DEADBEEF",
+                                "quickXorHash": "QXOR=="
+                            }
+                        },
+                        "listItem": {
+                            "id": "42",
+                            "fields": {
+                                "@odata.etag": "\"42,1\"",
+                                "Status": "Approved",
+                                "Owner": "Alice",
+                                "Department": "Security",
+                                "EmptyCol": ""
+                            }
+                        }
+                    }))
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("{base}/v1.0"),
+            ..AppConfig::default()
+        };
+        let auth = crate::auth::AuthManager::from_tokens(
+            cfg.clone(),
+            crate::auth::StoredTokens {
+                access_token: "test-token".into(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".into(),
+                tenant_id: "tid".into(),
+                user_id: Some("u1".into()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "test".into(),
+            },
+        );
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+
+        // 1. compact: true surfaces sorted omitted.list_item_fields and hint mentioning fields: [...]
+        let compact_req = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "get_file_info",
+                "arguments": { "drive": "sp-lib", "item_id": "doc-42" }
+            }
+        });
+        let compact_reply = handle_rpc_line(&cfg, &graph, &storage, &compact_req.to_string())
+            .await
+            .unwrap();
+        assert_eq!(compact_reply["result"]["isError"], false);
+        let compact_item = &compact_reply["result"]["structuredContent"]["item"];
+        assert_eq!(
+            compact_item["omitted"]["list_item_fields"],
+            json!(["Department", "Owner", "Status"])
+        );
+        let omitted_std: Vec<&str> = compact_item["omitted"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(omitted_std.contains(&"description"));
+        assert!(omitted_std.contains(&"sha256_hash"));
+        assert!(omitted_std.contains(&"quick_xor_hash"));
+        assert!(!omitted_std.contains(&"list_item_fields"));
+        assert!(compact_item["hint"]
+            .as_str()
+            .unwrap()
+            .contains("fields: [...]"));
+
+        // 2. Selective fields projection: standard fields + hashes + case-insensitive custom columns + missing_fields
+        let proj_req = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "get_file_info",
+                "arguments": {
+                    "drive": "sp-lib",
+                    "item_id": "doc-42",
+                    "fields": ["description", "hashes", "created_by", "status", "OWNER", "NoSuchCol"]
+                }
+            }
+        });
+        let proj_reply = handle_rpc_line(&cfg, &graph, &storage, &proj_req.to_string())
+            .await
+            .unwrap();
+        assert_eq!(proj_reply["result"]["isError"], false);
+        let proj_item = &proj_reply["result"]["structuredContent"]["item"];
+        assert_eq!(proj_item["description"], "Annual security policy");
+        assert_eq!(proj_item["created_by"], "Bob");
+        assert_eq!(
+            proj_item["hashes"],
+            json!({ "sha256_hash": "DEADBEEF", "quick_xor_hash": "QXOR==" })
+        );
+        assert_eq!(
+            proj_item["list_item_fields"],
+            json!({ "Owner": "Alice", "Status": "Approved" })
+        );
+        assert_eq!(proj_item["missing_fields"], json!(["NoSuchCol"]));
+        assert!(proj_item.get("web_url").is_none());
+
+        // 3. Requesting "list_item_fields" directly returns all custom columns
+        let all_cols_req = json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "get_file_info",
+                "arguments": {
+                    "drive": "sp-lib",
+                    "item_id": "doc-42",
+                    "fields": ["list_item_fields", "web_url"]
+                }
+            }
+        });
+        let all_cols_reply = handle_rpc_line(&cfg, &graph, &storage, &all_cols_req.to_string())
+            .await
+            .unwrap();
+        let all_cols_item = &all_cols_reply["result"]["structuredContent"]["item"];
+        assert_eq!(
+            all_cols_item["list_item_fields"],
+            json!({ "Department": "Security", "Owner": "Alice", "Status": "Approved" })
+        );
+        assert_eq!(
+            all_cols_item["web_url"],
+            "https://contoso.sharepoint.com/Docs/Policy.pdf"
+        );
+        assert!(all_cols_item.get("missing_fields").is_none());
+
+        // 4. Schema advertises fields parameter on get_file_info
+        let tools = tool_catalog();
+        let gfi = tools.iter().find(|t| t["name"] == "get_file_info").unwrap();
+        assert_eq!(
+            gfi["inputSchema"]["properties"]["fields"]["type"],
+            json!("array")
+        );
+
+        server.abort();
     }
 }

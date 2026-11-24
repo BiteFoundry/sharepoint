@@ -113,9 +113,9 @@ impl Fixture {
         assert_eq!((site.as_str(), list.as_str()), (SITE, LIST));
         let selection = query.get("$select");
         let token = query.get("$skiptoken");
-        assert_eq!(
-            selection.map(String::as_str),
-            Some("id,name,displayName,readOnly,hidden")
+        assert!(
+            selection.is_none(),
+            "list_columns should not narrow $select so Graph facets/description/required/choices are returned: {selection:?}"
         );
         fixture.state.lock().await.reads.push((
             "columns".into(),
@@ -134,7 +134,7 @@ impl Fixture {
         Json(json!({ "value": [
             { "id": "col-1", "name": "ReviewStatus", "displayName": "Review status", "readOnly": false }
         ], "@odata.nextLink": format!(
-            "{}/v1.0/sites/{SITE}/lists/{LIST}/columns?%24select=id,name,displayName,readOnly,hidden&%24skiptoken=next",
+            "{}/v1.0/sites/{SITE}/lists/{LIST}/columns?%24skiptoken=next",
             fixture.base,
         ) }))
     }

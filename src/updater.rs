@@ -32,9 +32,18 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
+fn resolve_target_executable_from(exe: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&exe).unwrap_or(exe)
+}
+
+fn resolve_target_executable() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("Unable to determine current executable path")?;
+    Ok(resolve_target_executable_from(exe))
+}
+
 /// Silently cleans up any `<current_exe>.old` left behind by a previous self-update.
 pub fn cleanup_stale_old_binary() {
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(exe) = resolve_target_executable() {
         let old_path = append_ext_suffix(&exe, ".old");
         if old_path.symlink_metadata().is_ok() {
             let _ = std::fs::remove_file(&old_path);
@@ -58,8 +67,7 @@ pub async fn check_or_apply_update_with_api_base(
     check_only: bool,
     force: bool,
 ) -> Result<UpdateCheckResult> {
-    let binary_path =
-        std::env::current_exe().context("Unable to determine current executable path")?;
+    let binary_path = resolve_target_executable()?;
     let token = discover_github_token(api_base_url).await;
     check_or_apply_update_at(api_base_url, repo, check_only, force, &binary_path, token).await
 }
@@ -1020,5 +1028,52 @@ mod tests {
         assert_eq!(std::fs::read(&fake_exe).unwrap(), b"ORIGINAL-SAFE-BINARY");
 
         server.abort();
+    }
+
+    #[test]
+    fn test_resolve_target_executable_and_new_symlink_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_bin = tmp.path().join("sharepoint-real");
+        std::fs::write(&real_bin, b"REAL-BIN").unwrap();
+        let canon_real = std::fs::canonicalize(&real_bin).unwrap();
+        assert_eq!(resolve_target_executable_from(real_bin.clone()), canon_real);
+
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(resolve_target_executable_from(missing.clone()), missing);
+
+        let link_bin = tmp.path().join("sharepoint-link");
+        let symlink_ok = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&real_bin, &link_bin).is_ok()
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_file(&real_bin, &link_bin).is_ok()
+            }
+        };
+        if symlink_ok {
+            assert_eq!(resolve_target_executable_from(link_bin), canon_real);
+
+            // `.new` symlink refusal remains intact.
+            let target_exe = tmp.path().join("target-bin");
+            std::fs::write(&target_exe, b"OLD").unwrap();
+            let victim = tmp.path().join("victim");
+            std::fs::write(&victim, b"PROTECTED").unwrap();
+            let new_symlink = append_ext_suffix(&target_exe, ".new");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&victim, &new_symlink).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&victim, &new_symlink).unwrap();
+
+            let err = replace_executable_at(&target_exe, b"NEW").unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Refusing to write update binary through symlink"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(std::fs::read(&victim).unwrap(), b"PROTECTED");
+            assert_eq!(std::fs::read(&target_exe).unwrap(), b"OLD");
+        }
     }
 }

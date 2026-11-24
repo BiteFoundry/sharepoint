@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 use url::Url;
 
 use super::{client::GraphListPage, GraphClient};
+pub use crate::models::ListColumn;
 
 #[derive(Debug, Deserialize)]
 struct RawListFacet {
@@ -36,15 +37,116 @@ pub struct ListInfo {
     pub template: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ListColumn {
-    pub id: String,
-    pub name: String,
-    #[serde(rename(deserialize = "displayName"))]
-    pub display_name: Option<String>,
-    #[serde(rename(deserialize = "readOnly"))]
-    pub read_only: Option<bool>,
-    pub hidden: Option<bool>,
+#[derive(Debug, Deserialize)]
+struct RawChoiceFacet {
+    #[serde(default)]
+    choices: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawListColumn {
+    id: String,
+    name: String,
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(rename = "readOnly", default)]
+    read_only: Option<bool>,
+    #[serde(default)]
+    hidden: Option<bool>,
+    #[serde(default)]
+    required: Option<bool>,
+    #[serde(default)]
+    text: Option<Value>,
+    #[serde(default)]
+    number: Option<Value>,
+    #[serde(default)]
+    choice: Option<RawChoiceFacet>,
+    #[serde(rename = "dateTime", default)]
+    date_time: Option<Value>,
+    #[serde(rename = "personOrGroup", default)]
+    person_or_group: Option<Value>,
+    #[serde(default)]
+    boolean: Option<Value>,
+    #[serde(default)]
+    lookup: Option<Value>,
+    #[serde(default)]
+    currency: Option<Value>,
+    #[serde(rename = "hyperlinkOrPicture", default)]
+    hyperlink_or_picture: Option<Value>,
+    #[serde(default)]
+    calculated: Option<Value>,
+    #[serde(default)]
+    geolocation: Option<Value>,
+    #[serde(default)]
+    term: Option<Value>,
+    #[serde(default)]
+    thumbnail: Option<Value>,
+    #[serde(rename = "contentApprovalStatus", default)]
+    content_approval_status: Option<Value>,
+}
+
+impl RawListColumn {
+    fn infer_column_type(&self) -> Option<String> {
+        let inferred = if self.choice.is_some() {
+            "choice"
+        } else if self.text.is_some() {
+            "text"
+        } else if self.number.is_some() {
+            "number"
+        } else if self.date_time.is_some() {
+            "dateTime"
+        } else if self.person_or_group.is_some() {
+            "personOrGroup"
+        } else if self.boolean.is_some() {
+            "boolean"
+        } else if self.lookup.is_some() {
+            "lookup"
+        } else if self.currency.is_some() {
+            "currency"
+        } else if self.hyperlink_or_picture.is_some() {
+            "hyperlinkOrPicture"
+        } else if self.calculated.is_some() {
+            "calculated"
+        } else if self.geolocation.is_some() {
+            "geolocation"
+        } else if self.term.is_some() {
+            "term"
+        } else if self.thumbnail.is_some() {
+            "thumbnail"
+        } else if self.content_approval_status.is_some() {
+            "contentApprovalStatus"
+        } else {
+            return None;
+        };
+        Some(inferred.to_string())
+    }
+
+    fn into_model(self) -> ListColumn {
+        let column_type = self.infer_column_type();
+        let description = self
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let choices = self
+            .choice
+            .map(|c| c.choices)
+            .unwrap_or_default();
+        ListColumn {
+            id: self.id,
+            name: self.name,
+            display_name: self.display_name,
+            description,
+            read_only: self.read_only,
+            hidden: self.hidden,
+            required: self.required.unwrap_or(false),
+            column_type,
+            choices,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -122,10 +224,8 @@ impl GraphClient {
 
     pub async fn list_columns(&self, site_id: &str, list_id: &str) -> Result<Vec<ListColumn>> {
         let path = list_path(site_id, list_id)?;
-        self.get_list_collection(format!(
-            "{path}/columns?$select=id,name,displayName,readOnly,hidden"
-        ))
-        .await
+        let raw: Vec<RawListColumn> = self.get_list_collection(format!("{path}/columns")).await?;
+        Ok(raw.into_iter().map(RawListColumn::into_model).collect())
     }
 
     pub async fn list_items_page(
@@ -310,4 +410,162 @@ fn resource_id<'a>(name: &str, value: &'a str) -> Result<std::borrow::Cow<'a, st
         "{name} must be a resource ID"
     );
     Ok(urlencoding::encode(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{routing::get, Json, Router};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    use crate::{
+        auth::{AuthManager, StoredTokens},
+        config::AppConfig,
+    };
+
+    #[test]
+    fn raw_list_column_infers_types_choices_description_and_required() {
+        let samples = json!([
+            {
+                "id": "c1",
+                "name": "Status",
+                "displayName": "Review Status",
+                "description": "Current workflow stage",
+                "readOnly": false,
+                "hidden": false,
+                "required": true,
+                "choice": { "choices": ["Draft", "In Review", "Approved"] }
+            },
+            {
+                "id": "c2",
+                "name": "Notes",
+                "displayName": "Notes",
+                "description": "   ",
+                "text": { "allowMultipleLines": true }
+            },
+            {
+                "id": "c3",
+                "name": "Budget",
+                "currency": { "locale": "en-US" }
+            },
+            {
+                "id": "c4",
+                "name": "Count",
+                "number": { "decimalPlaces": "none" }
+            },
+            {
+                "id": "c5",
+                "name": "DueDate",
+                "dateTime": { "format": "dateOnly" }
+            },
+            {
+                "id": "c6",
+                "name": "Owner",
+                "personOrGroup": { "allowMultipleSelection": false }
+            },
+            {
+                "id": "c7",
+                "name": "Approved",
+                "boolean": {}
+            },
+            {
+                "id": "c8",
+                "name": "Project",
+                "lookup": { "listId": "list-99" }
+            },
+            {
+                "id": "c9",
+                "name": "ReferenceLink",
+                "hyperlinkOrPicture": { "isPicture": false }
+            }
+        ]);
+        let raw: Vec<RawListColumn> = serde_json::from_value(samples).unwrap();
+        let cols: Vec<ListColumn> = raw.into_iter().map(RawListColumn::into_model).collect();
+
+        assert_eq!(cols[0].description.as_deref(), Some("Current workflow stage"));
+        assert!(cols[0].required);
+        assert_eq!(cols[0].column_type.as_deref(), Some("choice"));
+        assert_eq!(cols[0].choices, vec!["Draft", "In Review", "Approved"]);
+
+        assert_eq!(cols[1].description, None);
+        assert!(!cols[1].required);
+        assert_eq!(cols[1].column_type.as_deref(), Some("text"));
+        assert!(cols[1].choices.is_empty());
+
+        assert_eq!(cols[2].column_type.as_deref(), Some("currency"));
+        assert_eq!(cols[3].column_type.as_deref(), Some("number"));
+        assert_eq!(cols[4].column_type.as_deref(), Some("dateTime"));
+        assert_eq!(cols[5].column_type.as_deref(), Some("personOrGroup"));
+        assert_eq!(cols[6].column_type.as_deref(), Some("boolean"));
+        assert_eq!(cols[7].column_type.as_deref(), Some("lookup"));
+        assert_eq!(cols[8].column_type.as_deref(), Some("hyperlinkOrPicture"));
+    }
+
+    #[tokio::test]
+    async fn list_columns_fetches_rich_column_metadata_from_graph() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/v1.0/sites/site-1/lists/list-1/columns",
+            get(|| async {
+                Json(json!({
+                    "value": [
+                        {
+                            "id": "col-status",
+                            "name": "DocStatus",
+                            "displayName": "Document Status",
+                            "description": "Approval state for compliance docs",
+                            "readOnly": false,
+                            "hidden": false,
+                            "required": true,
+                            "choice": { "choices": ["Draft", "Published", "Archived"] }
+                        },
+                        {
+                            "id": "col-owner",
+                            "name": "DocOwner",
+                            "displayName": "Owner",
+                            "personOrGroup": {}
+                        }
+                    ]
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("{base}/v1.0"),
+            ..AppConfig::default()
+        };
+        let auth = AuthManager::from_tokens(
+            cfg.clone(),
+            StoredTokens {
+                access_token: "test-token".into(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".into(),
+                tenant_id: "tid".into(),
+                user_id: Some("u1".into()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "test".into(),
+            },
+        );
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let cols = graph.list_columns("site-1", "list-1").await.unwrap();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "DocStatus");
+        assert_eq!(
+            cols[0].description.as_deref(),
+            Some("Approval state for compliance docs")
+        );
+        assert!(cols[0].required);
+        assert_eq!(cols[0].column_type.as_deref(), Some("choice"));
+        assert_eq!(cols[0].choices, vec!["Draft", "Published", "Archived"]);
+        assert_eq!(cols[1].name, "DocOwner");
+        assert!(!cols[1].required);
+        assert_eq!(cols[1].column_type.as_deref(), Some("personOrGroup"));
+
+        server.abort();
+    }
 }

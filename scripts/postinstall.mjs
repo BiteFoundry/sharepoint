@@ -250,7 +250,20 @@ export function runPostinstall(options = {}) {
   return { skipped: false, platform, linked };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function resolveRealpathOrAbsolute(filePath) {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+}
+
+export function isMainModule(argv1 = process.argv[1], metaUrl = import.meta.url) {
+  if (!argv1) return false;
+  return resolveRealpathOrAbsolute(argv1) === resolveRealpathOrAbsolute(fileURLToPath(metaUrl));
+}
+
+if (isMainModule()) {
   try {
     runPostinstall();
   } catch {

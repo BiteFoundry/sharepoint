@@ -240,6 +240,10 @@ pub(crate) fn map_drive_item_row(row: &Row<'_>) -> rusqlite::Result<DriveItem> {
         shared_scope: row.get(17)?,
         remote_drive_id: row.get(18)?,
         remote_item_id: row.get(19)?,
+        description: None,
+        sha256_hash: None,
+        quick_xor_hash: None,
+        list_item_fields: std::collections::BTreeMap::new(),
     })
 }
 

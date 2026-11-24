@@ -552,41 +552,65 @@ fn cleanup_owned_files(paths: &DaemonPaths, our_secret: &str, sock_path: Option<
     let _ = sock_path;
 }
 
+fn profile_short_hash(config_dir: &Path) -> String {
+    let canonical = crate::config::canonicalize_existing_ancestor(config_dir);
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(canonical.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        hasher.update(canonical.to_string_lossy().as_bytes());
+    }
+    let digest = hex::encode(hasher.finalize());
+    digest[..12].to_string()
+}
+
 #[cfg(windows)]
 fn select_windows_pipe_name(config_dir: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(config_dir.to_string_lossy().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let short_hash = &digest[..12];
+    let short_hash = profile_short_hash(config_dir);
     format!(r"\\.\pipe\sharepoint-cli-daemon-{short_hash}")
+}
+
+#[cfg(any(unix, test))]
+fn select_unix_socket_path_with_xdg(config_dir: &Path, xdg_runtime_dir: Option<&str>) -> PathBuf {
+    let path_byte_len = |p: &Path| -> usize {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            p.as_os_str().as_bytes().len()
+        }
+        #[cfg(not(unix))]
+        {
+            p.to_string_lossy().len()
+        }
+    };
+
+    let candidate = config_dir.join("sharepoint-daemon.sock");
+    if path_byte_len(&candidate) <= 90 {
+        return candidate;
+    }
+
+    let short_hash = profile_short_hash(config_dir);
+
+    if let Some(trimmed) = xdg_runtime_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        let xdg_candidate = PathBuf::from(trimmed)
+            .join("sharepoint-cli")
+            .join(format!("sharepoint-daemon-{short_hash}.sock"));
+        if path_byte_len(&xdg_candidate) <= 90 {
+            return xdg_candidate;
+        }
+    }
+
+    PathBuf::from(format!("/tmp/sharepoint-cli-{short_hash}/sharepoint-daemon.sock"))
 }
 
 #[cfg(unix)]
 fn select_unix_socket_path(config_dir: &Path) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-
-    let candidate = config_dir.join("sharepoint-daemon.sock");
-    if candidate.as_os_str().as_bytes().len() <= 90 {
-        return candidate;
-    }
-
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        let trimmed = xdg.trim();
-        if !trimmed.is_empty() {
-            let xdg_candidate = PathBuf::from(trimmed)
-                .join("sharepoint-cli")
-                .join("sharepoint-daemon.sock");
-            if xdg_candidate.as_os_str().as_bytes().len() <= 90 {
-                return xdg_candidate;
-            }
-        }
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(config_dir.as_os_str().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let short_hash = &digest[..12];
-    PathBuf::from(format!("/tmp/sharepoint-cli-{short_hash}/sharepoint-daemon.sock"))
+    let xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    select_unix_socket_path_with_xdg(config_dir, xdg.as_deref())
 }
 
 #[cfg(unix)]
@@ -1580,11 +1604,8 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
             if status.transport.as_deref() == Some("unix") {
-                assert!(status
-                    .endpoint
-                    .as_deref()
-                    .unwrap()
-                    .ends_with("sharepoint-daemon.sock"));
+                let ep = status.endpoint.as_deref().unwrap();
+                assert!(ep.ends_with(".sock") && ep.contains("sharepoint-daemon"));
             }
         }
 
@@ -1873,5 +1894,56 @@ mod tests {
             Some("{\"ok\":false}")
         );
         assert_eq!(read_limited_line(&mut valid_reader).await.unwrap(), None);
+    }
+
+    #[test]
+    fn select_unix_socket_path_isolates_long_profiles_and_canonicalizes_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long_pad = "a".repeat(80);
+        let profile_a = tmp.path().join(&long_pad).join("profile-alpha");
+        let profile_b = tmp.path().join(&long_pad).join("profile-beta");
+
+        let sock_a = select_unix_socket_path_with_xdg(&profile_a, Some("/run/user/1000"));
+        let sock_b = select_unix_socket_path_with_xdg(&profile_b, Some("/run/user/1000"));
+        assert_ne!(
+            sock_a, sock_b,
+            "distinct long-path profiles must never share the same XDG socket path"
+        );
+        let hash_a = profile_short_hash(&profile_a);
+        let hash_b = profile_short_hash(&profile_b);
+        assert_eq!(
+            sock_a,
+            PathBuf::from("/run/user/1000")
+                .join("sharepoint-cli")
+                .join(format!("sharepoint-daemon-{hash_a}.sock"))
+        );
+        assert_eq!(
+            sock_b,
+            PathBuf::from("/run/user/1000")
+                .join("sharepoint-cli")
+                .join(format!("sharepoint-daemon-{hash_b}.sock"))
+        );
+
+        // Without XDG_RUNTIME_DIR, falls back to /tmp/sharepoint-cli-{short_hash}/sharepoint-daemon.sock
+        let tmp_sock = select_unix_socket_path_with_xdg(&profile_a, None);
+        assert_eq!(
+            tmp_sock,
+            PathBuf::from(format!("/tmp/sharepoint-cli-{hash_a}/sharepoint-daemon.sock"))
+        );
+
+        // Non-canonical equivalent path (trailing `.`) produces the same hash.
+        let profile_a_dot = profile_a.join(".");
+        assert_eq!(
+            profile_short_hash(&profile_a_dot),
+            hash_a,
+            "canonicalize_existing_ancestor should normalize equivalent paths"
+        );
+
+        // Short path stays directly inside config_dir.
+        let short_dir = PathBuf::from("/tmp/sp-short");
+        assert_eq!(
+            select_unix_socket_path_with_xdg(&short_dir, Some("/run/user/1000")),
+            short_dir.join("sharepoint-daemon.sock")
+        );
     }
 }

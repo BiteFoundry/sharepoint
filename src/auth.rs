@@ -24,7 +24,9 @@ use tokio::{
 };
 use url::Url;
 
-use crate::config::{credential_fallback_path, legacy_teams_config_dir, write_atomic, AppConfig};
+use crate::config::{
+    credential_fallback_path, expand_tilde, legacy_teams_config_dir, write_atomic_0600, AppConfig,
+};
 
 /// Default Microsoft Graph delegated OAuth scopes for `sharepoint-cli`.
 pub const DEFAULT_SCOPES: &[&str] = &[
@@ -397,7 +399,7 @@ impl AuthManager {
         if let Ok(val) = std::env::var("TEAMS_TOKEN_FILE") {
             let trimmed = val.trim();
             if !trimmed.is_empty() {
-                return Some(expand_tilde_path(trimmed));
+                return Some(expand_tilde(trimmed));
             }
         }
         let teams_dir = self.resolve_legacy_teams_config_dir()?;
@@ -413,7 +415,7 @@ impl AuthManager {
         if trimmed.is_empty() {
             None
         } else {
-            Some(expand_tilde_path(trimmed))
+            Some(expand_tilde(trimmed))
         }
     }
 
@@ -1608,7 +1610,7 @@ pub(crate) fn load_tokens_from_path(path: &Path) -> Result<Option<StoredTokens>>
 
 pub(crate) fn save_tokens_to_path(tokens: &StoredTokens, path: &Path) -> Result<()> {
     let json = serde_json::to_vec_pretty(tokens)?;
-    write_atomic(path, &json)?;
+    write_atomic_0600(path, &json)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1828,21 +1830,6 @@ fn env_access_token_from_str(raw: &str, config: &AppConfig) -> Option<StoredToke
         &config.tenant_id,
         "env_token",
     ))
-}
-
-fn expand_tilde_path(input: &str) -> PathBuf {
-    if input == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-    }
-    if let Some(rest) = input
-        .strip_prefix("~/")
-        .or_else(|| input.strip_prefix("~\\"))
-    {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(input)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
