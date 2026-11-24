@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.BiteFoundry/sharepoint",
+  "title": "SharePoint & OneDrive (TUI, CLI & MCP)",
+  "description": "SharePoint & OneDrive MCP server, CLI, and TUI in Rust with list rows & conditional uploads.",
+  "version": "0.4.2",
+  "websiteUrl": "https://bitefoundry.dev/#app-sharepoint",
+  "repository": {
+    "url": "https://github.com/BiteFoundry/sharepoint",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/bitefoundry/sharepoint:0.4.2",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "SHAREPOINT_ACCESS_TOKEN",
+          "description": "Microsoft Graph delegated bearer token for SharePoint and OneDrive.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "TEAMS_TOKEN_FILE",
+          "description": "Optional shared Microsoft Graph token file path.",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
