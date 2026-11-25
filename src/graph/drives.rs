@@ -1603,10 +1603,13 @@ impl GraphClient {
         let is_image = if head_sample.is_empty() {
             crate::img_preview::is_image_mime_or_name(&mime_type, Some(&final_name))
         } else {
-            bitefoundry_html::is_safe_raster_image(
-                Some(&mime_type),
-                Some(&final_name),
-                Some(&head_sample),
+            matches!(
+                bitefoundry_html::sniff_content_kind(
+                    Some(&mime_type),
+                    Some(&final_name),
+                    Some(&head_sample),
+                ),
+                bitefoundry_html::ContentKind::RasterImage | bitefoundry_html::ContentKind::Svg
             )
         };
 

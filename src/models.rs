@@ -252,11 +252,17 @@ impl DriveItem {
         if self.is_folder || self.is_image() {
             return false;
         }
+        if matches!(self.extension().as_deref(), Some("svg" | "svgz")) {
+            return false;
+        }
         if self.markup_kind().is_some() {
             return true;
         }
         if let Some(mime) = self.mime_type.as_deref() {
             let lower = mime.to_ascii_lowercase();
+            if lower.contains("svg") {
+                return false;
+            }
             if lower.starts_with("text/")
                 || lower.contains("json")
                 || lower.contains("yaml")
@@ -636,6 +642,42 @@ mod tests {
         assert!(!folder.is_image());
         assert!(!folder.is_text_previewable());
         assert_eq!(format_human_size(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn svg_item_is_image_and_not_text_previewable() {
+        let svg_mime = DriveItem {
+            id: "svg1".into(),
+            drive_id: "d1".into(),
+            name: "diagram.svg".into(),
+            mime_type: Some("image/svg+xml".into()),
+            size: 1200,
+            ..Default::default()
+        };
+        assert!(svg_mime.is_image());
+        assert!(!svg_mime.is_text_previewable());
+        assert_eq!(svg_mime.type_badge(), "IMG");
+
+        let svg_ext_only = DriveItem {
+            id: "svg2".into(),
+            drive_id: "d1".into(),
+            name: "icon.svg".into(),
+            mime_type: Some("text/xml".into()),
+            size: 400,
+            ..Default::default()
+        };
+        assert!(!svg_ext_only.is_text_previewable());
+
+        let svgz = DriveItem {
+            id: "svg3".into(),
+            drive_id: "d1".into(),
+            name: "chart.svgz".into(),
+            mime_type: Some("application/octet-stream".into()),
+            size: 600,
+            ..Default::default()
+        };
+        assert!(svgz.is_image());
+        assert!(!svgz.is_text_previewable());
     }
 
     #[test]

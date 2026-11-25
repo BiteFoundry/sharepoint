@@ -270,12 +270,15 @@ fn parse_pixel_key(key: &str) -> (&str, Option<(u16, u16, u16, u16)>) {
 }
 
 /// Overlay Z-order guard: blocks inline pixel graphics whenever any modal overlay is active,
-/// and blocks modal pixel graphics whenever another modal (e.g., `ConfirmDialog`) sits on top of `ImagePreview`.
+/// allows modal image pixels only when `ImagePreview` is top-most, and allows inline HTML
+/// pixels (`html:...`) only when `HtmlPreview` is top-most.
 fn pixel_graphics_allowed_for_overlays(overlays: &[Overlay], cache_key: &str) -> bool {
     if overlays.is_empty() {
         true
     } else if matches!(overlays.last(), Some(Overlay::ImagePreview(_))) {
-        !cache_key.starts_with("inline:")
+        !cache_key.starts_with("inline:") && !cache_key.starts_with("html:")
+    } else if matches!(overlays.last(), Some(Overlay::HtmlPreview(_))) {
+        cache_key.starts_with("html:")
     } else {
         false
     }
@@ -325,7 +328,8 @@ fn evaluate_pixel_placement(
     let fit_w = avail_w.min(safe_max_w);
     let fit_h = avail_h.min(safe_max_h);
 
-    if fit_w < 4 || fit_h < 2 {
+    let min_h = if cache_key.starts_with("html:") { 1 } else { 2 };
+    if fit_w < 4 || fit_h < min_h {
         return Err(None);
     }
     if rendered_cols == 0 || rendered_rows == 0 {
@@ -653,19 +657,32 @@ fn draw_frame(
             continue;
         }
         let (base_key, crop) = parse_pixel_key(&pending.cache_key);
-        let Some(rendered) = app.rendered_images.get(base_key) else {
-            continue;
-        };
-        let resolved: Option<(Cow<'_, str>, u16, u16)> = if let Some((sx, sy, vw, vh)) = crop {
-            rendered
-                .viewport_pixel_payload(sx, sy, vw, vh)
-                .map(|(p, dw, dh)| (Cow::Owned(p), dw, dh))
-        } else {
-            rendered
-                .pixel_payload
-                .as_deref()
-                .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
-        };
+        let (protocol, resolved): (TerminalImageProtocol, Option<(Cow<'_, str>, u16, u16)>) =
+            if let Some(direct_payload) = pending.payload {
+                (
+                    pending.protocol,
+                    Some((
+                        Cow::Owned(direct_payload),
+                        pending.rect.width,
+                        pending.rect.height,
+                    )),
+                )
+            } else {
+                let Some(rendered) = app.rendered_images.get(base_key) else {
+                    continue;
+                };
+                let res = if let Some((sx, sy, vw, vh)) = crop {
+                    rendered
+                        .viewport_pixel_payload(sx, sy, vw, vh)
+                        .map(|(p, dw, dh)| (Cow::Owned(p), dw, dh))
+                } else {
+                    rendered
+                        .pixel_payload
+                        .as_deref()
+                        .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
+                };
+                (rendered.protocol, res)
+            };
         let Some((payload, draw_cols, draw_rows)) = resolved else {
             continue;
         };
@@ -684,7 +701,7 @@ fn draw_frame(
                 desired.push(ActivePixelGraphic {
                     cache_key: pending.cache_key,
                     rect: placement_rect,
-                    protocol: rendered.protocol,
+                    protocol,
                     cols: draw_cols,
                     rows: draw_rows,
                     payload_len: payload.len(),
@@ -912,6 +929,38 @@ mod tests {
         assert!(!pixel_graphics_allowed_for_overlays(
             &stacked,
             "inline:d1:img1"
+        ));
+
+        // HtmlPreviewOverlay alone: html: allowed, inline/modal blocked; stacked ConfirmDialog blocks html:
+        let html_ov = crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(
+            "chart.html",
+            "<html><body><p>Hi</p></body></html>".into(),
+            None,
+        );
+        let only_html = vec![Overlay::HtmlPreview(html_ov)];
+        assert!(pixel_graphics_allowed_for_overlays(
+            &only_html,
+            "html:3:0:40:8:kitty"
+        ));
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &only_html,
+            "inline:d1:img1"
+        ));
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &only_html,
+            "modal:d1:img1:80x24:sixel"
+        ));
+        let stacked_html = vec![
+            Overlay::HtmlPreview(crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(
+                "chart.html",
+                "<html><body><p>Hi</p></body></html>".into(),
+                None,
+            )),
+            Overlay::confirm("Close?", None),
+        ];
+        assert!(!pixel_graphics_allowed_for_overlays(
+            &stacked_html,
+            "html:3:0:40:8:kitty"
         ));
 
         // Verify tracker transitions from active image -> [] with erase_and_redraw

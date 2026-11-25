@@ -764,6 +764,7 @@ pub fn draw_inspector(
                     cache_key: preview_key,
                     rect,
                     protocol,
+                    payload: None,
                 });
             }
         }
@@ -1233,22 +1234,27 @@ mod tests {
         ));
         assert!(app.rendered_images.is_empty());
 
-        // 2. SVG bytes masquerading as .png -> informative SVG preview error, never raster-decoded
-        let fake_svg = DriveItem {
-            id: "fake-svg-1".into(),
+        // 2. Standalone .svg (image/svg+xml) -> natively rasterized with format_label == "SVG"
+        let svg_item = DriveItem {
+            id: "svg-item-1".into(),
             drive_id: "d1".into(),
-            name: "logo.png".into(),
-            mime_type: Some("image/png".into()),
+            name: "logo.svg".into(),
+            mime_type: Some("image/svg+xml".into()),
             ..Default::default()
         };
+        assert!(svg_item.is_image());
+        assert!(!svg_item.is_text_previewable());
         app.cache_raw_image(
-            AppState::item_revision_key(&fake_svg),
-            std::sync::Arc::from(b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>".as_slice()),
+            AppState::item_revision_key(&svg_item),
+            std::sync::Arc::from(
+                br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="#2563eb"/></svg>"##
+                    .as_slice(),
+            ),
         );
-        let svg_key = app.modal_image_cache_key(&fake_svg, 40, 20, 100, ui.graphics_caps);
+        let svg_key = app.modal_image_cache_key(&svg_item, 40, 20, 100, ui.graphics_caps);
         app.request_image_decode(
-            &fake_svg,
-            svg_key,
+            &svg_item,
+            svg_key.clone(),
             crate::img_preview::FitBox::fixed(40, 20),
             (18, 20, 26),
             ui.graphics_caps,
@@ -1256,13 +1262,16 @@ mod tests {
 
         let svg_msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
             .await
-            .expect("expected SVG PreviewFailed")
+            .expect("expected SVG ImageDecoded")
             .expect("channel open");
+        assert!(matches!(svg_msg, UiMsg::ImageDecoded { .. }));
         app.apply_ui_msg(svg_msg, &mut ui);
-        let err = app
-            .image_preview_error_for(&fake_svg)
-            .expect("expected SVG preview error");
-        assert!(err.contains("SVG"), "unexpected error: {err}");
+        assert!(app.image_preview_error_for(&svg_item).is_none());
+        let rendered_svg = app
+            .rendered_images
+            .get(&svg_key)
+            .expect("expected rendered SVG cached");
+        assert_eq!(rendered_svg.format_label, "SVG");
     }
 
     #[tokio::test]

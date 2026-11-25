@@ -308,6 +308,7 @@ impl ImagePreviewOverlay {
                         cache_key: key,
                         rect: draw_rect,
                         protocol: rendered.protocol,
+                        payload: None,
                     });
                 } else if rendered.has_scroll_backing() && total_cols > 0 && total_rows > 0 {
                     let draw_w = total_cols.saturating_sub(sx).min(avail_w);
@@ -320,6 +321,7 @@ impl ImagePreviewOverlay {
                         cache_key: format!("{key}#crop:{sx},{sy},{avail_w},{avail_h}"),
                         rect: draw_rect,
                         protocol: rendered.protocol,
+                        payload: None,
                     });
                 } else {
                     frame.render_widget(

@@ -121,6 +121,9 @@ pub struct PendingPixelGraphic {
     pub cache_key: String,
     pub rect: Rect,
     pub protocol: TerminalImageProtocol,
+    /// Optional pre-encoded escape sequence payload (used by `HtmlPreviewOverlay` inline graphics
+    /// whose cache lives on the overlay and is dropped on close).
+    pub payload: Option<String>,
 }
 
 pub enum UiMsg {
@@ -1301,11 +1304,10 @@ impl AppState {
             } in decodes
             {
                 let result = match kind {
-                    ContentKind::RasterImage => {
+                    ContentKind::RasterImage | ContentKind::Svg => {
                         img_preview::decode_and_render_for_protocol(&bytes, fit, bg_rgb, caps)
                             .map_err(|err| format!("{err:#}"))
                     }
-                    ContentKind::Svg => Err("SVG vector image (image/svg+xml) cannot be raster-decoded — press o to open in browser".into()),
                     _ => Err(format!("Unsupported image response ({kind:?}); refusing raster decode")),
                 };
                 let msg = match result {
@@ -1733,7 +1735,7 @@ impl AppState {
                             Some(&pending.item.name),
                             Some(&bytes),
                         );
-                        if kind == ContentKind::RasterImage {
+                        if matches!(kind, ContentKind::RasterImage | ContentKind::Svg) {
                             self.cache_raw_image(cache_key, Arc::clone(&bytes));
                         }
                         self.spawn_image_decodes(pending.item, bytes, kind, pending.decodes);

@@ -1417,8 +1417,20 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
         let tag = el.value().name().to_ascii_lowercase();
         match tag.as_str() {
             // Non-visual subtrees stripped completely
-            "script" | "style" | "head" | "noscript" | "svg" | "template" | "meta" | "link"
-            | "iframe" | "object" | "canvas" => {}
+            "script" | "style" | "head" | "noscript" | "template" | "meta" | "link" | "iframe"
+            | "object" => {}
+            "svg" => {
+                self.inline_buf.push(Span::styled(
+                    "[◇ Vector Graphic · H: HTML]",
+                    self.out.theme.muted_style(),
+                ));
+            }
+            "canvas" => {
+                self.inline_buf.push(Span::styled(
+                    "[▣ Canvas · H: HTML]",
+                    self.out.theme.muted_style(),
+                ));
+            }
 
             // Headings
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -1758,7 +1770,7 @@ fn collect_plain_text_into(el: ElementRef<'_>, out: &mut String, show_link_urls:
                 let name = e.name().to_ascii_lowercase();
                 if matches!(
                     name.as_str(),
-                    "script" | "style" | "head" | "noscript" | "svg" | "template"
+                    "script" | "style" | "head" | "noscript" | "svg" | "canvas" | "template"
                 ) {
                     continue;
                 }
@@ -2053,6 +2065,7 @@ fn main() {
   <p>Value &lt; 100 &nbsp; <strong>approved</strong> &amp; <em>verified</em>.</p>
   <noscript>hidden noscript</noscript>
   <svg><text>svg noise</text></svg>
+  <canvas>canvas noise</canvas>
   <template><p>template noise</p></template>
   <pre><code class="language-rust">fn check() {
     let x = 1;
@@ -2072,7 +2085,16 @@ fn main() {
         assert!(!plain.contains("alert(1)"), "script must be stripped: {plain}");
         assert!(!plain.contains("color: red"), "style must be stripped: {plain}");
         assert!(!plain.contains("hidden noscript"), "noscript must be stripped");
-        assert!(!plain.contains("svg noise"), "svg must be stripped");
+        assert!(!plain.contains("svg noise"), "svg inner XML/text must be stripped");
+        assert!(!plain.contains("canvas noise"), "canvas fallback text must be stripped");
+        assert!(
+            plain.contains("[◇ Vector Graphic · H: HTML]"),
+            "svg must render clean graphic chip: {plain}"
+        );
+        assert!(
+            plain.contains("[▣ Canvas · H: HTML]"),
+            "canvas must render clean chip: {plain}"
+        );
         assert!(!plain.contains("template noise"), "template must be stripped");
 
         // Entities decoded cleanly
