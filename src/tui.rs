@@ -278,8 +278,9 @@ fn evaluate_pixel_placement(
     let is_inline = cache_key.starts_with("inline:");
 
     let (avail_w, avail_h) = if is_inline {
-        let body_y = inspector_area.y.saturating_add(1);
-        let body_h = inspector_area.height.saturating_sub(1);
+        let header_rows = crate::ui::drive_view::inspector_header_rows(inspector_area);
+        let body_y = inspector_area.y.saturating_add(header_rows);
+        let body_h = inspector_area.height.saturating_sub(header_rows);
         let body_bottom = body_y.saturating_add(body_h);
         if inspector_scroll_y > 0 {
             if rect.y < body_y.saturating_add(inspector_scroll_y) {
@@ -610,8 +611,8 @@ fn draw_frame(
     let mut desired: Vec<ActivePixelGraphic> = Vec::new();
     let mut desired_payloads: Vec<Cow<'_, str>> = Vec::new();
     let pending_list = std::mem::take(&mut ui.pending_pixel_graphics);
-    let body_h = ui.inspector_scroll.area.height.saturating_sub(1);
-    let max_off = ui.inspector_scroll.total_lines.saturating_sub(body_h as usize);
+    let body_h = crate::ui::drive_view::inspector_body_height(ui.inspector_scroll.area);
+    let max_off = ui.inspector_scroll.total_lines.saturating_sub(body_h);
     let inspector_scroll_y = ui.inspector_scroll.offset.min(max_off) as u16;
     let mut redecode_requests: Vec<(String, u16, u16)> = Vec::new();
 

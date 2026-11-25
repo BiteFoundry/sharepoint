@@ -138,6 +138,7 @@ pub fn draw(
     if area.width == 0 || area.height == 0 {
         return;
     }
+    hitmap.add(area, HitTarget::Pane(Focus::Nav));
     let theme = &ui.theme;
     let sidebar_style = if theme.no_color {
         Style::default()

@@ -52,10 +52,16 @@ impl Toast {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ToastQueue {
     toasts: VecDeque<Toast>,
     max: usize,
+}
+
+impl Default for ToastQueue {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToastQueue {

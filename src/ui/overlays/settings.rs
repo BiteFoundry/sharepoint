@@ -110,31 +110,42 @@ impl SettingsState {
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        crate::ui::overlays::draw_overlay_close_pill(frame, rect, ui, hitmap);
         if inner.width == 0 || inner.height == 0 {
             return;
         }
 
         let rows = SettingsState::rows(app, ui);
-        for (index, (label, value)) in rows.iter().enumerate() {
-            if index as u16 >= inner.height.saturating_sub(1) {
-                break;
+        let visible = inner.height.saturating_sub(1) as usize;
+        if visible > 0 {
+            let active_sel = self.selected.min(rows.len() - 1);
+            let skip = active_sel.saturating_sub(visible.saturating_sub(1));
+            for (vis_row, (index, (label, value))) in rows
+                .iter()
+                .enumerate()
+                .skip(skip)
+                .take(visible)
+                .enumerate()
+            {
+                let y = inner.y + vis_row as u16;
+                let selected = index == active_sel;
+                let style = if selected {
+                    theme.selection()
+                } else {
+                    Style::default()
+                };
+                let used = unicode_width::UnicodeWidthStr::width(*label).max(25) + 3;
+                let value = crate::ui::truncate_width(
+                    value,
+                    (inner.width as usize).saturating_sub(used + 2),
+                );
+                let line = Line::from(vec![
+                    Span::styled(format!(" {:<25}", label), style),
+                    Span::styled(value, theme.muted_style()),
+                ]);
+                frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
+                hitmap.add_line(inner.x, y, inner.width, HitTarget::OverlayItem { index });
             }
-            let y = inner.y + index as u16;
-            let selected = index == self.selected;
-            let style = if selected {
-                theme.selection()
-            } else {
-                Style::default()
-            };
-            let used = unicode_width::UnicodeWidthStr::width(*label).max(25) + 3;
-            let value =
-                crate::ui::truncate_width(value, (inner.width as usize).saturating_sub(used + 2));
-            let line = Line::from(vec![
-                Span::styled(format!(" {:<25}", label), style),
-                Span::styled(value, theme.muted_style()),
-            ]);
-            frame.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
-            hitmap.add_line(inner.x, y, inner.width, HitTarget::OverlayItem { index });
         }
 
         let hint_y = inner.y + inner.height.saturating_sub(1);

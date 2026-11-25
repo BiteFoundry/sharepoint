@@ -197,6 +197,70 @@ pub fn truncate_width(s: &str, max_w: usize) -> String {
     out
 }
 
+pub fn wrapped_line_count(lines: &[ratatui::text::Line<'_>], width: u16) -> usize {
+    let max_w = width as usize;
+    if max_w == 0 {
+        return lines.len();
+    }
+    let mut total = 0usize;
+    for line in lines {
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        if text.is_empty() {
+            total += 1;
+            continue;
+        }
+        let mut line_rows = 1usize;
+        let mut col = 0usize;
+        let mut chars = text.chars().peekable();
+        while chars.peek().is_some() {
+            let is_ws = chars.peek().is_some_and(|c| c.is_whitespace());
+            let mut token = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() != is_ws {
+                    break;
+                }
+                token.push(c);
+                chars.next();
+            }
+            let tok_w = token.width();
+            if tok_w == 0 {
+                continue;
+            }
+            if col + tok_w <= max_w {
+                col += tok_w;
+            } else if is_ws {
+                let mut rem = tok_w;
+                while col + rem > max_w {
+                    let take = max_w.saturating_sub(col);
+                    rem = rem.saturating_sub(take);
+                    line_rows += 1;
+                    col = 0;
+                }
+                col = rem;
+            } else if tok_w <= max_w {
+                line_rows += 1;
+                col = tok_w;
+            } else {
+                if col > 0 {
+                    line_rows += 1;
+                    col = 0;
+                }
+                for ch in token.chars() {
+                    let cw = ch.width().unwrap_or(0);
+                    if col + cw > max_w && col > 0 {
+                        line_rows += 1;
+                        col = cw;
+                    } else {
+                        col += cw;
+                    }
+                }
+            }
+        }
+        total += line_rows;
+    }
+    total
+}
+
 pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(u16, u16)> {
     let area = frame.area();
     ui.term_width = area.width;
@@ -214,6 +278,8 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
 
     let plan = compute_layout(area, ui.show_nav_rail, ui.narrow_pane);
     ui.nav_area = plan.nav.unwrap_or_default();
+    ui.list_scroll.area = Rect::default();
+    ui.inspector_scroll.area = Rect::default();
 
     let mut hitmap = HitMap::default();
 
@@ -238,7 +304,12 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
 
     let mut cursor_pos = None;
     let mut overlays = std::mem::take(&mut ui.overlays);
-    for overlay in overlays.iter_mut() {
+    let overlay_count = overlays.len();
+    for (idx, overlay) in overlays.iter_mut().enumerate() {
+        if idx + 1 == overlay_count {
+            hitmap.clear();
+            hitmap.add(area, HitTarget::OverlayBackdrop);
+        }
         if let Some(pos) = overlay.draw(frame, area, app, ui, &mut hitmap) {
             cursor_pos = Some(pos);
         }

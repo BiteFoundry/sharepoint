@@ -4,6 +4,8 @@
 
 use ratatui::layout::{Position, Rect};
 
+use super::app::Focus;
+
 /// Toolbar, header, and modal button identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonId {
@@ -30,14 +32,17 @@ pub enum ButtonId {
     NarrowSidebar,
     NarrowFiles,
     NarrowInspector,
-    // Confirm dialog
+    // Confirm dialog & modal close pill
     ConfirmOk,
     ConfirmCancel,
+    OverlayClose,
 }
 
 /// Clickable targets on the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
+    /// Background region of a workspace pane (clicking empty pane space focuses that pane).
+    Pane(Focus),
     /// A row in the left sidebar (`nav_pane`).
     NavRow(usize),
     /// A row in the middle pane file/folder list.
@@ -50,6 +55,8 @@ pub enum HitTarget {
     PreviewImageChip,
     /// Header / toolbar / status / modal button.
     Button(ButtonId),
+    /// Full-screen modal backdrop behind the top overlay (click closes top overlay, blocks click-through).
+    OverlayBackdrop,
     /// Modal / overlay outer frame (prevents clicks inside modal padding from closing the modal).
     OverlayBody,
     /// Item inside the top overlay.

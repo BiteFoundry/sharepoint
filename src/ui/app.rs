@@ -84,6 +84,7 @@ pub enum ActiveViewSource {
     Recent,
     SharedWithMe,
     Drive { drive_id: String, label: String },
+    SearchResult { drive_id: String, label: String },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -130,6 +131,7 @@ pub enum UiMsg {
     RecentLoaded(Vec<DriveItem>),
     SharedLoaded(Vec<DriveItem>),
     VirtualListLoaded {
+        seq: u64,
         kind: VirtualListKind,
         items: Vec<DriveItem>,
         status: VirtualListStatus,
@@ -148,6 +150,9 @@ pub enum UiMsg {
         cache_key: String,
         item_id: String,
         versions: Vec<DriveItemVersion>,
+    },
+    VersionsFailed {
+        cache_key: String,
     },
     PreviewFailed {
         drive_id: String,
@@ -188,6 +193,8 @@ pub enum UiMsg {
     ItemDeleted {
         drive_id: String,
         item_id: String,
+        raw_drive_id: Option<String>,
+        raw_item_id: Option<String>,
         name: String,
     },
     ShareLinkCreated {
@@ -195,6 +202,7 @@ pub enum UiMsg {
         link: ShareLinkResult,
     },
     SearchResults {
+        seq: u64,
         items: Vec<DriveItem>,
     },
     UpdateChecked(crate::models::UpdateCheckResult),
@@ -368,6 +376,10 @@ pub struct AppState {
     /// Deduplicates raw image byte downloads across inline and modal views for the same item revision.
     inflight_raw_images: HashMap<String, PendingImageDownload>,
     pub search_results: Vec<DriveItem>,
+    /// Monotonic generation guard for local/remote search responses.
+    pub search_seq: u64,
+    /// Monotonic generation guard for Recent/SharedWithMe virtual list loads.
+    pub virtual_list_seq: u64,
     pub active_selected_id: Option<String>,
     /// True once the user has toggled the rendered-preview setting in this session.
     render_markup_user_set: bool,
@@ -440,25 +452,64 @@ impl AppState {
             pending_html_overlay_fetches: HashSet::new(),
             inflight_raw_images: HashMap::new(),
             search_results: Vec::new(),
+            search_seq: 0,
+            virtual_list_seq: 0,
             active_selected_id: None,
             render_markup_user_set: false,
             html_server: NativeHtmlServer::new(),
         }
     }
 
+    pub fn next_search_seq(&mut self) -> u64 {
+        self.search_seq = self.search_seq.wrapping_add(1);
+        self.search_seq
+    }
+
+    pub fn bump_virtual_list_seq(&mut self) -> u64 {
+        self.virtual_list_seq = self.virtual_list_seq.wrapping_add(1);
+        self.virtual_list_seq
+    }
+
+    pub(crate) fn reset_folder_listing_state(&mut self) {
+        self.listed_folder = None;
+        self.current_items_truncated = false;
+        self.folder_item_limit = FOLDER_PAGE_SIZE;
+        self.loading_folder = false;
+        self.bump_virtual_list_seq();
+    }
+
     pub fn active_drive_id(&self) -> Option<String> {
         match &self.active_source {
             ActiveViewSource::OneDriveRoot => self.my_drive.as_ref().map(|d| d.id.clone()),
-            ActiveViewSource::Drive { drive_id, .. } => Some(drive_id.clone()),
+            ActiveViewSource::Drive { drive_id, .. }
+            | ActiveViewSource::SearchResult { drive_id, .. } => Some(drive_id.clone()),
             ActiveViewSource::Recent | ActiveViewSource::SharedWithMe => None,
         }
     }
 
-    /// Returns `Some((drive_id, parent_id))` only when viewing a real folder (`OneDriveRoot` or `Drive`),
-    /// never for virtual views (`Recent` / `SharedWithMe`).
-    pub fn active_folder_target(&self) -> Option<(String, Option<String>)> {
+    /// Returns the SharePoint `site_id` owning the currently active library, if any.
+    pub fn active_site_id(&self) -> Option<String> {
         let drive_id = self.active_drive_id()?;
-        Some((drive_id, self.active_parent_id()))
+        for (site_id, drives) in &self.site_drives {
+            if drives.iter().any(|d| d.id == drive_id) {
+                return Some(site_id.clone());
+            }
+        }
+        None
+    }
+
+    /// Returns `Some((drive_id, parent_id))` only when viewing a real folder (`OneDriveRoot` or `Drive`),
+    /// never for virtual views (`Recent` / `SharedWithMe`) or synthetic `SearchResult` views.
+    pub fn active_folder_target(&self) -> Option<(String, Option<String>)> {
+        match &self.active_source {
+            ActiveViewSource::OneDriveRoot | ActiveViewSource::Drive { .. } => {
+                let drive_id = self.active_drive_id()?;
+                Some((drive_id, self.active_parent_id()))
+            }
+            ActiveViewSource::Recent
+            | ActiveViewSource::SharedWithMe
+            | ActiveViewSource::SearchResult { .. } => None,
+        }
     }
 
     pub fn virtual_list_status_for_active(&self) -> Option<(VirtualListKind, Option<&VirtualListStatus>)> {
@@ -481,6 +532,7 @@ impl AppState {
             ActiveViewSource::Recent => "OneDrive > Recent".to_string(),
             ActiveViewSource::SharedWithMe => "OneDrive > Shared with Me".to_string(),
             ActiveViewSource::Drive { label, .. } => format!("SharePoint > {label}"),
+            ActiveViewSource::SearchResult { label, .. } => label.clone(),
         };
         if self.folder_stack.is_empty() {
             root
@@ -709,8 +761,9 @@ impl AppState {
         })
     }
 
-    fn reconcile_selection_after_items_update(&mut self, ui: &mut UiState) {
+    pub(crate) fn reconcile_selection_after_items_update(&mut self, ui: &mut UiState) {
         let items = self.sorted_visible_items();
+        let prev_idx = ui.list_scroll.selected_idx;
         let selected = if items.is_empty() {
             ui.list_scroll.selected_idx = None;
             self.active_selected_id = None;
@@ -720,16 +773,18 @@ impl AppState {
                 ui.list_scroll.selected_idx = Some(pos);
                 items.get(pos)
             } else {
-                ui.list_scroll.selected_idx = Some(0);
-                self.active_selected_id = Some(items[0].id.clone());
+                let fallback = prev_idx.unwrap_or(0).min(items.len() - 1);
+                ui.list_scroll.selected_idx = Some(fallback);
+                self.active_selected_id = Some(items[fallback].id.clone());
                 ui.inspector_scroll.top();
-                items.first()
+                items.get(fallback)
             }
         } else {
-            ui.list_scroll.selected_idx = Some(0);
-            self.active_selected_id = Some(items[0].id.clone());
+            let fallback = prev_idx.unwrap_or(0).min(items.len() - 1);
+            ui.list_scroll.selected_idx = Some(fallback);
+            self.active_selected_id = Some(items[fallback].id.clone());
             ui.inspector_scroll.top();
-            items.first()
+            items.get(fallback)
         };
         self.sync_inspector_preview_for(selected, ui);
     }
@@ -877,12 +932,15 @@ impl AppState {
                 Overlay::ImagePreview(ov) => {
                     let prev_cur = ov.current().cloned();
                     let new_images: Vec<DriveItem> = self
-                        .current_items
-                        .iter()
+                        .sorted_visible_items()
+                        .into_iter()
                         .filter(|i| i.is_image())
-                        .cloned()
                         .collect();
-                    if !new_images.is_empty() {
+                    if new_images.is_empty() {
+                        ov.items.clear();
+                        ov.index = 0;
+                        ov.error = Some("No images remaining in this folder".to_string());
+                    } else {
                         if let Some(ref prev) = prev_cur {
                             if let Some(pos) = new_images.iter().position(|i| i.id == prev.id) {
                                 let updated = &new_images[pos];
@@ -901,6 +959,16 @@ impl AppState {
                                 }
                             } else {
                                 ov.index = ov.index.min(new_images.len() - 1);
+                                let next_img = &new_images[ov.index];
+                                let (cols, rows) =
+                                    ov.target_dimensions(ui.term_width, ui.term_height);
+                                let key = self.modal_image_cache_key(
+                                    next_img,
+                                    cols,
+                                    rows,
+                                    ui.graphics_caps.protocol,
+                                );
+                                image_refresh = Some((next_img.clone(), key, cols, rows));
                             }
                         }
                         ov.items = new_images;
@@ -944,6 +1012,7 @@ impl AppState {
         let tx = self.ui_tx.clone();
         let graph = self.graph.clone();
         let storage = self.storage.clone();
+        let vseq = self.bump_virtual_list_seq();
         self.loading_folder = true;
 
         // Truncation belongs to one folder. Moving to another folder or to a virtual view
@@ -956,6 +1025,10 @@ impl AppState {
         }
 
         match &self.active_source {
+            ActiveViewSource::SearchResult { .. } => {
+                self.loading_folder = false;
+                return;
+            }
             ActiveViewSource::Recent => {
                 self.sync_ctrl.set_focus(FocusTarget {
                     active_drive_id: None,
@@ -971,6 +1044,7 @@ impl AppState {
                                 let _ = storage.replace_recent_items(&fetch.items);
                             }
                             let _ = tx.send(UiMsg::VirtualListLoaded {
+                                seq: vseq,
                                 kind: VirtualListKind::Recent,
                                 items: fetch.items,
                                 status: fetch.status,
@@ -1001,6 +1075,7 @@ impl AppState {
                                 let _ = storage.replace_shared_items(&fetch.items);
                             }
                             let _ = tx.send(UiMsg::VirtualListLoaded {
+                                seq: vseq,
                                 kind: VirtualListKind::SharedWithMe,
                                 items: fetch.items,
                                 status: fetch.status,
@@ -1027,18 +1102,19 @@ impl AppState {
         self.sync_ctrl.set_focus(FocusTarget {
             active_drive_id: Some(drive_id.clone()),
             active_parent_id: parent_id.clone(),
-            active_site_id: None,
+            active_site_id: self.active_site_id(),
             view_kind: FocusViewKind::Folder,
             active_limit: self.requested_folder_limit(),
         });
 
-        // Show cached children immediately, then refresh from Graph
+        // Show cached children immediately, then refresh from Graph.
+        // Also clear stale in-memory rows when the cached folder was just emptied (e.g., last item deleted).
         if let Ok((cached, cache_truncated)) = self.storage.list_folder_children_page(
             &drive_id,
             parent_id.as_deref(),
             self.folder_item_limit,
         ) {
-            if !cached.is_empty() {
+            if !cached.is_empty() || !self.current_items.is_empty() {
                 self.current_items = cached;
                 // The cache can prove there is more, never that there is not: a folder whose
                 // last listing stopped early has exactly one page cached.
@@ -1081,12 +1157,17 @@ impl AppState {
                 let id_for_msg = item_id.clone();
                 let cache_key = rev_key.clone();
                 tokio::spawn(async move {
-                    if let Ok(versions) = graph.list_item_versions(&did, &iid).await {
-                        let _ = tx.send(UiMsg::VersionsLoaded {
-                            cache_key,
-                            item_id: id_for_msg,
-                            versions,
-                        });
+                    match graph.list_item_versions(&did, &iid).await {
+                        Ok(versions) => {
+                            let _ = tx.send(UiMsg::VersionsLoaded {
+                                cache_key,
+                                item_id: id_for_msg,
+                                versions,
+                            });
+                        }
+                        Err(_) => {
+                            let _ = tx.send(UiMsg::VersionsFailed { cache_key });
+                        }
                     }
                 });
             }
@@ -1343,6 +1424,11 @@ impl AppState {
                 truncated,
             } => {
                 if self.active_folder_target() == Some((drive_id, parent_id)) {
+                    // Guard against an older smaller-limit background poll truncating a
+                    // folder whose user-requested page limit was already raised via `LoadMoreItems`.
+                    if truncated && items.len() < self.folder_item_limit {
+                        return;
+                    }
                     self.current_items = items;
                     self.current_items_truncated = truncated;
                     self.loading_folder = false;
@@ -1395,7 +1481,12 @@ impl AppState {
                 }
             }
             CoreEvent::SyncStateChanged { busy, summary } => {
+                let was_busy = self.sync_busy;
                 self.sync_busy = busy;
+                if was_busy && !busy {
+                    self.loading_folder = false;
+                    self.ensure_inspector_loaded(ui);
+                }
                 if summary != POLL_RETRY_SUMMARY {
                     self.sync_summary = summary;
                 }
@@ -1403,6 +1494,7 @@ impl AppState {
             CoreEvent::SyncError(err) => {
                 self.sync_busy = false;
                 self.loading_folder = false;
+                self.ensure_inspector_loaded(ui);
                 ui.toast(format!("Sync error: {err}"), ToastKind::Error);
             }
         }
@@ -1474,10 +1566,14 @@ impl AppState {
                 }
             }
             UiMsg::VirtualListLoaded {
+                seq,
                 kind,
                 items,
                 status,
             } => {
+                if seq != self.virtual_list_seq {
+                    return;
+                }
                 let is_avail = status.is_available();
                 let active_matches = match kind {
                     VirtualListKind::Recent => {
@@ -1564,6 +1660,9 @@ impl AppState {
             } => {
                 self.inflight_previews.remove(&format!("ver:{cache_key}"));
                 self.item_versions.insert(cache_key, versions);
+            }
+            UiMsg::VersionsFailed { cache_key } => {
+                self.inflight_previews.remove(&format!("ver:{cache_key}"));
             }
             UiMsg::PreviewFailed {
                 drive_id,
@@ -1729,16 +1828,83 @@ impl AppState {
             }
             UiMsg::ItemRenamed(item) => {
                 ui.toast(format!("Renamed to '{}'", item.name), ToastKind::Success);
-                if self.active_selected_id.as_deref() == Some(item.id.as_str()) {
+                let mut touched_active = self.active_selected_id.as_deref() == Some(item.id.as_str());
+                for existing in &mut self.current_items {
+                    let is_same = (existing.drive_id == item.drive_id && existing.id == item.id)
+                        || (existing.effective_drive_id() == item.drive_id
+                            && existing.effective_item_id() == item.id);
+                    if is_same {
+                        existing.name = item.name.clone();
+                        if self.active_selected_id.as_deref() == Some(existing.id.as_str()) {
+                            touched_active = true;
+                        }
+                    }
+                }
+                for pin in &mut self.pins {
+                    if pin.drive_id.as_deref() == Some(item.drive_id.as_str())
+                        && pin.item_id.as_deref() == Some(item.id.as_str())
+                    {
+                        pin.label = item.name.clone();
+                        let _ = self.storage.upsert_pin(pin);
+                    }
+                }
+                if touched_active {
                     ui.markup_cache = None;
                 }
+                self.reconcile_selection_after_items_update(ui);
+                self.refresh_open_overlays_for_items(ui);
                 self.load_active_folder(ui);
             }
-            UiMsg::ItemDeleted { item_id, name, .. } => {
+            UiMsg::ItemDeleted {
+                drive_id,
+                item_id,
+                raw_drive_id,
+                raw_item_id,
+                name,
+            } => {
                 ui.toast(format!("Deleted '{name}'"), ToastKind::Success);
-                if self.active_selected_id.as_deref() == Some(item_id.as_str()) {
+                let raw_did = raw_drive_id.as_deref();
+                let raw_iid = raw_item_id.as_deref();
+                let active_deleted = self.active_selected_id.as_deref() == Some(item_id.as_str())
+                    || raw_iid.is_some_and(|rid| self.active_selected_id.as_deref() == Some(rid));
+                if active_deleted {
                     self.clear_inspector_preview(ui);
                 }
+                self.current_items.retain(|it| {
+                    let eff_match = it.effective_drive_id() == drive_id
+                        && it.effective_item_id() == item_id;
+                    let direct_match = it.drive_id == drive_id && it.id == item_id;
+                    let raw_match = matches!((raw_did, raw_iid), (Some(rd), Some(ri)) if it.drive_id == rd && it.id == ri);
+                    !(eff_match || direct_match || raw_match)
+                });
+                let eff_pin_key = format!("folder:{drive_id}:{item_id}");
+                let raw_pin_key = match (raw_did, raw_iid) {
+                    (Some(rd), Some(ri)) => Some(format!("folder:{rd}:{ri}")),
+                    _ => None,
+                };
+                let mut removed_pin_keys: Vec<String> = Vec::new();
+                self.pins.retain(|p| {
+                    let eff_pin = p.drive_id.as_deref() == Some(drive_id.as_str())
+                        && p.item_id.as_deref() == Some(item_id.as_str());
+                    let raw_pin = matches!(
+                        (raw_did, raw_iid),
+                        (Some(rd), Some(ri)) if p.drive_id.as_deref() == Some(rd) && p.item_id.as_deref() == Some(ri)
+                    );
+                    let key_pin = p.key == eff_pin_key
+                        || raw_pin_key.as_deref() == Some(p.key.as_str());
+                    if eff_pin || raw_pin || key_pin {
+                        removed_pin_keys.push(p.key.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for key in removed_pin_keys {
+                    let _ = self.storage.remove_pin(&key);
+                }
+                self.reconcile_selection_after_items_update(ui);
+                self.refresh_open_overlays_for_items(ui);
+                self.ensure_inspector_loaded(ui);
                 self.load_active_folder(ui);
             }
             UiMsg::ShareLinkCreated { item_id, link } => {
@@ -1747,7 +1913,10 @@ impl AppState {
                 let suffix = if copied { " (copied to clipboard)" } else { "" };
                 ui.toast(format!("Share link: {}{suffix}", link.web_url), ToastKind::Success);
             }
-            UiMsg::SearchResults { items } => {
+            UiMsg::SearchResults { seq, items } => {
+                if seq != self.search_seq {
+                    return;
+                }
                 self.search_results = items;
             }
             UiMsg::UpdateChecked(res) => {
@@ -1761,7 +1930,11 @@ impl AppState {
                 }
             }
             UiMsg::TaskError { label, error } => {
+                let was_loading = self.loading_folder;
                 self.loading_folder = false;
+                if was_loading {
+                    self.ensure_inspector_loaded(ui);
+                }
                 ui.toast(format!("{label} failed: {error}"), ToastKind::Error);
             }
             UiMsg::Toast { message, kind } => {
@@ -3351,11 +3524,17 @@ mod tests {
                 &mut ui,
             );
         }
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        app.apply_ui_msg(msg, &mut ui);
+        let mut saw_text = false;
+        while !saw_text {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(msg, UiMsg::TextPreviewLoaded { .. }) {
+                saw_text = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         // Metadata-only rename: name, eTag, and lastModifiedDateTime change; cTag & size stay identical!
@@ -3385,5 +3564,251 @@ mod tests {
         assert_eq!(app.text_preview_for(&item_renamed), Some("# Same Body\n"));
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn sequence_guards_ignore_stale_search_virtual_list_and_smaller_folder_polls() {
+        let (mut app, mut ui, _rx) = test_app_and_ui_with_base_url(None);
+
+        // 1. Search sequence guard ignores older out-of-order search responses.
+        let seq1 = app.next_search_seq();
+        let seq2 = app.next_search_seq();
+        app.apply_ui_msg(
+            UiMsg::SearchResults {
+                seq: seq2,
+                items: vec![make_text_file("d1", "fresh", "fresh.txt", "text/plain")],
+            },
+            &mut ui,
+        );
+        app.apply_ui_msg(
+            UiMsg::SearchResults {
+                seq: seq1,
+                items: vec![make_text_file("d1", "stale", "stale.txt", "text/plain")],
+            },
+            &mut ui,
+        );
+        assert_eq!(app.search_results.len(), 1);
+        assert_eq!(app.search_results[0].id, "fresh");
+
+        // 2. VirtualListLoaded sequence guard ignores stale Recent responses.
+        app.active_source = ActiveViewSource::Recent;
+        let vseq1 = app.bump_virtual_list_seq();
+        let vseq2 = app.bump_virtual_list_seq();
+        let avail_status = VirtualListStatus {
+            availability: crate::models::VirtualListAvailability::Available,
+            last_checked_at: "2026-11-25T00:00:00Z".into(),
+        };
+        app.apply_ui_msg(
+            UiMsg::VirtualListLoaded {
+                seq: vseq2,
+                kind: VirtualListKind::Recent,
+                items: vec![make_text_file("d1", "rec-new", "new.txt", "text/plain")],
+                status: avail_status.clone(),
+            },
+            &mut ui,
+        );
+        app.apply_ui_msg(
+            UiMsg::VirtualListLoaded {
+                seq: vseq1,
+                kind: VirtualListKind::Recent,
+                items: vec![make_text_file("d1", "rec-old", "old.txt", "text/plain")],
+                status: avail_status,
+            },
+            &mut ui,
+        );
+        assert_eq!(app.current_items.len(), 1);
+        assert_eq!(app.current_items[0].id, "rec-new");
+
+        // 3. Stale 200-item truncated background poll must NOT truncate a 400-item loaded folder.
+        app.active_source = ActiveViewSource::Drive {
+            drive_id: "d1".into(),
+            label: "Docs".into(),
+        };
+        app.navigate_to_active_folder(&mut ui);
+        let page400: Vec<DriveItem> = (0..400)
+            .map(|i| make_text_file("d1", &format!("f-{i}"), &format!("f-{i:03}.txt"), "text/plain"))
+            .collect();
+        app.folder_item_limit = 400;
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "d1".into(),
+                parent_id: None,
+                items: page400,
+                truncated: true,
+            },
+            &mut ui,
+        );
+        assert_eq!(app.current_items.len(), 400);
+
+        let stale200: Vec<DriveItem> = (0..200)
+            .map(|i| make_text_file("d1", &format!("f-{i}"), &format!("f-{i:03}.txt"), "text/plain"))
+            .collect();
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "d1".into(),
+                parent_id: None,
+                items: stale200,
+                truncated: true,
+            },
+            &mut ui,
+        );
+        assert_eq!(
+            app.current_items.len(),
+            400,
+            "stale 200-item truncated poll must not clobber 400-item folder"
+        );
+
+        // Complete listing (truncated=false) still applies even if smaller.
+        app.apply_core_event(
+            CoreEvent::FolderItemsUpdated {
+                drive_id: "d1".into(),
+                parent_id: None,
+                items: vec![make_text_file("d1", "only", "only.txt", "text/plain")],
+                truncated: false,
+            },
+            &mut ui,
+        );
+        assert_eq!(app.current_items.len(), 1);
+        assert!(!app.current_items_truncated);
+    }
+
+    #[tokio::test]
+    async fn post_delete_clamps_selection_clears_last_ghost_overlay_pins_and_versions_failure() {
+        let (mut app, mut ui, _rx) = test_app_and_ui_with_base_url(None);
+        app.active_source = ActiveViewSource::Drive {
+            drive_id: "d1".into(),
+            label: "Docs".into(),
+        };
+        let fld = make_folder("d1", "fld-pin", "PinnedFolder");
+        let a = make_text_file("d1", "a", "a.txt", "text/plain");
+        let b = make_text_file("d1", "b", "b.txt", "text/plain");
+        let c = make_text_file("d1", "c", "c.txt", "text/plain");
+        let img = make_text_file("d1", "img1", "pic.png", "image/png");
+        let all = vec![fld.clone(), a.clone(), b.clone(), c.clone(), img.clone()];
+        app.storage.upsert_drive_items(&all).unwrap();
+        app.current_items = all;
+        app.active_selected_id = Some("b".into());
+        ui.list_scroll.selected_idx = Some(2);
+
+        // Pin `fld-pin`
+        let pin = PinnedTarget {
+            key: "folder:d1:fld-pin".into(),
+            kind: "folder".into(),
+            drive_id: Some("d1".into()),
+            item_id: Some("fld-pin".into()),
+            site_id: None,
+            label: "PinnedFolder".into(),
+        };
+        app.storage.upsert_pin(&pin).unwrap();
+        app.pins.push(pin);
+
+        // Delete item at index 2 (`b`) -> selection clamps near index 2 (`c`), NOT jumping to 0!
+        app.storage.delete_drive_item("d1", "b").unwrap();
+        app.apply_ui_msg(
+            UiMsg::ItemDeleted {
+                drive_id: "d1".into(),
+                item_id: "b".into(),
+                raw_drive_id: None,
+                raw_item_id: None,
+                name: "b.txt".into(),
+            },
+            &mut ui,
+        );
+        assert_eq!(ui.list_scroll.selected_idx, Some(2));
+        assert_eq!(app.active_selected_id.as_deref(), Some("c"));
+
+        // Delete pinned folder -> removed from app.pins and SQLite!
+        app.storage.delete_drive_item("d1", "fld-pin").unwrap();
+        app.apply_ui_msg(
+            UiMsg::ItemDeleted {
+                drive_id: "d1".into(),
+                item_id: "fld-pin".into(),
+                raw_drive_id: None,
+                raw_item_id: None,
+                name: "PinnedFolder".into(),
+            },
+            &mut ui,
+        );
+        assert!(app.pins.is_empty());
+        assert!(app.storage.list_pins().unwrap().is_empty());
+
+        // Open ImagePreviewOverlay on `img1`, then delete `img1` -> overlay items cleared!
+        let ov = crate::ui::overlays::image_preview::ImagePreviewOverlay::from_folder_items(
+            &app.sorted_visible_items(),
+            Some("img1"),
+        )
+        .unwrap();
+        ui.push_overlay(Overlay::ImagePreview(ov));
+        app.storage.delete_drive_item("d1", "img1").unwrap();
+        app.apply_ui_msg(
+            UiMsg::ItemDeleted {
+                drive_id: "d1".into(),
+                item_id: "img1".into(),
+                raw_drive_id: None,
+                raw_item_id: None,
+                name: "pic.png".into(),
+            },
+            &mut ui,
+        );
+        match ui.overlays.last() {
+            Some(Overlay::ImagePreview(ov)) => assert!(ov.items.is_empty()),
+            other => panic!("expected ImagePreview overlay, got {other:?}"),
+        }
+        ui.pop_overlay();
+
+        // Delete remaining items so SQLite folder is empty -> no ghost last item remains!
+        app.storage.delete_drive_item("d1", "a").unwrap();
+        app.storage.delete_drive_item("d1", "c").unwrap();
+        app.current_items = vec![c.clone()];
+        app.active_selected_id = Some("c".into());
+        ui.list_scroll.selected_idx = Some(0);
+        app.load_active_folder(&mut ui);
+        assert!(
+            app.current_items.is_empty(),
+            "load_folder must not keep ghost deleted last item when SQLite cache is empty"
+        );
+
+        // Failed list_item_versions removes `ver:` key from `inflight_previews`.
+        let rev_key = AppState::item_revision_key(&a);
+        let vkey = format!("ver:{rev_key}");
+        app.inflight_previews.insert(vkey.clone());
+        app.apply_ui_msg(UiMsg::VersionsFailed { cache_key: rev_key }, &mut ui);
+        assert!(!app.inflight_previews.contains(&vkey));
+    }
+
+    #[tokio::test]
+    async fn refresh_all_avoids_virtual_list_re_fetch_and_recovers_inspector_on_error() {
+        let (mut app, mut ui, _rx) = test_app_and_ui_with_base_url(None);
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        app.sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+
+        // On Recent, RefreshAll sends SyncCommand::RefreshAll without spawning duplicate load_active_folder fetch.
+        app.active_source = ActiveViewSource::Recent;
+        let doc = make_text_file("d1", "rec-doc", "notes.txt", "text/plain");
+        app.current_items = vec![doc.clone()];
+        app.active_selected_id = Some("rec-doc".into());
+        app.set_text_preview("d1", "rec-doc", "cached text".into());
+        let seq_before = app.virtual_list_seq;
+
+        dispatch(Action::RefreshAll, &mut app, &mut ui);
+        assert!(app.text_preview_for(&doc).is_none());
+        assert_eq!(app.virtual_list_seq, seq_before + 1);
+        let mut cmds = Vec::new();
+        while let Ok(cmd) = nudge_rx.try_recv() {
+            cmds.push(cmd);
+        }
+        assert!(cmds.iter().any(|c| matches!(c, SyncCommand::RefreshAll)));
+        assert!(!cmds.iter().any(|c| matches!(c, SyncCommand::SyncFolder { .. })));
+
+        // When SyncError arrives, loading_folder clears and inspector fetch is re-requested (not stuck on Loading...).
+        let tkey = AppState::text_preview_inflight_key("d1", "rec-doc");
+        assert!(!app.inflight_previews.contains(&tkey));
+        app.apply_core_event(CoreEvent::SyncError("network down".into()), &mut ui);
+        assert!(!app.loading_folder);
+        assert!(
+            app.inflight_previews.contains(&tkey),
+            "SyncError after RefreshAll must re-trigger ensure_inspector_loaded"
+        );
     }
 }

@@ -244,6 +244,14 @@ impl ImagePreviewOverlay {
         }
 
         let Some(cur) = self.current() else {
+            let msg = self
+                .error
+                .as_deref()
+                .unwrap_or("No images remaining in this folder");
+            frame.render_widget(
+                Paragraph::new(Span::styled(format!(" {msg}"), theme.muted_style())),
+                inner,
+            );
             return;
         };
         let (cols, rows) = self.target_dimensions(area.width, area.height);

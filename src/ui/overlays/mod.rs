@@ -15,14 +15,18 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::ui::{
     action::Action,
     app::{AppState, UiState},
-    hitmap::{HitMap, HitTarget},
+    hitmap::{ButtonId, HitMap, HitTarget},
     overlays::{
         command_palette::CommandPalette, confirm::ConfirmDialog, context_menu::ContextMenu,
         file_picker::FilePickerOverlay, html_preview::HtmlPreviewOverlay,
@@ -127,7 +131,7 @@ impl Overlay {
     }
 
     pub fn help() -> Self {
-        Overlay::Help(HelpOverlay)
+        Overlay::Help(HelpOverlay::default())
     }
 
     pub fn confirm(message: impl Into<String>, on_confirm: Option<Action>) -> Self {
@@ -171,9 +175,44 @@ impl Overlay {
             Overlay::QuickInput(input) => input.handle(action),
             Overlay::ImagePreview(preview) => preview.handle(action),
             Overlay::HtmlPreview(html) => html.handle(action, ui),
-            Overlay::Help(_) => match action {
+            Overlay::Help(help) => match action {
                 Action::CloseOverlay | Action::Activate | Action::Input('q') => {
                     OverlayOutcome::Close
+                }
+                Action::MoveUp | Action::CursorUp | Action::Input('k') => {
+                    help.scroll_y = help.scroll_y.saturating_sub(1);
+                    OverlayOutcome::Handled
+                }
+                Action::MoveDown | Action::CursorDown | Action::Input('j') => {
+                    help.scroll_y = help.scroll_y.saturating_add(1).min(help.max_scroll_y);
+                    OverlayOutcome::Handled
+                }
+                Action::ScrollPageUp => {
+                    help.scroll_y = help.scroll_y.saturating_sub(6);
+                    OverlayOutcome::Handled
+                }
+                Action::ScrollPageDown => {
+                    help.scroll_y = help.scroll_y.saturating_add(6).min(help.max_scroll_y);
+                    OverlayOutcome::Handled
+                }
+                Action::ScrollTop | Action::CursorHome | Action::Input('g') => {
+                    help.scroll_y = 0;
+                    OverlayOutcome::Handled
+                }
+                Action::ScrollBottom | Action::CursorEnd | Action::Input('G') => {
+                    help.scroll_y = help.max_scroll_y;
+                    OverlayOutcome::Handled
+                }
+                Action::MouseScroll { delta, .. } => {
+                    if *delta < 0 {
+                        help.scroll_y = help.scroll_y.saturating_sub((-*delta) as u16);
+                    } else {
+                        help.scroll_y = help
+                            .scroll_y
+                            .saturating_add(*delta as u16)
+                            .min(help.max_scroll_y);
+                    }
+                    OverlayOutcome::Handled
                 }
                 Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
                 _ => OverlayOutcome::Handled,
@@ -243,8 +282,8 @@ impl Overlay {
                 html.draw(frame, area, app, ui, hitmap);
                 None
             }
-            Overlay::Help(_) => {
-                draw_help(frame, area, ui, hitmap);
+            Overlay::Help(help) => {
+                help.draw(frame, area, ui, hitmap);
                 None
             }
             Overlay::Confirm(dialog) => {
@@ -256,7 +295,10 @@ impl Overlay {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct HelpOverlay;
+pub struct HelpOverlay {
+    pub scroll_y: u16,
+    pub max_scroll_y: u16,
+}
 
 const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     (
@@ -308,58 +350,167 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     ),
 ];
 
-fn draw_help(frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
-    let theme = &ui.theme;
-    let rect = centered_rect(
-        area,
-        area.width.saturating_sub(4).min(100),
-        area.height.saturating_sub(3).min(24),
-    );
-    frame.render_widget(Clear, rect);
-    hitmap.add(rect, HitTarget::OverlayBody);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
-        .title(Line::from(Span::styled(
-            " Microsoft SharePoint & OneDrive TUI Help · Esc Close ",
-            theme.title(true),
-        )))
-        .border_style(theme.border_style(true));
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(inner);
-
-    for (index, (title, entries)) in HELP_SECTIONS.iter().enumerate() {
-        let target = columns[index % 2];
-        if target.width == 0 {
-            continue;
+impl HelpOverlay {
+    fn build_section_lines(
+        sections: &[usize],
+        theme: &crate::ui::theme::Theme,
+    ) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for (idx, &sec_idx) in sections.iter().enumerate() {
+            if idx > 0 {
+                lines.push(Line::raw(""));
+            }
+            let (title, entries) = HELP_SECTIONS[sec_idx];
+            lines.push(Line::from(Span::styled(
+                format!(" {title}"),
+                theme.title(true),
+            )));
+            for (key, desc) in entries {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {key:<20}"), theme.accent_style()),
+                    Span::raw((*desc).to_string()),
+                ]));
+            }
         }
-        let y_offset = if index < 2 { 0 } else { target.height / 2 };
-        let mut lines = Vec::with_capacity(entries.len() + 1);
-        lines.push(Line::from(Span::styled(
-            format!(" {title}"),
-            theme.title(true),
-        )));
-        for (key, desc) in entries.iter() {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {key:<20}"), theme.accent_style()),
-                Span::raw(desc.to_string()),
-            ]));
-        }
-        let sub = Rect::new(
-            target.x,
-            target.y + y_offset,
-            target.width,
-            target.height.saturating_sub(y_offset),
-        );
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), sub);
+        lines
     }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
+        let theme = &ui.theme;
+        let rect = centered_rect(
+            area,
+            area.width.saturating_sub(4).min(100),
+            area.height.saturating_sub(3).min(24),
+        );
+        frame.render_widget(Clear, rect);
+        hitmap.add(rect, HitTarget::OverlayBody);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
+            .title(Line::from(Span::styled(
+                " Microsoft SharePoint & OneDrive TUI Help · ↑↓/Wheel Scroll · Esc Close ",
+                theme.title(true),
+            )))
+            .border_style(theme.border_style(true));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        draw_overlay_close_pill(frame, rect, ui, hitmap);
+
+        if inner.width == 0 || inner.height == 0 {
+            self.max_scroll_y = 0;
+            self.scroll_y = 0;
+            return;
+        }
+
+        if inner.width >= 76 {
+            let left_lines = Self::build_section_lines(&[0, 2], theme);
+            let right_lines = Self::build_section_lines(&[1, 3], theme);
+            let initial_cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(inner);
+            let raw_max = crate::ui::wrapped_line_count(&left_lines, initial_cols[0].width)
+                .max(crate::ui::wrapped_line_count(&right_lines, initial_cols[1].width));
+            let show_sb = raw_max > inner.height as usize && inner.width > 4;
+            let content_area = if show_sb {
+                Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height)
+            } else {
+                inner
+            };
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(content_area);
+            let total_rows = crate::ui::wrapped_line_count(&left_lines, columns[0].width)
+                .max(crate::ui::wrapped_line_count(&right_lines, columns[1].width));
+            self.max_scroll_y = total_rows
+                .saturating_sub(inner.height as usize)
+                .min(u16::MAX as usize) as u16;
+            self.scroll_y = self.scroll_y.min(self.max_scroll_y);
+
+            frame.render_widget(
+                Paragraph::new(left_lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.scroll_y, 0)),
+                columns[0],
+            );
+            frame.render_widget(
+                Paragraph::new(right_lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.scroll_y, 0)),
+                columns[1],
+            );
+
+            if show_sb {
+                let sb_area = Rect::new(inner.right().saturating_sub(1), inner.y, 1, inner.height);
+                let mut sb_state =
+                    ScrollbarState::new(self.max_scroll_y.saturating_add(1) as usize)
+                        .position(self.scroll_y as usize);
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_style(Style::default().fg(theme.accent))
+                    .track_style(theme.muted_style());
+                frame.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
+            }
+        } else {
+            let all_lines = Self::build_section_lines(&[0, 1, 2, 3], theme);
+            let raw_rows = crate::ui::wrapped_line_count(&all_lines, inner.width);
+            let show_sb = raw_rows > inner.height as usize && inner.width > 2;
+            let content_area = if show_sb {
+                Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height)
+            } else {
+                inner
+            };
+            let total_rows = crate::ui::wrapped_line_count(&all_lines, content_area.width);
+            self.max_scroll_y = total_rows
+                .saturating_sub(inner.height as usize)
+                .min(u16::MAX as usize) as u16;
+            self.scroll_y = self.scroll_y.min(self.max_scroll_y);
+
+            frame.render_widget(
+                Paragraph::new(all_lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.scroll_y, 0)),
+                content_area,
+            );
+            if show_sb {
+                let sb_area = Rect::new(inner.right().saturating_sub(1), inner.y, 1, inner.height);
+                let mut sb_state =
+                    ScrollbarState::new(self.max_scroll_y.saturating_add(1) as usize)
+                        .position(self.scroll_y as usize);
+                let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_style(Style::default().fg(theme.accent))
+                    .track_style(theme.muted_style());
+                frame.render_stateful_widget(scrollbar, sb_area, &mut sb_state);
+            }
+        }
+    }
+}
+
+/// Renders a clickable `[✕ Esc]` close pill on the top-right border of a modal when space allows.
+pub fn draw_overlay_close_pill(frame: &mut Frame, rect: Rect, ui: &UiState, hitmap: &mut HitMap) {
+    let close_label = "[✕ Esc]";
+    let close_w = close_label.width() as u16;
+    if rect.width <= close_w + 6 || rect.height == 0 {
+        return;
+    }
+    let close_x = rect.right().saturating_sub(close_w + 1);
+    let close_rect = Rect::new(close_x, rect.y, close_w, 1);
+    let theme = &ui.theme;
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            close_label,
+            Style::default().fg(theme.fg).bg(theme.bg_elevated),
+        )),
+        close_rect,
+    );
+    hitmap.add_line(
+        close_x,
+        rect.y,
+        close_w,
+        HitTarget::Button(ButtonId::OverlayClose),
+    );
 }
 
 pub fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {

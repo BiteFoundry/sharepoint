@@ -66,7 +66,7 @@ const SOCKET_UNSUPPORTED_RETRY_SECS: u64 = 300;
 /// beyond it are reached through search (`/`) or `sharepoint sites <name>`.
 const SIDEBAR_SITE_DISCOVERY_LIMIT: usize = 50;
 /// Sites whose libraries are fetched up front. The rest load when their row is opened.
-const SIDEBAR_DRIVE_PREFETCH_SITES: usize = 12;
+pub const SIDEBAR_DRIVE_PREFETCH_SITES: usize = 12;
 
 /// Sidebar site list: followed sites first, then discovered sites not already present.
 /// The order matters: `sites_for_drive_prefetch` takes the head of this list.
@@ -87,6 +87,23 @@ fn merge_sidebar_sites(
 /// sites before discovered ones.
 fn sites_for_drive_prefetch(sites: &[SharePointSite]) -> &[SharePointSite] {
     &sites[..sites.len().min(SIDEBAR_DRIVE_PREFETCH_SITES)]
+}
+
+/// Sites whose libraries should be refreshed: the first `SIDEBAR_DRIVE_PREFETCH_SITES`
+/// plus `active_site_id` if the user is actively viewing a site beyond the initial cap.
+fn sites_for_drive_refresh<'a>(
+    sites: &'a [SharePointSite],
+    active_site_id: Option<&str>,
+) -> Vec<&'a SharePointSite> {
+    let mut selected: Vec<&'a SharePointSite> = sites_for_drive_prefetch(sites).iter().collect();
+    if let Some(active_id) = active_site_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if !selected.iter().any(|s| s.id == active_id) {
+            if let Some(site) = sites.iter().find(|s| s.id == active_id) {
+                selected.push(site);
+            }
+        }
+    }
+    selected
 }
 
 pub(crate) struct SyncSharedState {
@@ -686,7 +703,17 @@ pub fn spawn_sync_engine(
                                     busy: true,
                                     summary: "Syncing OneDrive & SharePoint...".to_string(),
                                 });
-                                let discovered_root = sync_core_discovery(&graph, &storage, &event_tx, &shared, &mut backoff, &mut rt).await;
+                                let active_site_id = focus_rx.borrow().active_site_id.clone();
+                                let discovered_root = sync_core_discovery(
+                                    &graph,
+                                    &storage,
+                                    &event_tx,
+                                    &shared,
+                                    &mut backoff,
+                                    &mut rt,
+                                    active_site_id.as_deref(),
+                                )
+                                .await;
                                 let is_startup = matches!(cmd, SyncCommand::Bootstrap);
                                 if is_startup {
                                     startup_root = discovered_root;
@@ -699,7 +726,7 @@ pub fn spawn_sync_engine(
                                                 && focus.active_parent_id.is_none()
                                                 && startup_root.as_ref().is_some_and(|(id, _)| *id == did);
                                             if !discovery_handled_root {
-                                                let _ = sync_drive_delta_once(
+                                                if let Err(err) = sync_drive_delta_once(
                                                     &graph,
                                                     &storage,
                                                     &event_tx,
@@ -708,16 +735,15 @@ pub fn spawn_sync_engine(
                                                     focus.active_parent_id.as_deref(),
                                                     effective_folder_limit(focus.active_limit),
                                                 )
-                                                .await;
+                                                .await
+                                                {
+                                                    handle_poll_error(&err, &shared, &mut backoff, &event_tx);
+                                                }
                                             }
                                         }
                                     }
-                                    FocusViewKind::Recent => {
-                                        sync_virtual_list_once(&graph, &storage, &event_tx, &mut rt, VirtualListKind::Recent).await;
-                                    }
-                                    FocusViewKind::SharedWithMe => {
-                                        sync_virtual_list_once(&graph, &storage, &event_tx, &mut rt, VirtualListKind::SharedWithMe).await;
-                                    }
+                                    // Recent and SharedWithMe were already refreshed once by `sync_core_discovery`.
+                                    FocusViewKind::Recent | FocusViewKind::SharedWithMe => {}
                                 }
                                 let summary = current_idle_summary(&connected_socket_drive, focus_rx.borrow().active_drive_id.as_deref());
                                 let _ = event_tx.send(CoreEvent::SyncStateChanged {
@@ -763,7 +789,8 @@ pub fn spawn_sync_engine(
                                 }
                             }
                             SyncCommand::SyncSites => {
-                                sync_sites_once(&graph, &storage, &event_tx).await;
+                                let active_site_id = focus_rx.borrow().active_site_id.clone();
+                                sync_sites_once(&graph, &storage, &event_tx, active_site_id.as_deref()).await;
                             }
                             SyncCommand::SyncSiteDrives { site_id, site_name } => {
                                 if let Ok(drives) = graph.list_site_drives(&site_id, site_name.as_deref()).await {
@@ -877,6 +904,7 @@ pub fn spawn_sync_engine(
     // Lane 2: Quiet Background Site/Library Discovery Lane
     {
         let bg_ms = config.background_poll_ms.clamp(15_000, 600_000);
+        let focus_rx = focus_rx;
         let mut shutdown_rx = shutdown_rx;
         tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_millis(bg_ms));
@@ -900,7 +928,8 @@ pub fn spawn_sync_engine(
                         if !tracker.on_tick(idle, seq) {
                             continue;
                         }
-                        sync_sites_once(&graph, &storage, &event_tx).await;
+                        let active_site_id = focus_rx.borrow().active_site_id.clone();
+                        sync_sites_once(&graph, &storage, &event_tx, active_site_id.as_deref()).await;
                     }
                 }
             }
@@ -1655,6 +1684,7 @@ async fn sync_core_discovery(
     shared: &Arc<SyncSharedState>,
     backoff: &mut ErrorBackoffState,
     rt: &mut DriveSyncRuntime,
+    active_site_id: Option<&str>,
 ) -> Option<(String, bool)> {
     if let Ok(me) = graph.get_me().await {
         let _ = event_tx.send(CoreEvent::ProfileLoaded(me));
@@ -1682,7 +1712,7 @@ async fn sync_core_discovery(
         }
     };
 
-    sync_sites_once(graph, storage, event_tx).await;
+    sync_sites_once(graph, storage, event_tx, active_site_id).await;
     sync_virtual_list_once(graph, storage, event_tx, rt, VirtualListKind::Recent).await;
     sync_virtual_list_once(graph, storage, event_tx, rt, VirtualListKind::SharedWithMe).await;
     root_load
@@ -1725,6 +1755,7 @@ async fn sync_sites_once(
     graph: &GraphClient,
     storage: &Storage,
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    active_site_id: Option<&str>,
 ) {
     let followed_res = graph.list_followed_sites().await;
     let authoritative_follow = followed_res.is_ok();
@@ -1742,7 +1773,11 @@ async fn sync_sites_once(
     }
     if !combined.is_empty() || authoritative_follow {
         let _ = event_tx.send(CoreEvent::SitesUpdated(combined.clone()));
-        for site in sites_for_drive_prefetch(&combined) {
+        let mut refreshed_active = false;
+        for site in sites_for_drive_refresh(&combined, active_site_id) {
+            if active_site_id == Some(site.id.as_str()) {
+                refreshed_active = true;
+            }
             if let Ok(drives) = graph
                 .list_site_drives(&site.id, Some(site.effective_name()))
                 .await
@@ -1752,6 +1787,17 @@ async fn sync_sites_once(
                     site_id: site.id.clone(),
                     drives,
                 });
+            }
+        }
+        if let Some(sid) = active_site_id.filter(|s| !s.trim().is_empty()) {
+            if !refreshed_active {
+                if let Ok(drives) = graph.list_site_drives(sid, None).await {
+                    let _ = storage.upsert_drives(&drives);
+                    let _ = event_tx.send(CoreEvent::DrivesUpdated {
+                        site_id: sid.to_string(),
+                        drives,
+                    });
+                }
             }
         }
     }
@@ -1908,5 +1954,14 @@ mod tests {
         let few = merge_sidebar_sites(vec![test_site("only", true)], Vec::new());
         assert_eq!(sites_for_drive_prefetch(&few).len(), 1);
         assert!(sites_for_drive_prefetch(&[]).is_empty());
+
+        // Active site past the #12 prefetch cap is still included in drive refresh.
+        let refresh = sites_for_drive_refresh(&merged, Some("discovered-20"));
+        assert_eq!(refresh.len(), SIDEBAR_DRIVE_PREFETCH_SITES + 1);
+        assert_eq!(refresh.last().unwrap().id, "discovered-20");
+
+        // Active site already within the first 12 is not duplicated.
+        let refresh_dup = sites_for_drive_refresh(&merged, Some("followed-a"));
+        assert_eq!(refresh_dup.len(), SIDEBAR_DRIVE_PREFETCH_SITES);
     }
 }

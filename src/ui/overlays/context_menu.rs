@@ -164,12 +164,23 @@ impl ContextMenu {
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
 
-        for (index, item) in self.items.iter().enumerate() {
-            if index as u16 >= inner.height {
-                break;
-            }
-            let row = inner.y + index as u16;
-            let selected = index == self.selected;
+        let visible = inner.height as usize;
+        if visible == 0 || self.items.is_empty() {
+            return;
+        }
+        let active_sel = self.selected.min(self.items.len() - 1);
+        let skip = active_sel.saturating_sub(visible.saturating_sub(1));
+
+        for (vis_row, (index, item)) in self
+            .items
+            .iter()
+            .enumerate()
+            .skip(skip)
+            .take(visible)
+            .enumerate()
+        {
+            let row = inner.y + vis_row as u16;
+            let selected = index == active_sel;
             let label_style = if selected {
                 theme.selection().remove_modifier(Modifier::BOLD)
             } else {

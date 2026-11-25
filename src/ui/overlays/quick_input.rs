@@ -115,6 +115,7 @@ impl QuickInputOverlay {
             .border_style(theme.border_style(true));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
+        crate::ui::overlays::draw_overlay_close_pill(frame, rect, ui, hitmap);
         if inner.width == 0 || inner.height == 0 {
             return;
         }

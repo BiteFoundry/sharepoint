@@ -20,6 +20,20 @@ use crate::{
     },
 };
 
+/// Number of header rows rendered at the top of the Inspector pane (title row + action pill bar when tall enough).
+pub fn inspector_header_rows(area: Rect) -> u16 {
+    if area.height >= 4 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Scrollable body height of the Inspector pane in terminal rows.
+pub fn inspector_body_height(area: Rect) -> usize {
+    area.height.saturating_sub(inspector_header_rows(area)) as usize
+}
+
 pub fn draw_list(
     frame: &mut Frame,
     area: Rect,
@@ -31,6 +45,7 @@ pub fn draw_list(
         return;
     }
     ui.list_scroll.area = area;
+    hitmap.add(area, HitTarget::Pane(Focus::List));
     let theme = &ui.theme;
     let focused = ui.focus == Focus::List;
 
@@ -344,6 +359,7 @@ pub fn draw_inspector(
         return;
     }
     ui.inspector_scroll.area = area;
+    hitmap.add(area, HitTarget::Pane(Focus::Inspector));
     let theme = &ui.theme;
     let focused = ui.focus == Focus::Inspector;
 
@@ -571,8 +587,6 @@ pub fn draw_inspector(
         theme.muted_style(),
     )));
 
-    let meta_rows_used = lines.len() as u16;
-
     // Live inline image preview for image files
     let active_preview_key = AppState::text_preview_key(item.effective_drive_id(), &item.id);
     if markup_kind.is_none()
@@ -583,6 +597,9 @@ pub fn draw_inspector(
     {
         ui.markup_cache = None;
     }
+
+    let mut inline_image_chip: Option<(usize, u16, usize)> = None;
+    let mut deferred_pixel_graphic: Option<(String, usize, u16, u16, crate::img_preview::TerminalImageProtocol)> = None;
 
     if item.is_image() && ui.inline_images {
         let preview_key = app.inline_image_cache_key(&item);
@@ -596,30 +613,30 @@ pub fn draw_inspector(
                 ),
                 theme.accent_style(),
             )));
-            let img_y = body_area.y.saturating_add(meta_rows_used + 1);
+            let img_doc_row = crate::ui::wrapped_line_count(&lines, body_area.width);
             if rendered.protocol.is_pixel()
                 && rendered.pixel_payload.is_some()
                 && ui.overlays.is_empty()
-                && img_y < body_area.bottom()
             {
-                let avail_h = body_area.bottom().saturating_sub(img_y);
-                let rect = Rect::new(
-                    body_area.x + 1,
-                    img_y,
-                    body_area.width.saturating_sub(2).min(rendered.cols),
-                    avail_h.min(rendered.rows),
-                );
-                if rect.width > 0 && rect.height > 0 {
-                    ui.pending_pixel_graphics.push(PendingPixelGraphic {
-                        cache_key: preview_key,
-                        rect,
-                        protocol: rendered.protocol,
-                    });
-                    hitmap.add(rect, HitTarget::PreviewImageChip);
+                let chip_w = body_area.width.saturating_sub(2).min(rendered.cols);
+                if chip_w > 0 && rendered.rows > 0 {
+                    deferred_pixel_graphic = Some((
+                        preview_key,
+                        img_doc_row,
+                        chip_w,
+                        rendered.rows,
+                        rendered.protocol,
+                    ));
+                    inline_image_chip = Some((img_doc_row, chip_w, rendered.rows as usize));
                 }
             } else {
+                let chip_h = rendered.lines.len();
+                let chip_w = body_area.width.saturating_sub(2).min(rendered.cols.max(1));
                 for img_line in &rendered.lines {
                     lines.push(img_line.clone());
+                }
+                if chip_w > 0 && chip_h > 0 {
+                    inline_image_chip = Some((img_doc_row, chip_w, chip_h));
                 }
             }
         } else if let Some(err) = app.image_preview_error_for(&item) {
@@ -730,10 +747,43 @@ pub fn draw_inspector(
         )));
     }
 
-    ui.inspector_scroll.total_lines = lines.len();
-    let max_off = lines.len().saturating_sub(body_area.height as usize);
+    let visual_lines = crate::ui::wrapped_line_count(&lines, body_area.width);
+    ui.inspector_scroll.total_lines = visual_lines;
+    let max_off = visual_lines.saturating_sub(body_area.height as usize);
     ui.inspector_scroll.offset = ui.inspector_scroll.offset.min(max_off);
     let scroll_y = ui.inspector_scroll.offset as u16;
+
+    if let Some((preview_key, img_doc_row, chip_w, img_rows, protocol)) = deferred_pixel_graphic {
+        let img_y = body_area.y.saturating_add(img_doc_row as u16);
+        let scrolled_y = img_y.saturating_sub(scroll_y);
+        if img_doc_row >= ui.inspector_scroll.offset && scrolled_y < body_area.bottom() {
+            let avail_h = body_area.bottom().saturating_sub(scrolled_y);
+            let rect = Rect::new(body_area.x + 1, img_y, chip_w, avail_h.min(img_rows));
+            if rect.width > 0 && rect.height > 0 {
+                ui.pending_pixel_graphics.push(PendingPixelGraphic {
+                    cache_key: preview_key,
+                    rect,
+                    protocol,
+                });
+            }
+        }
+    }
+
+    if let Some((img_doc_row, chip_w, chip_h)) = inline_image_chip {
+        let view_top = ui.inspector_scroll.offset;
+        let view_bot = view_top.saturating_add(body_area.height as usize);
+        let vis_top = img_doc_row.max(view_top);
+        let vis_bot = img_doc_row.saturating_add(chip_h).min(view_bot);
+        if vis_bot > vis_top {
+            let chip_y = body_area.y.saturating_add((vis_top - view_top) as u16);
+            let vis_h = (vis_bot - vis_top) as u16;
+            hitmap.add(
+                Rect::new(body_area.x + 1, chip_y, chip_w, vis_h),
+                HitTarget::PreviewImageChip,
+            );
+        }
+    }
+
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
