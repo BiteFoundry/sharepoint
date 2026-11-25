@@ -8,6 +8,7 @@
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-2b3137?style=flat-square)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-dea584?style=flat-square)](https://github.com/BiteFoundry/sharepoint/blob/master/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)](LICENSE)
+[![BiteFoundry/sharepoint MCP server](https://glama.ai/mcp/servers/BiteFoundry/sharepoint/badges/score.svg)](https://glama.ai/mcp/servers/BiteFoundry/sharepoint)
 
 [BiteFoundry](https://bitefoundry.dev/#app-sharepoint) · [Latest release notes](https://github.com/BiteFoundry/sharepoint/releases/latest)
 
@@ -234,12 +235,13 @@ Full tool catalog & schemas: [docs/MCP.md](docs/MCP.md).
 
 | Package | Commands | Workspace Coverage |
 | --- | --- | --- |
-| [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams` | Microsoft Teams chats, channels, threads & meetings |
-| [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook` | Microsoft Outlook mail, calendar & contacts |
-| [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote` | Microsoft OneNote notebooks, sections, pages & XHTML/Markdown |
-| **`@bitefoundry/sharepoint`** | `sharepoint`, `bitefoundry-onedrive` | Microsoft SharePoint sites, document libraries & OneDrive files |
-| [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `confluence`, `conf` | Atlassian Jira issues, boards, sprints & Confluence pages |
-| [`@bitefoundry/notion`](https://www.npmjs.com/package/@bitefoundry/notion) | `notion` | Notion pages, databases, blocks & Markdown sync |
+| [`@bitefoundry/teams`](https://github.com/BiteFoundry/teams) | `teams` | Microsoft Teams chats, channels, threads & meetings |
+| [`@bitefoundry/outlook`](https://github.com/BiteFoundry/outlook) | `outlook` | Microsoft Outlook mail, calendar & contacts |
+| [`@bitefoundry/onenote`](https://github.com/BiteFoundry/onenote) | `onenote` | Microsoft OneNote notebooks, sections, pages & XHTML/Markdown |
+| **`@bitefoundry/sharepoint`** *(this repo)* | `sharepoint`, `bitefoundry-onedrive` | Microsoft SharePoint sites, document libraries & OneDrive files |
+| [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian`, `confluence`, `conf` | Atlassian Jira issues, boards, sprints & Confluence pages |
+| [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion` | Notion pages, databases, blocks & Markdown sync |
+| [`@bitefoundry/obsidian`](https://github.com/BiteFoundry/obsidian) | `bitefoundry-obsidian` | Obsidian local vaults, backlinks & knowledge graph |
 
 ---
 
