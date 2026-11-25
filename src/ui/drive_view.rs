@@ -1212,8 +1212,14 @@ mod tests {
             AppState::item_revision_key(&fake_png),
             std::sync::Arc::from(b"<!DOCTYPE html><html><body><h1>Sign In</h1></body></html>".as_slice()),
         );
-        let key = app.modal_image_cache_key(&fake_png, 40, 20, crate::img_preview::TerminalImageProtocol::Halfblock);
-        app.request_image_decode(&fake_png, key, 40, 20, ui.graphics_caps);
+        let key = app.modal_image_cache_key(&fake_png, 40, 20, 100, ui.graphics_caps);
+        app.request_image_decode(
+            &fake_png,
+            key,
+            crate::img_preview::FitBox::fixed(40, 20),
+            (18, 20, 26),
+            ui.graphics_caps,
+        );
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
             .await
@@ -1239,8 +1245,14 @@ mod tests {
             AppState::item_revision_key(&fake_svg),
             std::sync::Arc::from(b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>".as_slice()),
         );
-        let svg_key = app.modal_image_cache_key(&fake_svg, 40, 20, crate::img_preview::TerminalImageProtocol::Halfblock);
-        app.request_image_decode(&fake_svg, svg_key, 40, 20, ui.graphics_caps);
+        let svg_key = app.modal_image_cache_key(&fake_svg, 40, 20, 100, ui.graphics_caps);
+        app.request_image_decode(
+            &fake_svg,
+            svg_key,
+            crate::img_preview::FitBox::fixed(40, 20),
+            (18, 20, 26),
+            ui.graphics_caps,
+        );
 
         let svg_msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
             .await

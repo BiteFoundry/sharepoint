@@ -1,4 +1,4 @@
-//! TUI entry shell: terminal raw mode, 80ms CSI/DA1/Kitty active graphics probing,
+//! TUI entry shell: terminal raw mode, 150ms CSI/DA1/Kitty active graphics probing,
 //! pixel graphics overlay flush, mouse capture, event loop, and shared IPC daemon attachment.
 
 use std::borrow::Cow;
@@ -196,6 +196,26 @@ impl PixelLayerTracker {
                 delete_kitty: false,
                 erase_rects: Vec::new(),
                 emit_desired: false,
+            };
+        }
+
+        // Avoid full `terminal.clear()` flicker when only the `#crop:...` viewport changed
+        // on the exact same rect and base image for Sixel without a terminal resize.
+        let sixel_crop_only = !term_resized
+            && self.active.len() == 1
+            && desired.len() == 1
+            && self.active[0].protocol == TerminalImageProtocol::Sixel
+            && desired[0].protocol == TerminalImageProtocol::Sixel
+            && self.active[0].rect == desired[0].rect
+            && parse_pixel_key(&self.active[0].cache_key).0
+                == parse_pixel_key(&desired[0].cache_key).0;
+
+        if sixel_crop_only {
+            return PixelReconcilePlan {
+                erase_and_redraw: false,
+                delete_kitty: false,
+                erase_rects: Vec::new(),
+                emit_desired: true,
             };
         }
 
@@ -537,6 +557,18 @@ pub async fn run_tui(
                     CrosstermEvent::Resize(w, h) => {
                         ui.term_width = w;
                         ui.term_height = h;
+                        #[cfg(windows)]
+                        {
+                            drop(events);
+                            img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
+                            win_console::enforce_windows_mouse_capture();
+                            let _ = write_vt_mouse_enable(&mut io::stdout());
+                            events = EventStream::new();
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
+                        }
                         app.rendered_images.retain(|k, _| !k.starts_with("inline:"));
                         dirty = true;
                         if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
@@ -675,7 +707,17 @@ fn draw_frame(
         app.rendered_images.remove(&cache_key);
         if let Some(item) = app.active_item() {
             if app.inline_image_cache_key(&item) == cache_key {
-                app.request_image_decode(&item, cache_key, fit_w, fit_h, ui.graphics_caps);
+                let bg_rgb = img_preview::color_to_rgb(
+                    ui.theme.bg_canvas,
+                    img_preview::color_to_rgb(ui.theme.bg_elevated, (18, 20, 26)),
+                );
+                app.request_image_decode(
+                    &item,
+                    cache_key,
+                    img_preview::FitBox::fixed(fit_w, fit_h),
+                    bg_rgb,
+                    ui.graphics_caps,
+                );
             }
         }
     }
@@ -953,6 +995,57 @@ mod tests {
         assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE, 0x0098);
         assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0040, 0); // QuickEdit cleared
         assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0200, 0); // VTInput cleared
+    }
+
+    #[test]
+    fn sixel_crop_only_skips_erase_and_redraw() {
+        let mut tracker = PixelLayerTracker::default();
+        let rect = Rect::new(10, 3, 80, 24);
+        let top = sample_graphic(
+            "modal:d1:i1:rev1:100x30:100%:10x20:sixel#crop:0,0,80,24",
+            rect,
+            TerminalImageProtocol::Sixel,
+            12_000,
+        );
+        let scrolled = sample_graphic(
+            "modal:d1:i1:rev1:100x30:100%:10x20:sixel#crop:0,4,80,24",
+            rect,
+            TerminalImageProtocol::Sixel,
+            12_500,
+        );
+        tracker.commit(vec![top], (120, 36));
+
+        // Same base image, same rect, Sixel, no terminal resize -> flicker-free re-emit without erase/clear
+        let plan = tracker.plan_transition(std::slice::from_ref(&scrolled), (120, 36), false);
+        assert!(!plan.erase_and_redraw);
+        assert!(!plan.delete_kitty);
+        assert!(plan.erase_rects.is_empty());
+        assert!(plan.emit_desired);
+
+        // Terminal resize still forces full erase + redraw
+        let resized = tracker.plan_transition(std::slice::from_ref(&scrolled), (124, 36), false);
+        assert!(resized.erase_and_redraw);
+        assert!(resized.emit_desired);
+
+        // Different rect forces erase + redraw
+        let moved = sample_graphic(
+            "modal:d1:i1:rev1:100x30:100%:10x20:sixel#crop:0,4,80,24",
+            Rect::new(12, 3, 80, 24),
+            TerminalImageProtocol::Sixel,
+            12_500,
+        );
+        let moved_plan = tracker.plan_transition(&[moved], (120, 36), false);
+        assert!(moved_plan.erase_and_redraw);
+
+        // Different base image forces erase + redraw
+        let other_img = sample_graphic(
+            "modal:d1:i2:rev1:100x30:100%:10x20:sixel#crop:0,0,80,24",
+            rect,
+            TerminalImageProtocol::Sixel,
+            12_500,
+        );
+        let other_plan = tracker.plan_transition(&[other_img], (120, 36), false);
+        assert!(other_plan.erase_and_redraw);
     }
 
     #[test]

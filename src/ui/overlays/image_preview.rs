@@ -16,7 +16,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    img_preview::TerminalImageProtocol,
+    img_preview::{FitBox, TerminalImageProtocol},
     models::DriveItem,
     ui::{
         action::Action,
@@ -68,20 +68,16 @@ impl ImagePreviewOverlay {
         )
     }
 
-    pub fn target_dimensions(&self, term_width: u16, term_height: u16) -> (u16, u16) {
+    pub fn viewport_dimensions(term_width: u16, term_height: u16) -> (u16, u16) {
         let rect = Self::modal_rect(Rect::new(0, 0, term_width.max(24), term_height.max(12)));
-        let inner_w = rect.width.saturating_sub(2).max(12);
-        let inner_h = rect.height.saturating_sub(3).max(6);
-        let base_cols = rect.width.saturating_sub(4).max(12);
-        let max_cols = inner_w.saturating_mul(2).max(base_cols).min(240);
-        let scaled_cols = ((base_cols as u32 * self.zoom_pct as u32) / 100)
-            .clamp(8, max_cols as u32) as u16;
-        // Pass `scrollable_max_rows >= scaled_cols` so `img_preview` fits tall images to width
-        // and lets them scroll vertically immediately at 100% zoom.
-        let scrollable_max_rows = ((inner_h as u32 * 4 * self.zoom_pct as u32) / 100)
-            .max(scaled_cols as u32)
-            .clamp(6, 240) as u16;
-        (scaled_cols, scrollable_max_rows)
+        let inner_w = rect.width.saturating_sub(2).max(4);
+        let inner_h = rect.height.saturating_sub(2).max(2);
+        (inner_w, inner_h)
+    }
+
+    pub fn fit_box(&self, term_width: u16, term_height: u16) -> FitBox {
+        let (view_cols, view_rows) = Self::viewport_dimensions(term_width, term_height);
+        FitBox::scrollable(view_cols, view_rows, self.zoom_pct)
     }
 
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
@@ -254,8 +250,8 @@ impl ImagePreviewOverlay {
             );
             return;
         };
-        let (cols, rows) = self.target_dimensions(area.width, area.height);
-        let key = app.modal_image_cache_key(cur, cols, rows, proto);
+        let (cols, rows) = Self::viewport_dimensions(area.width, area.height);
+        let key = app.modal_image_cache_key(cur, cols, rows, self.zoom_pct, ui.graphics_caps);
         let max_safe_bottom = area.bottom().saturating_sub(1);
         let safe_inner_h = inner.height.min(max_safe_bottom.saturating_sub(inner.y));
 
@@ -493,8 +489,8 @@ mod tests {
         let mut overlay =
             ImagePreviewOverlay::from_folder_items(&[item.clone()], Some("img-ok-1")).unwrap();
         let area = Rect::new(0, 0, 80, 24);
-        let (cols, rows) = overlay.target_dimensions(area.width, area.height);
-        let key = app.modal_image_cache_key(&item, cols, rows, TerminalImageProtocol::Sixel);
+        let (cols, rows) = ImagePreviewOverlay::viewport_dimensions(area.width, area.height);
+        let key = app.modal_image_cache_key(&item, cols, rows, overlay.zoom_pct, ui.graphics_caps);
 
         // Fitting image -> emits PendingPixelGraphic strictly above area.bottom() - 1
         app.rendered_images.insert(
@@ -561,9 +557,9 @@ mod tests {
             let item = sample_image_item("tall-1", "tall.png");
             let mut overlay =
                 ImagePreviewOverlay::from_folder_items(&[item.clone()], Some("tall-1")).unwrap();
-            let (cols, rows) = overlay.target_dimensions(area.width, area.height);
+            let fit = overlay.fit_box(area.width, area.height);
             let rendered =
-                decode_and_render_for_protocol(&png, cols, rows, (25, 25, 25), ui.graphics_caps)
+                decode_and_render_for_protocol(&png, fit, (25, 25, 25), ui.graphics_caps)
                     .unwrap();
             let total_rows = if proto == TerminalImageProtocol::Halfblock {
                 rendered.lines.len() as u16
@@ -575,7 +571,13 @@ mod tests {
             let expected_max_scroll = total_rows.saturating_sub(inner_h);
             assert!(expected_max_scroll > 0);
 
-            let base_key = app.modal_image_cache_key(&item, cols, rows, proto);
+            let base_key = app.modal_image_cache_key(
+                &item,
+                fit.view_cols,
+                fit.view_rows,
+                fit.zoom_pct,
+                ui.graphics_caps,
+            );
             app.rendered_images.insert(base_key.clone(), rendered);
 
             let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
@@ -650,21 +652,26 @@ mod tests {
         overlay.handle(&Action::Input('['));
         assert_eq!(overlay.index, 2);
 
-        // `-` / `+` / `0` zoom scaling
-        let (base_c, base_r) = overlay.target_dimensions(120, 40);
+        // `-` / `+` / `0` zoom scaling updates FitBox::zoom_pct while viewport stays fixed
+        let base_fit = overlay.fit_box(120, 40);
+        assert_eq!(base_fit.zoom_pct, 100);
+        assert!(base_fit.scrollable);
         overlay.handle(&Action::Input('-'));
         assert_eq!(overlay.zoom_pct, 75);
-        let (small_c, small_r) = overlay.target_dimensions(120, 40);
-        assert!(small_c < base_c && small_r < base_r);
+        let small_fit = overlay.fit_box(120, 40);
+        assert_eq!(small_fit.view_cols, base_fit.view_cols);
+        assert_eq!(small_fit.view_rows, base_fit.view_rows);
+        assert_eq!(small_fit.zoom_pct, 75);
 
         overlay.handle(&Action::Input('+'));
         assert_eq!(overlay.zoom_pct, 100);
-        assert_eq!(overlay.target_dimensions(120, 40), (base_c, base_r));
+        assert_eq!(overlay.fit_box(120, 40), base_fit);
 
         overlay.handle(&Action::Input('+'));
         assert_eq!(overlay.zoom_pct, 125);
+        assert_eq!(overlay.fit_box(120, 40).zoom_pct, 125);
         overlay.handle(&Action::Input('0'));
         assert_eq!(overlay.zoom_pct, 100);
-        assert_eq!(overlay.target_dimensions(120, 40), (base_c, base_r));
+        assert_eq!(overlay.fit_box(120, 40), base_fit);
     }
 }

@@ -13,7 +13,9 @@ use crate::auth::AuthManager;
 use crate::cli::DEFAULT_TEXT_PREVIEW_MAX_BYTES;
 use crate::config::{AppConfig, DensityMode, ImageProtocolPreference, Persona, ThemePreset};
 use crate::graph::GraphClient;
-use crate::img_preview::{self, RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol};
+use crate::img_preview::{
+    self, FitBox, RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol,
+};
 use crate::models::{
     CoreEvent, DownloadedFile, DriveInfo, DriveItem, DriveItemVersion, PinnedTarget,
     ShareLinkResult, SharePointSite, UserProfile, VirtualListKind, VirtualListStatus,
@@ -319,8 +321,8 @@ const MAX_RAW_IMAGE_ENTRIES: usize = 8;
 
 struct ImageDecodeRequest {
     cache_key: String,
-    cols: u16,
-    rows: u16,
+    fit: FitBox,
+    bg_rgb: (u8, u8, u8),
     caps: TerminalGraphicsCaps,
 }
 
@@ -807,14 +809,17 @@ impl AppState {
         item: &DriveItem,
         cols: u16,
         rows: u16,
-        proto: TerminalImageProtocol,
+        zoom_pct: u16,
+        caps: TerminalGraphicsCaps,
     ) -> String {
-        format!(
-            "modal:{}:{}x{}:{}",
-            Self::item_revision_key(item),
+        img_preview::preview_image_cache_key(
+            "modal",
+            &Self::item_revision_key(item),
             cols,
             rows,
-            proto.as_str()
+            zoom_pct,
+            caps.cell_px,
+            caps.protocol,
         )
     }
 
@@ -905,7 +910,7 @@ impl AppState {
 
     pub fn refresh_open_overlays_for_items(&mut self, ui: &mut UiState) {
         let mut html_refresh: Option<DriveItem> = None;
-        let mut image_refresh: Option<(DriveItem, String, u16, u16)> = None;
+        let mut image_refresh: Option<(DriveItem, String, FitBox)> = None;
 
         for overlay in &mut ui.overlays {
             match overlay {
@@ -947,28 +952,28 @@ impl AppState {
                                 let changed = updated.content_revision() != prev.content_revision();
                                 ov.index = pos;
                                 if changed {
-                                    let (cols, rows) =
-                                        ov.target_dimensions(ui.term_width, ui.term_height);
+                                    let fit = ov.fit_box(ui.term_width, ui.term_height);
                                     let key = self.modal_image_cache_key(
                                         updated,
-                                        cols,
-                                        rows,
-                                        ui.graphics_caps.protocol,
+                                        fit.view_cols,
+                                        fit.view_rows,
+                                        fit.zoom_pct,
+                                        ui.graphics_caps,
                                     );
-                                    image_refresh = Some((updated.clone(), key, cols, rows));
+                                    image_refresh = Some((updated.clone(), key, fit));
                                 }
                             } else {
                                 ov.index = ov.index.min(new_images.len() - 1);
                                 let next_img = &new_images[ov.index];
-                                let (cols, rows) =
-                                    ov.target_dimensions(ui.term_width, ui.term_height);
+                                let fit = ov.fit_box(ui.term_width, ui.term_height);
                                 let key = self.modal_image_cache_key(
                                     next_img,
-                                    cols,
-                                    rows,
-                                    ui.graphics_caps.protocol,
+                                    fit.view_cols,
+                                    fit.view_rows,
+                                    fit.zoom_pct,
+                                    ui.graphics_caps,
                                 );
-                                image_refresh = Some((next_img.clone(), key, cols, rows));
+                                image_refresh = Some((next_img.clone(), key, fit));
                             }
                         }
                         ov.items = new_images;
@@ -982,8 +987,9 @@ impl AppState {
             self.spawn_shared_text_fetch(&item, true);
         }
 
-        if let Some((item, key, cols, rows)) = image_refresh {
-            self.request_image_decode(&item, key, cols, rows, ui.graphics_caps);
+        if let Some((item, key, fit)) = image_refresh {
+            let bg_rgb = img_preview::color_to_rgb(ui.theme.bg_elevated, (18, 20, 26));
+            self.request_image_decode(&item, key, fit, bg_rgb, ui.graphics_caps);
         }
     }
 
@@ -1180,7 +1186,17 @@ impl AppState {
             if !self.rendered_images.contains_key(&cache_key) {
                 let cols = ui.inspector_scroll.area.width.saturating_sub(4).clamp(24, 72);
                 let rows = ui.inspector_scroll.area.height.saturating_sub(12).clamp(8, 22);
-                self.request_image_decode(&item, cache_key, cols, rows, ui.graphics_caps);
+                let bg_rgb = img_preview::color_to_rgb(
+                    ui.theme.bg_canvas,
+                    img_preview::color_to_rgb(ui.theme.bg_elevated, (18, 20, 26)),
+                );
+                self.request_image_decode(
+                    &item,
+                    cache_key,
+                    FitBox::fixed(cols, rows),
+                    bg_rgb,
+                    ui.graphics_caps,
+                );
             }
         }
     }
@@ -1189,8 +1205,8 @@ impl AppState {
         &mut self,
         item: &DriveItem,
         cache_key: String,
-        cols: u16,
-        rows: u16,
+        fit: FitBox,
+        bg_rgb: (u8, u8, u8),
         caps: TerminalGraphicsCaps,
     ) {
         if self.rendered_images.contains_key(&cache_key)
@@ -1201,8 +1217,8 @@ impl AppState {
 
         let decode = ImageDecodeRequest {
             cache_key,
-            cols,
-            rows,
+            fit,
+            bg_rgb,
             caps,
         };
         let raw_cache_key = Self::item_revision_key(item);
@@ -1277,10 +1293,16 @@ impl AppState {
                 });
                 return;
             }
-            for ImageDecodeRequest { cache_key, cols, rows, caps } in decodes {
+            for ImageDecodeRequest {
+                cache_key,
+                fit,
+                bg_rgb,
+                caps,
+            } in decodes
+            {
                 let result = match kind {
                     ContentKind::RasterImage => {
-                        img_preview::decode_and_render_for_protocol(&bytes, cols, rows, (18, 20, 26), caps)
+                        img_preview::decode_and_render_for_protocol(&bytes, fit, bg_rgb, caps)
                             .map_err(|err| format!("{err:#}"))
                     }
                     ContentKind::Svg => Err("SVG vector image (image/svg+xml) cannot be raster-decoded — press o to open in browser".into()),
@@ -2426,8 +2448,14 @@ mod tests {
             };
             let item = overlay.current().unwrap();
             assert_eq!(item.name, expected_name);
-            let (cols, rows) = overlay.target_dimensions(ui.term_width, ui.term_height);
-            let key = app.modal_image_cache_key(item, cols, rows, ui.graphics_caps.protocol);
+            let fit = overlay.fit_box(ui.term_width, ui.term_height);
+            let key = app.modal_image_cache_key(
+                item,
+                fit.view_cols,
+                fit.view_rows,
+                fit.zoom_pct,
+                ui.graphics_caps,
+            );
             if !app.rendered_images.contains_key(&key) {
                 let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
                     .await

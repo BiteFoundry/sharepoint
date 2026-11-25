@@ -305,8 +305,14 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
         Action::CycleTheme => {
             ui.theme_preset = ui.theme_preset.next();
             ui.theme = Theme::detect(ui.theme_preset);
+            app.rendered_images.clear();
             app.save_ui_prefs(ui);
             ui.toast(format!("Theme: {}", ui.theme_preset.label()), ToastKind::Info);
+            if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
+                return dispatch_workspace(Action::LoadPreviewImage, app, ui);
+            } else {
+                app.ensure_inspector_loaded(ui);
+            }
         }
         Action::CycleSortMode => {
             app.sort_mode = app.sort_mode.next();
@@ -942,9 +948,16 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
         Action::LoadPreviewImage => {
             if let Some(Overlay::ImagePreview(ov)) = ui.overlays.last() {
                 if let Some(cur) = ov.current().cloned() {
-                    let (cols, rows) = ov.target_dimensions(ui.term_width, ui.term_height);
-                    let key = app.modal_image_cache_key(&cur, cols, rows, ui.graphics_caps.protocol);
-                    app.request_image_decode(&cur, key, cols, rows, ui.graphics_caps);
+                    let fit = ov.fit_box(ui.term_width, ui.term_height);
+                    let key = app.modal_image_cache_key(
+                        &cur,
+                        fit.view_cols,
+                        fit.view_rows,
+                        fit.zoom_pct,
+                        ui.graphics_caps,
+                    );
+                    let bg_rgb = crate::img_preview::color_to_rgb(ui.theme.bg_elevated, (18, 20, 26));
+                    app.request_image_decode(&cur, key, fit, bg_rgb, ui.graphics_caps);
                 }
             }
         }
