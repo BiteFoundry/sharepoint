@@ -16,6 +16,7 @@ use std::{
 };
 
 use anyhow::Result;
+use futures::StreamExt;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -67,6 +68,9 @@ const SOCKET_UNSUPPORTED_RETRY_SECS: u64 = 300;
 const SIDEBAR_SITE_DISCOVERY_LIMIT: usize = 50;
 /// Sites whose libraries are fetched up front. The rest load when their row is opened.
 pub const SIDEBAR_DRIVE_PREFETCH_SITES: usize = 12;
+/// Bounded concurrency for per-site drive discovery and 410 Tier-2 folder reconciliation.
+const SITE_DRIVE_FETCH_CONCURRENCY: usize = 4;
+const RESYNC_FOLDER_CONCURRENCY: usize = 4;
 
 /// Sidebar site list: followed sites first, then discovered sites not already present.
 /// The order matters: `sites_for_drive_prefetch` takes the head of this list.
@@ -481,6 +485,42 @@ impl DriveSyncRuntime {
     fn folder_is_incomplete(&self, drive_id: &str, parent_id: Option<&str>) -> bool {
         self.incomplete_folders.contains(&folder_key(drive_id, parent_id))
     }
+
+    fn snapshot_for_drive(&self, drive_id: &str) -> Self {
+        let mut out = Self::default();
+        if self.delta_unsupported_drives.contains(drive_id) {
+            out.delta_unsupported_drives.insert(drive_id.to_string());
+        }
+        if let Some(ts) = self.last_delta_at.get(drive_id) {
+            out.last_delta_at.insert(drive_id.to_string(), *ts);
+        }
+        for key in &self.incomplete_folders {
+            if key.0 == drive_id {
+                out.incomplete_folders.insert(key.clone());
+            }
+        }
+        out
+    }
+
+    fn merge_drive_state(&mut self, drive_id: &str, other: &Self) {
+        if other.delta_unsupported_drives.contains(drive_id) {
+            self.delta_unsupported_drives.insert(drive_id.to_string());
+        }
+        match other.last_delta_at.get(drive_id) {
+            Some(ts) => {
+                self.last_delta_at.insert(drive_id.to_string(), *ts);
+            }
+            None => {
+                self.last_delta_at.remove(drive_id);
+            }
+        }
+        self.incomplete_folders.retain(|(d, _)| d != drive_id);
+        for key in &other.incomplete_folders {
+            if key.0 == drive_id {
+                self.incomplete_folders.insert(key.clone());
+            }
+        }
+    }
 }
 
 /// Reads the active folder from the cache for a `FolderItemsUpdated` event.
@@ -500,52 +540,77 @@ fn cached_folder_page(
 /// Performs an initial bootstrap of `/me/drive`, `/me/followedSites`, `/sites?search=*`,
 /// personal OneDrive root children (with delta seed), recent items, and shared items into SQLite.
 pub async fn bootstrap_sharepoint(graph: &GraphClient, storage: &Storage) -> Result<()> {
-    if let Ok(drive) = graph.get_my_drive().await {
-        let _ = storage.upsert_drives(std::slice::from_ref(&drive));
-        let (dummy_tx, _) = mpsc::unbounded_channel();
-        let mut rt = DriveSyncRuntime::default();
-        let _ = sync_drive_delta_once(graph, storage, &dummy_tx, &mut rt, &drive.id, None, FOLDER_PAGE_SIZE).await;
-    }
+    let my_drive_fut = async {
+        if let Ok(drive) = graph.get_my_drive().await {
+            let _ = storage.upsert_drives(std::slice::from_ref(&drive));
+            let (dummy_tx, _) = mpsc::unbounded_channel();
+            let mut rt = DriveSyncRuntime::default();
+            let _ = sync_drive_delta_once(
+                graph,
+                storage,
+                &dummy_tx,
+                &mut rt,
+                &drive.id,
+                None,
+                FOLDER_PAGE_SIZE,
+            )
+            .await;
+        }
+    };
 
-    let followed_res = graph.list_followed_sites().await;
-    let authoritative_follow = followed_res.is_ok();
-    let sites = merge_sidebar_sites(
-        followed_res.unwrap_or_default(),
-        graph
-            .list_sites(Some("*"), SIDEBAR_SITE_DISCOVERY_LIMIT)
-            .await
-            .unwrap_or_default(),
-    );
-    if authoritative_follow {
-        let _ = storage.upsert_sites_with_follow_state(&sites);
-    } else if !sites.is_empty() {
-        let _ = storage.upsert_sites(&sites);
-    }
-    if !sites.is_empty() {
-        for site in sites_for_drive_prefetch(&sites) {
-            if let Ok(drives) = graph
-                .list_site_drives(&site.id, Some(site.effective_name()))
-                .await
-            {
+    let sites_fut = async {
+        let (followed_res, discovered_res) = tokio::join!(
+            graph.list_followed_sites(),
+            graph.list_sites(Some("*"), SIDEBAR_SITE_DISCOVERY_LIMIT),
+        );
+        let authoritative_follow = followed_res.is_ok();
+        let sites = merge_sidebar_sites(
+            followed_res.unwrap_or_default(),
+            discovered_res.unwrap_or_default(),
+        );
+        if authoritative_follow {
+            let _ = storage.upsert_sites_with_follow_state(&sites);
+        } else if !sites.is_empty() {
+            let _ = storage.upsert_sites(&sites);
+        }
+        if !sites.is_empty() {
+            let targets: Vec<(String, String)> = sites_for_drive_prefetch(&sites)
+                .iter()
+                .map(|site| (site.id.clone(), site.effective_name().to_string()))
+                .collect();
+            let drive_lists: Vec<_> = futures::stream::iter(targets)
+                .map(|(site_id, site_name)| async move {
+                    graph.list_site_drives(&site_id, Some(&site_name)).await
+                })
+                .buffered(SITE_DRIVE_FETCH_CONCURRENCY)
+                .collect()
+                .await;
+            for drives in drive_lists.into_iter().flatten() {
                 let _ = storage.upsert_drives(&drives);
             }
         }
-    }
+    };
 
-    if let Ok(recent) = graph.fetch_virtual_list(VirtualListKind::Recent, 50).await {
-        if recent.status.is_available() {
-            let _ = storage.replace_recent_items(&recent.items);
+    let recent_fut = async {
+        if let Ok(recent) = graph.fetch_virtual_list(VirtualListKind::Recent, 50).await {
+            if recent.status.is_available() {
+                let _ = storage.replace_recent_items(&recent.items);
+            }
         }
-    }
-    if let Ok(shared) = graph
-        .fetch_virtual_list(VirtualListKind::SharedWithMe, 50)
-        .await
-    {
-        if shared.status.is_available() {
-            let _ = storage.replace_shared_items(&shared.items);
-        }
-    }
+    };
 
+    let shared_fut = async {
+        if let Ok(shared) = graph
+            .fetch_virtual_list(VirtualListKind::SharedWithMe, 50)
+            .await
+        {
+            if shared.status.is_available() {
+                let _ = storage.replace_shared_items(&shared.items);
+            }
+        }
+    };
+
+    tokio::join!(my_drive_fut, sites_fut, recent_fut, shared_fut);
     Ok(())
 }
 
@@ -703,20 +768,20 @@ pub fn spawn_sync_engine(
                                     busy: true,
                                     summary: "Syncing OneDrive & SharePoint...".to_string(),
                                 });
-                                let active_site_id = focus_rx.borrow().active_site_id.clone();
-                                let discovered_root = sync_core_discovery(
+                                let pre_focus = focus_rx.borrow().clone();
+                                let discovery = sync_core_discovery(
                                     &graph,
                                     &storage,
                                     &event_tx,
                                     &shared,
                                     &mut backoff,
                                     &mut rt,
-                                    active_site_id.as_deref(),
+                                    &pre_focus,
                                 )
                                 .await;
                                 let is_startup = matches!(cmd, SyncCommand::Bootstrap);
                                 if is_startup {
-                                    startup_root = discovered_root;
+                                    startup_root = discovery.startup_root;
                                 }
                                 let focus = focus_rx.borrow().clone();
                                 match focus.view_kind {
@@ -725,7 +790,11 @@ pub fn spawn_sync_engine(
                                             let discovery_handled_root = is_startup
                                                 && focus.active_parent_id.is_none()
                                                 && startup_root.as_ref().is_some_and(|(id, _)| *id == did);
-                                            if !discovery_handled_root {
+                                            let already_synced_focus = discovery
+                                                .handled_focus
+                                                .as_ref()
+                                                .is_some_and(|(hd, hp)| *hd == did && *hp == focus.active_parent_id);
+                                            if !discovery_handled_root && !already_synced_focus {
                                                 if let Err(err) = sync_drive_delta_once(
                                                     &graph,
                                                     &storage,
@@ -1210,7 +1279,7 @@ pub async fn bootstrap_drive_with_delta(
     };
 
     if seed_link.is_some() && inferred_root_id.is_none() {
-        inferred_root_id = graph.get_item_by_path(drive_id, "").await.ok().map(|root| root.id);
+        inferred_root_id = graph.get_drive_root_id_cached(drive_id).await.ok();
     }
     if page.complete {
         storage.replace_folder_children(drive_id, active_parent_id, &page.items)?;
@@ -1286,7 +1355,7 @@ pub async fn sync_drive_delta_once(
 
         let mut known_root_id = decode_root_id(existing_cursor.as_ref());
         if known_root_id.is_none() {
-            known_root_id = graph.get_item_by_path(drive_id, "").await.ok().map(|root| root.id);
+            known_root_id = graph.get_drive_root_id_cached(drive_id).await.ok();
         }
         let progress = pull_delta_pages_and_emit(
             graph,
@@ -1566,53 +1635,55 @@ async fn resync_drive_after_410_or_overflow(
 
     // Always reconcile root on overflow/410 so deleted/added root items are never stale.
     // The root is listed in full only when it is the folder on screen.
+    // Fetch root, active folder, and cached ancestors concurrently under a bounded cap
+    // (after `fresh_seed` was acquired for gap closure).
     let root_limit = if active_parent_id.is_none() { limit } else { FOLDER_PAGE_SIZE };
-    let root_page = graph
-        .list_children_detailed(drive_id, None, Some(root_limit))
-        .await?;
-    rt.note_folder_listing(drive_id, None, root_page.complete);
-    if let Some(det_root) = root_page
-        .items
-        .iter()
-        .find_map(|i| i.parent_id.clone())
-        .filter(|pid| !pid.trim().is_empty() && pid != "root")
-    {
-        known_root_id = Some(det_root);
-    }
-    if known_root_id.is_none() {
-        known_root_id = graph.get_item_by_path(drive_id, "").await.ok().map(|root| root.id);
-    }
-    if root_page.complete {
-        storage.replace_folder_children(drive_id, None, &root_page.items)?;
-    } else {
-        storage.upsert_drive_items(&root_page.items)?;
-    }
-
+    let mut folder_requests: Vec<(Option<String>, usize, bool)> =
+        Vec::with_capacity(1 + usize::from(active_parent_id.is_some()) + ancestors.len());
+    folder_requests.push((None, root_limit, true));
     if let Some(pid) = active_parent_id {
-        let active_page = graph
-            .list_children_detailed(drive_id, Some(pid), Some(limit))
-            .await?;
-        rt.note_folder_listing(drive_id, Some(pid), active_page.complete);
-        if active_page.complete {
-            storage.replace_folder_children(drive_id, Some(pid), &active_page.items)?;
-        } else {
-            storage.upsert_drive_items(&active_page.items)?;
-        }
+        folder_requests.push((Some(pid.to_string()), limit, true));
         for ancestor in &ancestors {
+            folder_requests.push((Some(ancestor.clone()), FOLDER_PAGE_SIZE, false));
+        }
+    }
+    let fetched_folders: Vec<_> = futures::stream::iter(folder_requests)
+        .map(|(folder_id, lim, required)| async move {
+            let res = graph
+                .list_children_detailed(drive_id, folder_id.as_deref(), Some(lim))
+                .await;
+            (folder_id, required, res)
+        })
+        .buffered(RESYNC_FOLDER_CONCURRENCY)
+        .collect()
+        .await;
+
+    for (folder_id, required, res) in fetched_folders {
+        let page = match res {
+            Ok(page) => page,
+            Err(err) if required => return Err(err),
             // An ancestor that is gone or unreadable is left for its own visit to settle;
             // it must not stop the open folder from being brought up to date.
-            let Ok(page) = graph
-                .list_children_detailed(drive_id, Some(ancestor), Some(FOLDER_PAGE_SIZE))
-                .await
-            else {
-                continue;
-            };
-            rt.note_folder_listing(drive_id, Some(ancestor), page.complete);
-            if page.complete {
-                storage.replace_folder_children(drive_id, Some(ancestor), &page.items)?;
-            } else {
-                storage.upsert_drive_items(&page.items)?;
+            Err(_) => continue,
+        };
+        if folder_id.is_none() {
+            if let Some(det_root) = page
+                .items
+                .iter()
+                .find_map(|i| i.parent_id.clone())
+                .filter(|pid| !pid.trim().is_empty() && pid != "root")
+            {
+                known_root_id = Some(det_root);
             }
+            if known_root_id.is_none() {
+                known_root_id = graph.get_drive_root_id_cached(drive_id).await.ok();
+            }
+        }
+        rt.note_folder_listing(drive_id, folder_id.as_deref(), page.complete);
+        if page.complete {
+            storage.replace_folder_children(drive_id, folder_id.as_deref(), &page.items)?;
+        } else {
+            storage.upsert_drive_items(&page.items)?;
         }
     }
     let (items, truncated) = cached_folder_page(storage, rt, drive_id, active_parent_id, limit)?;
@@ -1677,6 +1748,11 @@ fn cached_ancestor_ids(
     Ok(ancestors)
 }
 
+struct CoreDiscoveryOutcome {
+    startup_root: Option<(String, bool)>,
+    handled_focus: Option<(String, Option<String>)>,
+}
+
 async fn sync_core_discovery(
     graph: &GraphClient,
     storage: &Storage,
@@ -1684,38 +1760,192 @@ async fn sync_core_discovery(
     shared: &Arc<SyncSharedState>,
     backoff: &mut ErrorBackoffState,
     rt: &mut DriveSyncRuntime,
-    active_site_id: Option<&str>,
-) -> Option<(String, bool)> {
-    if let Ok(me) = graph.get_me().await {
-        let _ = event_tx.send(CoreEvent::ProfileLoaded(me));
-    }
+    pre_focus: &FocusTarget,
+) -> CoreDiscoveryOutcome {
+    let overlap_folder = if pre_focus.view_kind == FocusViewKind::Folder {
+        pre_focus.active_drive_id.clone().map(|did| {
+            (
+                did,
+                pre_focus.active_parent_id.clone(),
+                effective_folder_limit(pre_focus.active_limit),
+            )
+        })
+    } else {
+        None
+    };
+    let overlap_drive_id = overlap_folder.as_ref().map(|(did, _, _)| did.clone());
+    let rt_delta_unsupported = rt.delta_unsupported_drives.clone();
+    let active_rt_seed = overlap_folder
+        .as_ref()
+        .map(|(did, _, _)| rt.snapshot_for_drive(did));
+    let active_site_id = pre_focus.active_site_id.as_deref();
 
-    let root_load = match graph.get_my_drive().await {
-        Ok(drive) => {
-            let _ = storage.upsert_drives(std::slice::from_ref(&drive));
-            let _ = event_tx.send(CoreEvent::MyDriveLoaded(drive.clone()));
-            let root_load = if storage.get_sync_cursor(&drive_cursor_scope_key(&drive.id)).is_ok_and(|cursor| cursor.is_none())
-                && !rt.delta_unsupported_drives.contains(&drive.id)
-            {
-                let loaded = bootstrap_drive_with_delta(graph, storage, event_tx, rt, &drive.id, None, FOLDER_PAGE_SIZE).await.is_ok();
-                Some((drive.id, loaded))
-            } else {
-                None
-            };
-            shared.clear_auth_pause();
-            backoff.record_success();
-            root_load
-        }
-        Err(err) => {
-            handle_poll_error(&err, shared, backoff, event_tx);
-            None
+    let me_fut = async {
+        if let Ok(me) = graph.get_me().await {
+            let _ = event_tx.send(CoreEvent::ProfileLoaded(me));
         }
     };
 
-    sync_sites_once(graph, storage, event_tx, active_site_id).await;
-    sync_virtual_list_once(graph, storage, event_tx, rt, VirtualListKind::Recent).await;
-    sync_virtual_list_once(graph, storage, event_tx, rt, VirtualListKind::SharedWithMe).await;
-    root_load
+    let my_drive_fut = async {
+        match graph.get_my_drive().await {
+            Ok(drive) => {
+                let _ = storage.upsert_drives(std::slice::from_ref(&drive));
+                let _ = event_tx.send(CoreEvent::MyDriveLoaded(drive.clone()));
+                let skipped_for_active =
+                    overlap_drive_id.as_deref() == Some(drive.id.as_str());
+                let mut local_rt = DriveSyncRuntime::default();
+                if rt_delta_unsupported.contains(&drive.id) {
+                    local_rt.delta_unsupported_drives.insert(drive.id.clone());
+                }
+                let root_load = if !skipped_for_active
+                    && storage
+                        .get_sync_cursor(&drive_cursor_scope_key(&drive.id))
+                        .is_ok_and(|cursor| cursor.is_none())
+                    && !local_rt.delta_unsupported_drives.contains(&drive.id)
+                {
+                    let loaded = bootstrap_drive_with_delta(
+                        graph,
+                        storage,
+                        event_tx,
+                        &mut local_rt,
+                        &drive.id,
+                        None,
+                        FOLDER_PAGE_SIZE,
+                    )
+                    .await
+                    .is_ok();
+                    Some((drive.id.clone(), loaded, local_rt))
+                } else {
+                    None
+                };
+                Ok((drive.id, root_load))
+            }
+            Err(err) => Err(err),
+        }
+    };
+
+    let active_folder_fut = async {
+        let Some((did, parent_id, limit)) = overlap_folder else {
+            return None;
+        };
+        let mut local_rt = active_rt_seed.unwrap_or_default();
+        let res = sync_drive_delta_once(
+            graph,
+            storage,
+            event_tx,
+            &mut local_rt,
+            &did,
+            parent_id.as_deref(),
+            limit,
+        )
+        .await;
+        Some((did, parent_id, res, local_rt))
+    };
+
+    let sites_fut = sync_sites_once(graph, storage, event_tx, active_site_id);
+    let recent_fut =
+        fetch_and_emit_virtual_list(graph, storage, event_tx, VirtualListKind::Recent);
+    let shared_fut =
+        fetch_and_emit_virtual_list(graph, storage, event_tx, VirtualListKind::SharedWithMe);
+
+    let ((), my_drive_res, active_res, (), recent_unavail, shared_unavail) = tokio::join!(
+        me_fut,
+        my_drive_fut,
+        active_folder_fut,
+        sites_fut,
+        recent_fut,
+        shared_fut,
+    );
+
+    apply_virtual_availability(rt, VirtualListKind::Recent, recent_unavail);
+    apply_virtual_availability(rt, VirtualListKind::SharedWithMe, shared_unavail);
+
+    let mut startup_root = None;
+    let mut my_drive_id = None;
+    match my_drive_res {
+        Ok((did, root_load)) => {
+            my_drive_id = Some(did);
+            if let Some((boot_did, loaded, local_rt)) = root_load {
+                rt.merge_drive_state(&boot_did, &local_rt);
+                startup_root = Some((boot_did, loaded));
+            }
+            shared.clear_auth_pause();
+            backoff.record_success();
+        }
+        Err(err) => {
+            handle_poll_error(&err, shared, backoff, event_tx);
+        }
+    }
+
+    let mut handled_focus = None;
+    if let Some((did, parent_id, res, local_rt)) = active_res {
+        rt.merge_drive_state(&did, &local_rt);
+        let ok = match res {
+            Ok(()) => true,
+            Err(err) => {
+                handle_poll_error(&err, shared, backoff, event_tx);
+                false
+            }
+        };
+        if startup_root.is_none()
+            && parent_id.is_none()
+            && my_drive_id.as_deref() == Some(did.as_str())
+        {
+            startup_root = Some((did.clone(), ok));
+        }
+        handled_focus = Some((did, parent_id));
+    }
+
+    CoreDiscoveryOutcome {
+        startup_root,
+        handled_focus,
+    }
+}
+
+fn apply_virtual_availability(
+    rt: &mut DriveSyncRuntime,
+    kind: VirtualListKind,
+    unavailable: Option<bool>,
+) {
+    match unavailable {
+        Some(true) => {
+            rt.virtual_unavailable.insert(kind);
+        }
+        Some(false) => {
+            rt.virtual_unavailable.remove(&kind);
+        }
+        None => {}
+    }
+}
+
+async fn fetch_and_emit_virtual_list(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    kind: VirtualListKind,
+) -> Option<bool> {
+    let fetch = graph.fetch_virtual_list(kind, 50).await.ok()?;
+    let unavailable = match &fetch.status.availability {
+        VirtualListAvailability::Available => {
+            match kind {
+                VirtualListKind::Recent => {
+                    let _ = storage.replace_recent_items(&fetch.items);
+                    let _ = event_tx.send(CoreEvent::RecentItemsUpdated(fetch.items));
+                }
+                VirtualListKind::SharedWithMe => {
+                    let _ = storage.replace_shared_items(&fetch.items);
+                    let _ = event_tx.send(CoreEvent::SharedItemsUpdated(fetch.items));
+                }
+            }
+            false
+        }
+        VirtualListAvailability::Unavailable { .. } => true,
+    };
+    let _ = event_tx.send(CoreEvent::VirtualListStatusUpdated {
+        kind,
+        status: fetch.status,
+    });
+    Some(unavailable)
 }
 
 async fn sync_virtual_list_once(
@@ -1725,30 +1955,8 @@ async fn sync_virtual_list_once(
     rt: &mut DriveSyncRuntime,
     kind: VirtualListKind,
 ) {
-    if let Ok(fetch) = graph.fetch_virtual_list(kind, 50).await {
-        match &fetch.status.availability {
-            VirtualListAvailability::Available => {
-                rt.virtual_unavailable.remove(&kind);
-                match kind {
-                    VirtualListKind::Recent => {
-                        let _ = storage.replace_recent_items(&fetch.items);
-                        let _ = event_tx.send(CoreEvent::RecentItemsUpdated(fetch.items));
-                    }
-                    VirtualListKind::SharedWithMe => {
-                        let _ = storage.replace_shared_items(&fetch.items);
-                        let _ = event_tx.send(CoreEvent::SharedItemsUpdated(fetch.items));
-                    }
-                }
-            }
-            VirtualListAvailability::Unavailable { .. } => {
-                rt.virtual_unavailable.insert(kind);
-            }
-        }
-        let _ = event_tx.send(CoreEvent::VirtualListStatusUpdated {
-            kind,
-            status: fetch.status,
-        });
-    }
+    let unavailable = fetch_and_emit_virtual_list(graph, storage, event_tx, kind).await;
+    apply_virtual_availability(rt, kind, unavailable);
 }
 
 async fn sync_sites_once(
@@ -1757,14 +1965,14 @@ async fn sync_sites_once(
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
     active_site_id: Option<&str>,
 ) {
-    let followed_res = graph.list_followed_sites().await;
+    let (followed_res, discovered_res) = tokio::join!(
+        graph.list_followed_sites(),
+        graph.list_sites(Some("*"), SIDEBAR_SITE_DISCOVERY_LIMIT),
+    );
     let authoritative_follow = followed_res.is_ok();
     let combined: Vec<SharePointSite> = merge_sidebar_sites(
         followed_res.unwrap_or_default(),
-        graph
-            .list_sites(Some("*"), SIDEBAR_SITE_DISCOVERY_LIMIT)
-            .await
-            .unwrap_or_default(),
+        discovered_res.unwrap_or_default(),
     );
     if authoritative_follow {
         let _ = storage.upsert_sites_with_follow_state(&combined);
@@ -1773,31 +1981,28 @@ async fn sync_sites_once(
     }
     if !combined.is_empty() || authoritative_follow {
         let _ = event_tx.send(CoreEvent::SitesUpdated(combined.clone()));
-        let mut refreshed_active = false;
-        for site in sites_for_drive_refresh(&combined, active_site_id) {
-            if active_site_id == Some(site.id.as_str()) {
-                refreshed_active = true;
-            }
-            if let Ok(drives) = graph
-                .list_site_drives(&site.id, Some(site.effective_name()))
-                .await
-            {
-                let _ = storage.upsert_drives(&drives);
-                let _ = event_tx.send(CoreEvent::DrivesUpdated {
-                    site_id: site.id.clone(),
-                    drives,
-                });
+        let mut targets: Vec<(String, Option<String>)> =
+            sites_for_drive_refresh(&combined, active_site_id)
+                .into_iter()
+                .map(|site| (site.id.clone(), Some(site.effective_name().to_string())))
+                .collect();
+        if let Some(sid) = active_site_id.map(str::trim).filter(|s| !s.is_empty()) {
+            if !targets.iter().any(|(id, _)| id == sid) {
+                targets.push((sid.to_string(), None));
             }
         }
-        if let Some(sid) = active_site_id.filter(|s| !s.trim().is_empty()) {
-            if !refreshed_active {
-                if let Ok(drives) = graph.list_site_drives(sid, None).await {
-                    let _ = storage.upsert_drives(&drives);
-                    let _ = event_tx.send(CoreEvent::DrivesUpdated {
-                        site_id: sid.to_string(),
-                        drives,
-                    });
-                }
+        // `buffered` preserves site priority order (followed sites first, ensuring deterministic
+        // initial SharePoint library selection) while overlapping up to 4 drive fetches.
+        let mut stream = futures::stream::iter(targets)
+            .map(|(site_id, site_name)| async move {
+                let res = graph.list_site_drives(&site_id, site_name.as_deref()).await;
+                (site_id, res)
+            })
+            .buffered(SITE_DRIVE_FETCH_CONCURRENCY);
+        while let Some((site_id, res)) = stream.next().await {
+            if let Ok(drives) = res {
+                let _ = storage.upsert_drives(&drives);
+                let _ = event_tx.send(CoreEvent::DrivesUpdated { site_id, drives });
             }
         }
     }
@@ -1963,5 +2168,462 @@ mod tests {
         // Active site already within the first 12 is not duplicated.
         let refresh_dup = sites_for_drive_refresh(&merged, Some("followed-a"));
         assert_eq!(refresh_dup.len(), SIDEBAR_DRIVE_PREFETCH_SITES);
+    }
+
+    fn test_graph_client(base_url: String) -> GraphClient {
+        let cfg = AppConfig {
+            graph_base_url: base_url,
+            ..AppConfig::default()
+        };
+        let auth = crate::auth::AuthManager::from_tokens(
+            cfg.clone(),
+            crate::auth::StoredTokens {
+                access_token: "test-token".into(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".into(),
+                tenant_id: "tid".into(),
+                user_id: Some("u1".into()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "test".into(),
+            },
+        );
+        GraphClient::new(cfg, auth).unwrap()
+    }
+
+    #[tokio::test]
+    async fn bootstrap_sharepoint_overlaps_drive_sites_and_virtual_lists() {
+        use axum::{extract::Path as AxumPath, routing::get, Json, Router};
+        use serde_json::json;
+        use tokio::{net::TcpListener, sync::Barrier};
+
+        let top_barrier = Arc::new(Barrier::new(5));
+        let site_drives_barrier = Arc::new(Barrier::new(2));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1.0", listener.local_addr().unwrap());
+
+        let b_drive = Arc::clone(&top_barrier);
+        let b_followed = Arc::clone(&top_barrier);
+        let b_sites = Arc::clone(&top_barrier);
+        let b_recent = Arc::clone(&top_barrier);
+        let b_shared = Arc::clone(&top_barrier);
+        let b_sd = Arc::clone(&site_drives_barrier);
+        let base_delta = base.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/drive",
+                get(move || {
+                    let b = Arc::clone(&b_drive);
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "id": "drv-me", "name": "OneDrive", "driveType": "business" }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/drives/drv-me/root/delta",
+                get(move || {
+                    let base = base_delta.clone();
+                    async move {
+                        Json(json!({
+                            "value": [],
+                            "@odata.deltaLink": format!("{base}/drives/drv-me/root/delta?token=t1")
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/drives/drv-me/root/children",
+                get(|| async {
+                    Json(json!({
+                        "value": [{
+                            "id": "me-file-1",
+                            "name": "readme.md",
+                            "size": 12,
+                            "file": { "mimeType": "text/markdown" },
+                            "parentReference": { "driveId": "drv-me", "id": "root-me", "path": "/drives/drv-me/root:" }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/followedSites",
+                get(move || {
+                    let b = Arc::clone(&b_followed);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{ "id": "site-1", "name": "eng", "displayName": "Engineering" }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/sites",
+                get(move || {
+                    let b = Arc::clone(&b_sites);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{ "id": "site-2", "name": "ops", "displayName": "Operations" }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/sites/{site_id}/drives",
+                get(move |AxumPath(site_id): AxumPath<String>| {
+                    let b = Arc::clone(&b_sd);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{
+                                "id": format!("drv-{site_id}"),
+                                "name": "Documents",
+                                "driveType": "documentLibrary"
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/drive/recent",
+                get(move || {
+                    let b = Arc::clone(&b_recent);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{ "id": "rec-1", "name": "recent.txt", "size": 5, "file": { "mimeType": "text/plain" } }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/drive/sharedWithMe",
+                get(move || {
+                    let b = Arc::clone(&b_shared);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{ "id": "sh-1", "name": "shared.txt", "size": 7, "file": { "mimeType": "text/plain" } }]
+                        }))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let graph = test_graph_client(base);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&tmp.path().join("bootstrap-overlap.db")).unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            bootstrap_sharepoint(&graph, &storage),
+        )
+        .await
+        .expect("bootstrap_sharepoint must overlap drive, sites, virtual lists, and site drives")
+        .unwrap();
+
+        assert_eq!(storage.list_sites().unwrap().len(), 2);
+        assert_eq!(storage.list_drives(None).unwrap().len(), 3);
+        assert_eq!(storage.list_recent_items(10).unwrap().len(), 1);
+        assert_eq!(storage.list_shared_items(10).unwrap().len(), 1);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_core_discovery_overlaps_me_sites_and_active_folder_delta() {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+        use tokio::{net::TcpListener, sync::Barrier};
+
+        let barrier = Arc::new(Barrier::new(4));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1.0", listener.local_addr().unwrap());
+
+        let b_me = Arc::clone(&barrier);
+        let b_followed = Arc::clone(&barrier);
+        let b_sites = Arc::clone(&barrier);
+        let b_delta = Arc::clone(&barrier);
+        let base_delta = base.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me",
+                get(move || {
+                    let b = Arc::clone(&b_me);
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "id": "u1", "displayName": "Test User", "mail": "test@example.com" }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/drive",
+                get(|| async {
+                    Json(json!({ "id": "drv-me", "name": "OneDrive", "driveType": "business" }))
+                }),
+            )
+            .route(
+                "/v1.0/drives/drv-sp/root/delta",
+                get(move || {
+                    let b = Arc::clone(&b_delta);
+                    let base = base_delta.clone();
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [],
+                            "@odata.deltaLink": format!("{base}/drives/drv-sp/root/delta?token=t2")
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/followedSites",
+                get(move || {
+                    let b = Arc::clone(&b_followed);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{ "id": "site-1", "name": "eng", "displayName": "Engineering" }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/sites",
+                get(move || {
+                    let b = Arc::clone(&b_sites);
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "value": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/sites/site-1/drives",
+                get(|| async {
+                    Json(json!({
+                        "value": [{ "id": "drv-sp", "name": "Documents", "driveType": "documentLibrary" }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/drive/recent",
+                get(|| async { Json(json!({ "value": [] })) }),
+            )
+            .route(
+                "/v1.0/me/drive/sharedWithMe",
+                get(|| async { Json(json!({ "value": [] })) }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let graph = test_graph_client(base.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&tmp.path().join("core-disc.db")).unwrap();
+        // Seed cursors so drv-me does not bootstrap and drv-sp hits its delta endpoint directly.
+        storage
+            .upsert_sync_cursor(&SyncCursor {
+                scope_key: drive_cursor_scope_key("drv-me"),
+                delta_link: Some(format!("{base}/drives/drv-me/root/delta?token=me1")),
+                history_next_link: None,
+                last_synced_at: now_rfc3339(),
+            })
+            .unwrap();
+        storage
+            .upsert_sync_cursor(&SyncCursor {
+                scope_key: drive_cursor_scope_key("drv-sp"),
+                delta_link: Some(format!("{base}/drives/drv-sp/root/delta?token=t1")),
+                history_next_link: None,
+                last_synced_at: now_rfc3339(),
+            })
+            .unwrap();
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(SyncSharedState::new());
+        let mut backoff = ErrorBackoffState::new(10_000);
+        let mut rt = DriveSyncRuntime::default();
+        let pre_focus = FocusTarget {
+            active_drive_id: Some("drv-sp".into()),
+            active_parent_id: None,
+            active_site_id: Some("site-1".into()),
+            view_kind: FocusViewKind::Folder,
+            active_limit: None,
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            sync_core_discovery(
+                &graph,
+                &storage,
+                &event_tx,
+                &shared,
+                &mut backoff,
+                &mut rt,
+                &pre_focus,
+            ),
+        )
+        .await
+        .expect("sync_core_discovery must overlap /me, sites, and active folder delta");
+
+        assert_eq!(outcome.handled_focus, Some(("drv-sp".to_string(), None)));
+        let mut saw_profile = false;
+        let mut saw_drives = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            if matches!(ev, CoreEvent::ProfileLoaded(_)) {
+                saw_profile = true;
+            }
+            if matches!(ev, CoreEvent::DrivesUpdated { ref site_id, .. } if site_id == "site-1") {
+                saw_drives = true;
+            }
+        }
+        assert!(saw_profile);
+        assert!(saw_drives);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn resync_tier2_lists_root_active_and_ancestors_concurrently() {
+        use axum::{extract::Path as AxumPath, routing::get, Json, Router};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::{net::TcpListener, sync::Barrier};
+
+        let seed_seen = Arc::new(AtomicBool::new(false));
+        let children_barrier = Arc::new(Barrier::new(3));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1.0", listener.local_addr().unwrap());
+
+        let seed_for_delta = Arc::clone(&seed_seen);
+        let seed_for_root = Arc::clone(&seed_seen);
+        let seed_for_item = Arc::clone(&seed_seen);
+        let b_root = Arc::clone(&children_barrier);
+        let b_item = Arc::clone(&children_barrier);
+        let base_delta = base.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/drives/drv-1/root/delta",
+                get(move || {
+                    let seed = Arc::clone(&seed_for_delta);
+                    let base = base_delta.clone();
+                    async move {
+                        seed.store(true, Ordering::SeqCst);
+                        Json(json!({
+                            "value": [],
+                            "@odata.deltaLink": format!("{base}/drives/drv-1/root/delta?token=fresh")
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/drives/drv-1/root/children",
+                get(move || {
+                    let seed = Arc::clone(&seed_for_root);
+                    let b = Arc::clone(&b_root);
+                    async move {
+                        assert!(seed.load(Ordering::SeqCst), "seed delta must precede children listing");
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{
+                                "id": "anc-1",
+                                "name": "Projects",
+                                "folder": { "childCount": 1 },
+                                "parentReference": { "driveId": "drv-1", "id": "root-id", "path": "/drives/drv-1/root:" }
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/drives/drv-1/items/{item_id}/children",
+                get(move |AxumPath(item_id): AxumPath<String>| {
+                    let seed = Arc::clone(&seed_for_item);
+                    let b = Arc::clone(&b_item);
+                    async move {
+                        assert!(seed.load(Ordering::SeqCst), "seed delta must precede children listing");
+                        b.wait().await;
+                        if item_id == "anc-1" {
+                            Json(json!({
+                                "value": [{
+                                    "id": "leaf-1",
+                                    "name": "Q4",
+                                    "folder": { "childCount": 1 },
+                                    "parentReference": { "driveId": "drv-1", "id": "anc-1", "path": "/drives/drv-1/root:/Projects" }
+                                }]
+                            }))
+                        } else {
+                            Json(json!({
+                                "value": [{
+                                    "id": "file-leaf",
+                                    "name": "plan.md",
+                                    "size": 42,
+                                    "file": { "mimeType": "text/markdown" },
+                                    "parentReference": { "driveId": "drv-1", "id": "leaf-1", "path": "/drives/drv-1/root:/Projects/Q4" }
+                                }]
+                            }))
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let graph = test_graph_client(base);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&tmp.path().join("tier2-resync.db")).unwrap();
+        storage
+            .upsert_drive_items(&[
+                DriveItem {
+                    id: "anc-1".into(),
+                    drive_id: "drv-1".into(),
+                    parent_id: Some("root-id".into()),
+                    parent_path: String::new(),
+                    name: "Projects".into(),
+                    is_folder: true,
+                    ..Default::default()
+                },
+                DriveItem {
+                    id: "leaf-1".into(),
+                    drive_id: "drv-1".into(),
+                    parent_id: Some("anc-1".into()),
+                    parent_path: "/Projects".into(),
+                    name: "Q4".into(),
+                    is_folder: true,
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut rt = DriveSyncRuntime::default();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            resync_drive_after_410_or_overflow(
+                &graph,
+                &storage,
+                &event_tx,
+                &mut rt,
+                "drv-1",
+                Some("leaf-1"),
+                FOLDER_PAGE_SIZE,
+                None,
+                Some("root-id".into()),
+            ),
+        )
+        .await
+        .expect("Tier 2 resync must list root, active folder, and ancestors concurrently")
+        .unwrap();
+
+        let (leaf_items, _) = storage
+            .list_folder_children_page("drv-1", Some("leaf-1"), 50)
+            .unwrap();
+        assert_eq!(leaf_items.len(), 1);
+        assert_eq!(leaf_items[0].id, "file-leaf");
+
+        server.abort();
     }
 }

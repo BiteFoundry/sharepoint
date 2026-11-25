@@ -7,8 +7,8 @@ use crate::models::{MarkupKind, PinnedTarget};
 use crate::sync::{FocusTarget, SyncCommand, SIDEBAR_DRIVE_PREFETCH_SITES};
 
 use super::app::{
-    copy_text_to_clipboard, ActiveViewSource, AppState, Focus, LoadMoreOutcome, NarrowPane, UiMsg,
-    UiState,
+    copy_text_to_clipboard, ActiveViewSource, AppState, Focus, LoadMoreOutcome, LocalUploadPreview,
+    NarrowPane, UiMsg, UiState,
 };
 use super::drive_view::inspector_body_height;
 use super::hitmap::{ButtonId, HitTarget};
@@ -594,7 +594,33 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
                             &item,
                             &opts,
                         );
-                        let _ = tx.send(UiMsg::ItemUploaded(item));
+                        let local_preview = if !item.is_folder
+                            && item.is_text_previewable()
+                            && item.size <= DEFAULT_TEXT_PREVIEW_MAX_BYTES as u64
+                        {
+                            tokio::fs::read(&local_path)
+                                .await
+                                .ok()
+                                .filter(|b| b.len() <= DEFAULT_TEXT_PREVIEW_MAX_BYTES)
+                                .and_then(|b| crate::graph::media::decode_text_file(&b).ok())
+                                .map(LocalUploadPreview::Text)
+                        } else if !item.is_folder
+                            && item.is_image()
+                            && item.size <= crate::img_preview::MAX_IMAGE_CACHE_BYTES as u64
+                        {
+                            tokio::fs::read(&local_path)
+                                .await
+                                .ok()
+                                .filter(|b| b.len() <= crate::img_preview::MAX_IMAGE_CACHE_BYTES)
+                                .map(|b| LocalUploadPreview::Image(std::sync::Arc::from(b)))
+                        } else {
+                            None
+                        };
+                        let _ = tx.send(UiMsg::ItemUploaded {
+                            item,
+                            parent_id,
+                            local_preview,
+                        });
                     }
                     Err(err) => {
                         let _ = tx.send(UiMsg::TaskError {
@@ -625,7 +651,7 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
                 match graph.create_folder(&drive_id, parent_id.as_deref(), &name).await {
                     Ok(folder) => {
                         let _ = storage.upsert_drive_items(std::slice::from_ref(&folder));
-                        let _ = tx.send(UiMsg::FolderCreated(folder));
+                        let _ = tx.send(UiMsg::FolderCreated { folder, parent_id });
                     }
                     Err(err) => {
                         let _ = tx.send(UiMsg::TaskError {

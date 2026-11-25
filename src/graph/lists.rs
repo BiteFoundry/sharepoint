@@ -225,7 +225,9 @@ impl GraphClient {
     pub async fn list_columns(&self, site_id: &str, list_id: &str) -> Result<Vec<ListColumn>> {
         let path = list_path(site_id, list_id)?;
         let raw: Vec<RawListColumn> = self.get_list_collection(format!("{path}/columns")).await?;
-        Ok(raw.into_iter().map(RawListColumn::into_model).collect())
+        let columns: Vec<ListColumn> = raw.into_iter().map(RawListColumn::into_model).collect();
+        self.cache_list_columns(&normalized_id(site_id), &normalized_id(list_id), columns.clone());
+        Ok(columns)
     }
 
     pub async fn list_items_page(
@@ -336,12 +338,24 @@ impl GraphClient {
             None => Vec::new(),
         };
 
-        let column = self
-            .list_columns(site_id, list_id)
-            .await?
-            .into_iter()
-            .find(|column| column.name == field)
-            .ok_or_else(|| anyhow!("Unknown internal column name {field:?}. Use the list's columns to find its name."))?;
+        let site_key = normalized_id(site_id);
+        let list_key = normalized_id(list_id);
+        let cached_column = self
+            .cached_list_columns(&site_key, &list_key)
+            .and_then(|cols| cols.into_iter().find(|column| column.name == field));
+        let column = match cached_column {
+            Some(col) => col,
+            None => self
+                .list_columns(site_id, list_id)
+                .await?
+                .into_iter()
+                .find(|column| column.name == field)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Unknown internal column name {field:?}. Use the list's columns to find its name."
+                    )
+                })?,
+        };
         ensure!(
             column.read_only != Some(true),
             "Column {field:?} is read-only"
@@ -565,6 +579,90 @@ mod tests {
         assert_eq!(cols[1].name, "DocOwner");
         assert!(!cols[1].required);
         assert_eq!(cols[1].column_type.as_deref(), Some("personOrGroup"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn update_list_item_field_reuses_cached_columns_and_refreshes_on_miss() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use axum::{extract::State, routing::patch};
+
+        let col_hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1.0/sites/site-1/lists/list-1/columns",
+                get(|State(hits): State<Arc<AtomicUsize>>| async move {
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    let mut cols = vec![
+                        json!({ "id": "c1", "name": "Status", "readOnly": false }),
+                        json!({ "id": "c2", "name": "Created", "readOnly": true }),
+                    ];
+                    if n >= 1 {
+                        cols.push(json!({ "id": "c3", "name": "NewCol", "readOnly": false }));
+                    }
+                    Json(json!({ "value": cols }))
+                }),
+            )
+            .route(
+                "/v1.0/sites/site-1/lists/list-1/items/row-1/fields",
+                patch(|Json(body): Json<Value>| async move { Json(body) }),
+            )
+            .with_state(col_hits.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("{base}/v1.0"),
+            ..AppConfig::default()
+        };
+        let auth = AuthManager::from_tokens(
+            cfg.clone(),
+            StoredTokens {
+                access_token: "test-token".into(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".into(),
+                tenant_id: "tid".into(),
+                user_id: Some("u1".into()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "test".into(),
+            },
+        );
+        let graph = GraphClient::new(cfg, auth).unwrap();
+
+        // First call populates column cache; second call reuses it (0 extra GET /columns).
+        graph
+            .update_list_item_field("site-1", "list-1", "row-1", "Status", json!("Draft"), None)
+            .await
+            .unwrap();
+        graph
+            .update_list_item_field("site-1", "list-1", "row-1", "Status", json!("Ready"), None)
+            .await
+            .unwrap();
+        assert_eq!(col_hits.load(Ordering::SeqCst), 1);
+
+        // Cached read-only column is rejected with 0 extra GET /columns.
+        let ro_err = graph
+            .update_list_item_field("site-1", "list-1", "row-1", "Created", json!("x"), None)
+            .await
+            .unwrap_err();
+        assert!(ro_err.to_string().contains("read-only"));
+        assert_eq!(col_hits.load(Ordering::SeqCst), 1);
+
+        // A column missing from the cached schema triggers one live refresh and succeeds.
+        let added = graph
+            .update_list_item_field("site-1", "list-1", "row-1", "NewCol", json!("ok"), None)
+            .await
+            .unwrap();
+        assert_eq!(added.fields["NewCol"], json!("ok"));
+        assert_eq!(col_hits.load(Ordering::SeqCst), 2);
 
         server.abort();
     }

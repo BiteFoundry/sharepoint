@@ -1068,11 +1068,22 @@ impl GraphClient {
         })
     }
 
-    async fn get_drive_item_with_list_fields(&self, base_endpoint: &str) -> Result<GraphDriveItem> {
+    async fn get_drive_item_with_list_fields(
+        &self,
+        drive_id: &str,
+        base_endpoint: &str,
+        cache_unsupported: bool,
+    ) -> Result<GraphDriveItem> {
+        if cache_unsupported && self.is_list_item_expand_unsupported(drive_id) {
+            return self.get_json::<GraphDriveItem>(base_endpoint).await;
+        }
         let expanded = format!("{base_endpoint}?$expand=listItem($expand=fields)");
         match self.get_json::<GraphDriveItem>(&expanded).await {
             Ok(raw) => Ok(raw),
             Err(err) if is_list_item_expand_unsupported(&err) => {
+                if cache_unsupported {
+                    self.mark_list_item_expand_unsupported(drive_id);
+                }
                 self.get_json::<GraphDriveItem>(base_endpoint).await
             }
             Err(err) => Err(err),
@@ -1083,19 +1094,23 @@ impl GraphClient {
         let enc_drive = urlencoding::encode(drive_id.trim());
         let enc_item = urlencoding::encode(item_id.trim());
         let endpoint = format!("/drives/{enc_drive}/items/{enc_item}");
-        let raw = self.get_drive_item_with_list_fields(&endpoint).await?;
+        let raw = self
+            .get_drive_item_with_list_fields(drive_id, &endpoint, true)
+            .await?;
         Ok(raw.into_model(drive_id))
     }
 
     pub async fn get_item_by_path(&self, drive_id: &str, path: &str) -> Result<DriveItem> {
         let enc_drive = urlencoding::encode(drive_id.trim());
         let encoded_path = encode_graph_path(path);
-        let endpoint = if encoded_path.is_empty() {
-            format!("/drives/{enc_drive}/root")
+        let (endpoint, is_root) = if encoded_path.is_empty() {
+            (format!("/drives/{enc_drive}/root"), true)
         } else {
-            format!("/drives/{enc_drive}/root:/{encoded_path}:")
+            (format!("/drives/{enc_drive}/root:/{encoded_path}:"), false)
         };
-        let raw = self.get_drive_item_with_list_fields(&endpoint).await?;
+        let raw = self
+            .get_drive_item_with_list_fields(drive_id, &endpoint, !is_root)
+            .await?;
         Ok(raw.into_model(drive_id))
     }
 
@@ -2341,6 +2356,9 @@ impl GraphClient {
         Ok(raw.into_model(drive_id))
     }
 
+    /// Fetches the drive's real root folder ID live from Graph and records it in the
+    /// per-client cache for read-only callers (`get_drive_root_id_cached`). Mutating callers
+    /// (such as move-to-root) use this live check so an unreachable `/root` aborts before PATCH.
     pub async fn get_drive_root_id(&self, drive_id: &str) -> Result<String> {
         let enc_drive = urlencoding::encode(drive_id.trim());
         let raw: GraphDriveItem = self
@@ -2350,7 +2368,18 @@ impl GraphClient {
         if id.is_empty() {
             bail!("Graph /drives/{drive_id}/root response returned an empty root folder id.");
         }
-        Ok(id.to_string())
+        let owned = id.to_string();
+        self.cache_drive_root_id(drive_id, owned.clone());
+        Ok(owned)
+    }
+
+    /// Returns the drive's root folder ID from the per-client cache when already known,
+    /// otherwise fetches `/drives/{id}/root` (without `$expand=listItem`) and caches it.
+    pub async fn get_drive_root_id_cached(&self, drive_id: &str) -> Result<String> {
+        if let Some(cached) = self.cached_drive_root_id(drive_id) {
+            return Ok(cached);
+        }
+        self.get_drive_root_id(drive_id).await
     }
 
     pub async fn rename_or_move_item(
@@ -2737,12 +2766,16 @@ mod tests {
         assert_eq!(od_item.sha256_hash.as_deref(), Some("112233"));
         assert!(od_item.list_item_fields.is_empty());
 
-        // 3. get_item_by_path also transparently falls back on 400.
+        // 3. Subsequent get_item_by_path on the same personal drive remembers the 400
+        //    and skips the failing $expand round-trip directly, while sp-drive keeps $expand.
         let od_by_path = graph
             .get_item_by_path("personal-drive", "/Docs/notes.txt")
             .await
             .unwrap();
         assert_eq!(od_by_path.id, "od-2");
+
+        let sp_again = graph.get_item("sp-drive", "doc-1").await.unwrap();
+        assert_eq!(sp_again.list_item_fields["Status"], json!("Approved"));
 
         let recorded = seen_queries.lock().unwrap().clone();
         assert_eq!(
@@ -2751,10 +2784,86 @@ mod tests {
                 "listItem($expand=fields)",
                 "listItem($expand=fields)",
                 "",
-                "listItem($expand=fields)",
                 "",
+                "listItem($expand=fields)",
             ]
         );
+
+        // 4. Fresh GraphClient also transparently falls back on get_item_by_path when uncached.
+        seen_queries.lock().unwrap().clear();
+        let fresh_graph = GraphClient::new(graph.config().clone(), graph.auth().clone()).unwrap();
+        let od_by_path_fresh = fresh_graph
+            .get_item_by_path("personal-drive", "/Docs/notes.txt")
+            .await
+            .unwrap();
+        assert_eq!(od_by_path_fresh.id, "od-2");
+        assert_eq!(
+            seen_queries.lock().unwrap().clone(),
+            vec!["listItem($expand=fields)", ""]
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn get_drive_root_id_caches_per_drive_across_repeated_calls() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use axum::{extract::State, routing::get, Json, Router};
+        use tokio::net::TcpListener;
+        use crate::{
+            auth::{AuthManager, StoredTokens},
+            config::AppConfig,
+        };
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1.0/drives/drv-1/root",
+                get(|State(h): State<Arc<AtomicUsize>>| async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({ "id": "root-guid-1", "name": "root", "folder": {} }))
+                }),
+            )
+            .with_state(hits.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("{base}/v1.0"),
+            ..AppConfig::default()
+        };
+        let auth = AuthManager::from_tokens(
+            cfg.clone(),
+            StoredTokens {
+                access_token: "test-token".into(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".into(),
+                tenant_id: "tid".into(),
+                user_id: Some("u1".into()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "test".into(),
+            },
+        );
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        assert_eq!(
+            graph.get_drive_root_id_cached("drv-1").await.unwrap(),
+            "root-guid-1"
+        );
+        assert_eq!(
+            graph.get_drive_root_id_cached("drv-1").await.unwrap(),
+            "root-guid-1"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // Live get_drive_root_id still verifies /root directly for mutating callers.
+        assert_eq!(graph.get_drive_root_id("drv-1").await.unwrap(), "root-guid-1");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
 
         server.abort();
     }

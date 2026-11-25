@@ -7,13 +7,14 @@ pub mod media;
 pub mod socketio;
 
 use std::{
-    sync::{Arc, OnceLock},
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
 use anyhow::Result;
 
-use crate::{auth::AuthManager, config::AppConfig};
+use crate::{auth::AuthManager, config::AppConfig, models::ListColumn};
 
 /// Canonical prefix emitted by `GraphClient` HTTP errors; kept as a shared constant for safe parsing.
 pub const GRAPH_API_ERROR_PREFIX: &str = "Graph API error (";
@@ -76,6 +77,9 @@ pub struct GraphClient {
     my_user_id: Option<String>,
     cached_my_user_id: Arc<OnceLock<String>>,
     resolve_user_mutex: Arc<tokio::sync::Mutex<()>>,
+    list_item_expand_unsupported_drives: Arc<Mutex<HashSet<String>>>,
+    cached_drive_root_ids: Arc<Mutex<HashMap<String, String>>>,
+    cached_list_columns: Arc<Mutex<HashMap<(String, String), Vec<ListColumn>>>>,
 }
 
 impl GraphClient {
@@ -100,7 +104,57 @@ impl GraphClient {
             my_user_id: None,
             cached_my_user_id: Arc::new(OnceLock::new()),
             resolve_user_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            list_item_expand_unsupported_drives: Arc::new(Mutex::new(HashSet::new())),
+            cached_drive_root_ids: Arc::new(Mutex::new(HashMap::new())),
+            cached_list_columns: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub(crate) fn is_list_item_expand_unsupported(&self, drive_id: &str) -> bool {
+        let key = drive_id.trim();
+        self.list_item_expand_unsupported_drives
+            .lock()
+            .ok()
+            .is_some_and(|set| set.contains(key))
+    }
+
+    pub(crate) fn mark_list_item_expand_unsupported(&self, drive_id: &str) {
+        let key = drive_id.trim();
+        if !key.is_empty() {
+            if let Ok(mut set) = self.list_item_expand_unsupported_drives.lock() {
+                set.insert(key.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn cached_drive_root_id(&self, drive_id: &str) -> Option<String> {
+        let key = drive_id.trim();
+        self.cached_drive_root_ids
+            .lock()
+            .ok()
+            .and_then(|map| map.get(key).cloned())
+    }
+
+    pub(crate) fn cache_drive_root_id(&self, drive_id: &str, root_id: String) {
+        let key = drive_id.trim();
+        if !key.is_empty() && !root_id.trim().is_empty() {
+            if let Ok(mut map) = self.cached_drive_root_ids.lock() {
+                map.insert(key.to_string(), root_id);
+            }
+        }
+    }
+
+    pub(crate) fn cached_list_columns(&self, site_key: &str, list_key: &str) -> Option<Vec<ListColumn>> {
+        self.cached_list_columns
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&(site_key.to_string(), list_key.to_string())).cloned())
+    }
+
+    pub(crate) fn cache_list_columns(&self, site_key: &str, list_key: &str, columns: Vec<ListColumn>) {
+        if let Ok(mut map) = self.cached_list_columns.lock() {
+            map.insert((site_key.to_string(), list_key.to_string()), columns);
+        }
     }
 
     pub fn with_my_user_id(mut self, user_id: impl Into<String>) -> Self {

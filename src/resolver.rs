@@ -148,11 +148,15 @@ pub async fn resolve_site(
         }
     }
 
-    // Followed sites + a Graph search for the query itself. Searching for the query (not
-    // `*`) is what finds a site in a tenant with more sites than one result page.
-    let mut combined = graph.list_followed_sites().await.unwrap_or_default();
+    // Followed sites + a Graph search for the query itself in parallel. Searching for the
+    // query (not `*`) is what finds a site in a tenant with more sites than one result page.
+    let (followed_res, search_res) = tokio::join!(
+        graph.list_followed_sites(),
+        graph.list_sites(Some(q), SITE_RESOLVE_SEARCH_LIMIT),
+    );
+    let mut combined = followed_res.unwrap_or_default();
     let mut search_error: Option<anyhow::Error> = None;
-    match graph.list_sites(Some(q), SITE_RESOLVE_SEARCH_LIMIT).await {
+    match search_res {
         Ok(found) => merge_sites(&mut combined, found),
         // Kept: an auth or throttling failure must not be reported as "not found".
         Err(err) => search_error = Some(err),
@@ -329,8 +333,21 @@ pub async fn resolve_target_drive(
         } else {
             resolve_site(graph, storage, s_str, false).await?
         };
+        let cached_drives = storage.list_drives(Some(&site.id))?;
+        if !cached_drives.is_empty() {
+            if let Some(d_str) = dq {
+                match resolve_drive_from_slice_inner(&cached_drives, d_str, false) {
+                    Ok(found) => return Ok(found),
+                    Err(err) if err.downcast_ref::<AmbiguousMatch>().is_some() => return Err(err),
+                    Err(_) if !offline => {}
+                    Err(err) => return Err(err),
+                }
+            } else {
+                return Ok(cached_drives.into_iter().next().unwrap());
+            }
+        }
         let drives = if offline {
-            storage.list_drives(Some(&site.id))?
+            cached_drives
         } else {
             let fetched = graph
                 .list_site_drives(&site.id, Some(site.effective_name()))
@@ -458,6 +475,41 @@ pub async fn resolve_item(
             return Ok(exact);
         }
         bail!("Drive item not found in local cache for drive '{drive_id}': {raw}")
+    }
+
+    // Use SQLite solely as a lookup-order hint for bare root filenames (still always
+    // verifying live on Graph) so `info report.md` / `rm report.md` skips a guaranteed
+    // 404 on `/items/report.md` when the cache already knows `report.md` is a root path.
+    let hint_root_path = !looks_like_path
+        && storage.get_drive_item(drive_id, raw)?.is_none()
+        && storage
+            .get_drive_item_by_path(drive_id, raw)?
+            .is_some_and(|cached| cached.id != raw);
+
+    if hint_root_path {
+        match graph.get_item_by_path(drive_id, raw).await {
+            Ok(item) => {
+                if item.drive_id == drive_id || item.effective_drive_id() == drive_id {
+                    let _ = storage.upsert_drive_items(std::slice::from_ref(&item));
+                    return Ok(item);
+                }
+            }
+            Err(err) if crate::graph::is_graph_not_found_error(&err) => {}
+            Err(err) => return Err(err),
+        }
+        match graph.get_item(drive_id, raw).await {
+            Ok(item) => {
+                if item.drive_id == drive_id || item.effective_drive_id() == drive_id {
+                    let _ = storage.upsert_drive_items(std::slice::from_ref(&item));
+                    return Ok(item);
+                }
+                bail!("Drive item not found in drive '{drive_id}': {raw}")
+            }
+            Err(err) if crate::graph::is_graph_not_found_error(&err) => {
+                bail!("Drive item not found in drive '{drive_id}': {raw}")
+            }
+            Err(err) => return Err(err),
+        }
     }
 
     if !looks_like_path {
@@ -618,5 +670,241 @@ mod tests {
                 .id,
             "d-fin-docs"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_site_overlaps_followed_and_search_requests() {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+        use std::sync::Arc;
+        use tokio::{net::TcpListener, sync::Barrier};
+
+        use crate::{
+            auth::{AuthManager, StoredTokens},
+            config::AppConfig,
+        };
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/followedSites",
+                get(move || {
+                    let b = Arc::clone(&b1);
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "value": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/sites",
+                get(move || {
+                    let b = Arc::clone(&b2);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{
+                                "id": "site-search",
+                                "name": "marketing",
+                                "displayName": "Marketing Hub"
+                            }]
+                        }))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1.0", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = AppConfig {
+            graph_base_url: base,
+            ..AppConfig::default()
+        };
+        let auth = AuthManager::from_tokens(
+            cfg.clone(),
+            StoredTokens {
+                access_token: "test-token".into(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".into(),
+                tenant_id: "tid".into(),
+                user_id: Some("u1".into()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "test".into(),
+            },
+        );
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&tmp.path().join("resolver-overlap.db")).unwrap();
+
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            resolve_site(&graph, &storage, "marketing", false),
+        )
+        .await
+        .expect("followedSites and sites search must run concurrently")
+        .unwrap();
+        assert_eq!(resolved.id, "site-search");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn resolve_target_drive_reuses_cached_site_drives_and_resolve_item_hints_root_path() {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::net::TcpListener;
+
+        use crate::{
+            auth::{AuthManager, StoredTokens},
+            config::AppConfig,
+        };
+
+        let site_drives_hits = Arc::new(AtomicUsize::new(0));
+        let item_by_id_hits = Arc::new(AtomicUsize::new(0));
+        let item_by_path_hits = Arc::new(AtomicUsize::new(0));
+
+        let sdh = Arc::clone(&site_drives_hits);
+        let ibi = Arc::clone(&item_by_id_hits);
+        let ibp = Arc::clone(&item_by_path_hits);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/sites/{site_id}/drives",
+                get(move || {
+                    let hits = Arc::clone(&sdh);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "value": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/drives/{drive_id}/items/{item_id}",
+                get(move || {
+                    let hits = Arc::clone(&ibi);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::NOT_FOUND
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/drives/{drive_id}/root:/report.md:",
+                get(move || {
+                    let hits = Arc::clone(&ibp);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "id": "item-42",
+                            "name": "report.md",
+                            "size": 128,
+                            "file": { "mimeType": "text/markdown" },
+                            "parentReference": {
+                                "driveId": "drv-eng",
+                                "id": "root-id",
+                                "path": "/drives/drv-eng/root:"
+                            }
+                        }))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1.0", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = AppConfig {
+            graph_base_url: base,
+            ..AppConfig::default()
+        };
+        let auth = AuthManager::from_tokens(
+            cfg.clone(),
+            StoredTokens {
+                access_token: "test-token".into(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".into(),
+                tenant_id: "tid".into(),
+                user_id: Some("u1".into()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "test".into(),
+            },
+        );
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&tmp.path().join("resolver-cache.db")).unwrap();
+
+        storage
+            .upsert_sites(&[SharePointSite {
+                id: "site-eng".into(),
+                name: "engineering".into(),
+                display_name: "Engineering".into(),
+                ..Default::default()
+            }])
+            .unwrap();
+        storage
+            .upsert_drives(&[DriveInfo {
+                id: "drv-eng".into(),
+                name: "Documents".into(),
+                drive_type: "documentLibrary".into(),
+                site_id: Some("site-eng".into()),
+                site_name: Some("Engineering".into()),
+                ..Default::default()
+            }])
+            .unwrap();
+        storage
+            .upsert_drive_items(&[DriveItem {
+                id: "item-42".into(),
+                drive_id: "drv-eng".into(),
+                parent_id: Some("root-id".into()),
+                parent_path: String::new(),
+                name: "report.md".into(),
+                size: 128,
+                ..Default::default()
+            }])
+            .unwrap();
+
+        let drive = resolve_target_drive(
+            &graph,
+            &storage,
+            None,
+            Some("site-eng"),
+            Persona::SharePoint,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(drive.id, "drv-eng");
+        assert_eq!(
+            site_drives_hits.load(Ordering::SeqCst),
+            0,
+            "--site drive resolution should reuse SQLite-cached site drives"
+        );
+
+        let item = resolve_item(&graph, &storage, "drv-eng", "report.md", false)
+            .await
+            .unwrap();
+        assert_eq!(item.id, "item-42");
+        assert_eq!(
+            item_by_path_hits.load(Ordering::SeqCst),
+            1,
+            "bare cached root filename should verify live via /root:/report.md: first"
+        );
+        assert_eq!(
+            item_by_id_hits.load(Ordering::SeqCst),
+            0,
+            "cached root filename hint should skip guaranteed 404 on /items/report.md"
+        );
+
+        server.abort();
     }
 }

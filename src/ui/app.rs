@@ -126,6 +126,11 @@ pub struct PendingPixelGraphic {
     pub payload: Option<String>,
 }
 
+pub enum LocalUploadPreview {
+    Text(String),
+    Image(Arc<[u8]>),
+}
+
 pub enum UiMsg {
     BootstrapLoaded {
         my_drive: Option<DriveInfo>,
@@ -192,8 +197,15 @@ pub enum UiMsg {
         url: String,
     },
     ItemDownloaded(DownloadedFile),
-    ItemUploaded(DriveItem),
-    FolderCreated(DriveItem),
+    ItemUploaded {
+        item: DriveItem,
+        parent_id: Option<String>,
+        local_preview: Option<LocalUploadPreview>,
+    },
+    FolderCreated {
+        folder: DriveItem,
+        parent_id: Option<String>,
+    },
     ItemRenamed(DriveItem),
     ItemDeleted {
         drive_id: String,
@@ -1364,6 +1376,9 @@ impl AppState {
                 .unwrap_or(0);
             let file_name = format!("pasted-image-{unix_ms}.png");
 
+            let local_preview = (bytes.len() <= img_preview::MAX_IMAGE_CACHE_BYTES)
+                .then(|| LocalUploadPreview::Image(Arc::from(bytes.as_slice())));
+
             match graph
                 .upload_bytes(
                     &drive_id,
@@ -1376,7 +1391,11 @@ impl AppState {
             {
                 Ok(item) => {
                     let _ = storage.upsert_drive_items(std::slice::from_ref(&item));
-                    let _ = tx.send(UiMsg::ItemUploaded(item));
+                    let _ = tx.send(UiMsg::ItemUploaded {
+                        item,
+                        parent_id,
+                        local_preview,
+                    });
                 }
                 Err(err) => {
                     let _ = tx.send(UiMsg::TaskError {
@@ -1838,17 +1857,62 @@ impl AppState {
                     notification::show("SharePoint Download Complete", &msg);
                 }
             }
-            UiMsg::ItemUploaded(item) => {
-                let msg = format!("Uploaded {} ({})", item.name, crate::models::format_human_size(item.size));
+            UiMsg::ItemUploaded {
+                item,
+                parent_id,
+                local_preview,
+            } => {
+                let msg = format!(
+                    "Uploaded {} ({})",
+                    item.name,
+                    crate::models::format_human_size(item.size)
+                );
                 ui.toast(msg.clone(), ToastKind::Success);
                 if ui.notify {
                     notification::show("SharePoint Upload Complete", &msg);
                 }
-                self.load_active_folder(ui);
+                if self.active_folder_target() == Some((item.drive_id.clone(), parent_id.clone())) {
+                    self.current_items.retain(|existing| existing.id != item.id);
+                    self.current_items.push(item.clone());
+                    self.active_selected_id = Some(item.id.clone());
+                    self.loading_folder = false;
+                    self.reconcile_selection_after_items_update(ui);
+                    match local_preview {
+                        Some(LocalUploadPreview::Text(text)) => {
+                            if self.is_active_text_item(item.effective_drive_id(), &item.id) {
+                                self.set_text_preview(item.effective_drive_id(), &item.id, text);
+                            }
+                        }
+                        Some(LocalUploadPreview::Image(bytes)) => {
+                            self.cache_raw_image(Self::item_revision_key(&item), bytes);
+                        }
+                        None => {}
+                    }
+                    self.refresh_open_overlays_for_items(ui);
+                    self.ensure_inspector_loaded(ui);
+                    self.sync_ctrl.request(crate::sync::SyncCommand::SyncFolder {
+                        drive_id: item.drive_id,
+                        parent_id,
+                        reuse_startup_root: false,
+                        limit: self.requested_folder_limit(),
+                    });
+                }
             }
-            UiMsg::FolderCreated(folder) => {
+            UiMsg::FolderCreated { folder, parent_id } => {
                 ui.toast(format!("Created folder '{}'", folder.name), ToastKind::Success);
-                self.load_active_folder(ui);
+                if self.active_folder_target() == Some((folder.drive_id.clone(), parent_id.clone())) {
+                    self.current_items.retain(|existing| existing.id != folder.id);
+                    self.current_items.push(folder.clone());
+                    self.active_selected_id = Some(folder.id.clone());
+                    self.loading_folder = false;
+                    self.reconcile_selection_after_items_update(ui);
+                    self.sync_ctrl.request(crate::sync::SyncCommand::SyncFolder {
+                        drive_id: folder.drive_id,
+                        parent_id,
+                        reuse_startup_root: false,
+                        limit: self.requested_folder_limit(),
+                    });
+                }
             }
             UiMsg::ItemRenamed(item) => {
                 ui.toast(format!("Renamed to '{}'", item.name), ToastKind::Success);
@@ -3840,5 +3904,139 @@ mod tests {
             app.inflight_previews.contains(&tkey),
             "SyncError after RefreshAll must re-trigger ensure_inspector_loaded"
         );
+    }
+
+    #[tokio::test]
+    async fn folder_created_and_item_uploaded_render_immediately_without_loading_blank_or_redownload() {
+        use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+        use std::io::Cursor;
+
+        let content_hits = Arc::new(AtomicUsize::new(0));
+        let ch = Arc::clone(&content_hits);
+        let router = Router::new()
+            .route(
+                "/v1.0/drives/{drive_id}/items/{item_id}/content",
+                get(move || {
+                    let hits = Arc::clone(&ch);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/drives/{drive_id}/items/{item_id}/versions",
+                get(|| async { axum::Json(serde_json::json!({ "value": [] })) }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let base_url = format!("http://{addr}/v1.0");
+        let (mut app, mut ui, mut rx) = test_app_and_ui_with_base_url(Some(&base_url));
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        app.sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        ui.inline_images = true;
+        ui.graphics_caps.protocol = TerminalImageProtocol::Halfblock;
+        app.active_source = ActiveViewSource::Drive {
+            drive_id: "drv-1".into(),
+            label: "Docs".into(),
+        };
+
+        // 1. FolderCreated inserts & selects immediately without triggering a "Loading..." blank.
+        app.loading_folder = true;
+        let new_folder = make_folder("drv-1", "fld-new", "NewFolder");
+        app.apply_ui_msg(
+            UiMsg::FolderCreated {
+                folder: new_folder,
+                parent_id: None,
+            },
+            &mut ui,
+        );
+        assert!(!app.loading_folder);
+        assert_eq!(app.active_selected_id.as_deref(), Some("fld-new"));
+        assert!(app.current_items.iter().any(|i| i.id == "fld-new"));
+        let cmd1 = nudge_rx.try_recv().expect("expected background SyncFolder");
+        assert!(matches!(
+            cmd1,
+            SyncCommand::SyncFolder { ref drive_id, parent_id: None, .. } if drive_id == "drv-1"
+        ));
+
+        // 2. ItemUploaded with local text preview renders immediately with 0 /content downloads.
+        app.loading_folder = true;
+        let uploaded_md = DriveItem {
+            id: "doc-up".into(),
+            drive_id: "drv-1".into(),
+            name: "draft.md".into(),
+            size: 14,
+            mime_type: Some("text/markdown".into()),
+            e_tag: Some("\"etag-up\"".into()),
+            c_tag: Some("\"ctag-up\"".into()),
+            ..Default::default()
+        };
+        app.apply_ui_msg(
+            UiMsg::ItemUploaded {
+                item: uploaded_md.clone(),
+                parent_id: None,
+                local_preview: Some(LocalUploadPreview::Text("# Local Draft\n".into())),
+            },
+            &mut ui,
+        );
+        assert!(!app.loading_folder);
+        assert_eq!(app.active_selected_id.as_deref(), Some("doc-up"));
+        assert_eq!(
+            app.text_preview_for(&uploaded_md),
+            Some("# Local Draft\n")
+        );
+        let screen = draw_inspector_frame(&app, &mut ui);
+        assert!(screen.contains("Local Draft"), "{screen}");
+
+        // 3. ItemUploaded with local image bytes decodes directly from memory with 0 /content downloads.
+        let mut png_bytes = Vec::new();
+        let img = RgbaImage::from_pixel(2, 2, Rgba([0, 128, 255, 255]));
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut png_bytes), ImageFormat::Png)
+            .unwrap();
+        let uploaded_png = DriveItem {
+            id: "img-up".into(),
+            drive_id: "drv-1".into(),
+            name: "snap.png".into(),
+            size: png_bytes.len() as u64,
+            mime_type: Some("image/png".into()),
+            e_tag: Some("\"etag-img\"".into()),
+            c_tag: Some("\"ctag-img\"".into()),
+            ..Default::default()
+        };
+        app.apply_ui_msg(
+            UiMsg::ItemUploaded {
+                item: uploaded_png.clone(),
+                parent_id: None,
+                local_preview: Some(LocalUploadPreview::Image(Arc::from(png_bytes))),
+            },
+            &mut ui,
+        );
+        let img_key = app.inline_image_cache_key(&uploaded_png);
+        let mut saw_decoded = false;
+        while !saw_decoded {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected ImageDecoded from local upload bytes")
+                .expect("channel open");
+            if matches!(&msg, UiMsg::ImageDecoded { cache_key, .. } if *cache_key == img_key) {
+                saw_decoded = true;
+            }
+            app.apply_ui_msg(msg, &mut ui);
+        }
+        assert_eq!(app.rendered_images.get(&img_key).unwrap().width_px, 2);
+        assert_eq!(
+            content_hits.load(Ordering::SeqCst),
+            0,
+            "locally uploaded text and image items must not trigger redundant /content downloads"
+        );
+
+        server.abort();
     }
 }

@@ -739,24 +739,24 @@ async fn call_tool(
                 .await,
             )
             .await?;
-            let item = map_graph_err(
-                graph,
-                resolver::resolve_item_for_write(graph, storage, &drive.id, &item_q).await,
-            )
-            .await?;
-            let resolved_parent_id = match new_parent_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(p) if p == "/" || p.eq_ignore_ascii_case("root") => Some("root".to_string()),
-                Some(p) if p.starts_with('/') || p.contains('/') => {
-                    let folder = map_graph_err(
-                        graph,
-                        resolver::resolve_item_for_write(graph, storage, &drive.id, p).await,
-                    )
-                    .await?;
-                    Some(folder.id)
+            let item_fut = resolver::resolve_item_for_write(graph, storage, &drive.id, &item_q);
+            let parent_fut = async {
+                match new_parent_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(p) if p == "/" || p.eq_ignore_ascii_case("root") => {
+                        Ok(Some("root".to_string()))
+                    }
+                    Some(p) if p.starts_with('/') || p.contains('/') => {
+                        resolver::resolve_item_for_write(graph, storage, &drive.id, p)
+                            .await
+                            .map(|folder| Some(folder.id))
+                    }
+                    Some(pid) => Ok(Some(pid.to_string())),
+                    None => Ok(None),
                 }
-                Some(pid) => Some(pid.to_string()),
-                None => None,
             };
+            let (item_res, parent_res) = tokio::join!(item_fut, parent_fut);
+            let item = map_graph_err(graph, item_res).await?;
+            let resolved_parent_id = map_graph_err(graph, parent_res).await?;
             let updated = map_graph_err(
                 graph,
                 graph

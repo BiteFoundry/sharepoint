@@ -1401,18 +1401,22 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 false,
             )
             .await?;
-            let item =
-                resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, &item_or_path)
-                    .await?;
-            let dest_parent_id = match parent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(p) if p == "/" || p.eq_ignore_ascii_case("root") => Some("root".to_string()),
-                Some(p) => Some(
-                    resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, p)
-                        .await?
-                        .id,
-                ),
-                None => None,
+            let item_fut =
+                resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, &item_or_path);
+            let parent_fut = async {
+                match parent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(p) if p == "/" || p.eq_ignore_ascii_case("root") => {
+                        Ok(Some("root".to_string()))
+                    }
+                    Some(p) => resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, p)
+                        .await
+                        .map(|dest| Some(dest.id)),
+                    None => Ok(None),
+                }
             };
+            let (item_res, dest_parent_res) = tokio::join!(item_fut, parent_fut);
+            let item = item_res?;
+            let dest_parent_id = dest_parent_res?;
             let updated = graph
                 .rename_or_move_item(
                     &target_drive.id,
@@ -1985,13 +1989,15 @@ async fn cmd_doctor(config: &AppConfig, persona: Persona, online: bool, as_json:
     let mut online_probe = json!(null);
     if online {
         if let Ok(graph) = GraphClient::new(config.clone(), auth.clone()) {
-            let me_ok = graph.get_me().await.is_ok();
-            let drive_ok = graph.get_my_drive().await.is_ok();
-            let sites_ok = graph.list_sites(Some("*"), 5).await.is_ok();
+            let (me_res, drive_res, sites_res) = tokio::join!(
+                graph.get_me(),
+                graph.get_my_drive(),
+                graph.list_sites(Some("*"), 5),
+            );
             online_probe = json!({
-                "me": me_ok,
-                "onedrive": drive_ok,
-                "sharepoint_sites": sites_ok,
+                "me": me_res.is_ok(),
+                "onedrive": drive_res.is_ok(),
+                "sharepoint_sites": sites_res.is_ok(),
             });
         }
     }
@@ -2059,15 +2065,17 @@ pub async fn fetch_sites(
             return Ok(filtered.into_iter().take(limit).collect());
         }
     }
-    let (authoritative_follow, mut combined) = if clean_search.is_none() {
-        match graph.list_followed_sites().await {
+    let (authoritative_follow, mut combined, discovered) = if clean_search.is_none() {
+        let (followed_res, discovered_res) =
+            tokio::join!(graph.list_followed_sites(), graph.list_sites(search, limit));
+        let (auth_follow, followed) = match followed_res {
             Ok(followed) => (true, followed),
             Err(_) => (false, Vec::new()),
-        }
+        };
+        (auth_follow, followed, discovered_res?)
     } else {
-        (false, Vec::new())
+        (false, Vec::new(), graph.list_sites(search, limit).await?)
     };
-    let discovered = graph.list_sites(search, limit).await?;
     for s in discovered {
         if !combined.iter().any(|existing| existing.id == s.id) {
             combined.push(s);
@@ -2154,19 +2162,21 @@ pub async fn discover_drives(
     }
 
     let mut all = Vec::new();
-    if let Ok(me) = graph.get_my_drive().await {
+    let (me_res, listed) = tokio::join!(
+        graph.get_my_drive(),
+        fetch_sites(
+            graph,
+            storage,
+            None,
+            DRIVE_DISCOVERY_SITE_CAP + 1,
+            false,
+            false,
+            false,
+        ),
+    );
+    if let Ok(me) = me_res {
         all.push(me);
     }
-    let listed = fetch_sites(
-        graph,
-        storage,
-        None,
-        DRIVE_DISCOVERY_SITE_CAP + 1,
-        false,
-        false,
-        false,
-    )
-    .await;
     let (sites, has_more) = match listed {
         Ok(mut sites) => {
             let more = sites.len() > DRIVE_DISCOVERY_SITE_CAP;
@@ -2812,18 +2822,38 @@ pub async fn search_items_combined(
     Ok(results)
 }
 
-fn build_tree<'a>(
+const TREE_FETCH_CONCURRENCY: usize = 4;
+
+async fn build_tree(
+    graph: &GraphClient,
+    storage: &Storage,
+    drive_id: &str,
+    parent_id: Option<&str>,
+    depth: usize,
+) -> Result<(Vec<TreeNode>, bool)> {
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(TREE_FETCH_CONCURRENCY));
+    build_tree_inner(graph, storage, drive_id, parent_id, depth, sem).await
+}
+
+fn build_tree_inner<'a>(
     graph: &'a GraphClient,
     storage: &'a Storage,
     drive_id: &'a str,
     parent_id: Option<&'a str>,
     depth: usize,
+    sem: std::sync::Arc<tokio::sync::Semaphore>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<TreeNode>, bool)>> + Send + 'a>>
 {
     Box::pin(async move {
-        let page = graph
-            .list_children_detailed(drive_id, parent_id, Some(200))
-            .await?;
+        let page = {
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("tree concurrency semaphore closed"))?;
+            graph
+                .list_children_detailed(drive_id, parent_id, Some(200))
+                .await?
+        };
         if page.complete {
             let _ = storage.replace_folder_children(drive_id, parent_id, &page.items);
         } else {
@@ -2831,11 +2861,38 @@ fn build_tree<'a>(
         }
         let cut = !page.complete;
         let items = page.items;
-        let mut nodes = Vec::with_capacity(items.len());
-        for item in items {
-            let (children, has_more) = if item.is_folder && depth > 1 {
-                let (children, child_cut) =
-                    build_tree(graph, storage, drive_id, Some(&item.id), depth - 1)
+        if depth <= 1 {
+            let nodes = items
+                .into_iter()
+                .map(|item| {
+                    let has_more = if item.is_folder {
+                        item.child_count.map(|count| count > 0)
+                    } else {
+                        Some(false)
+                    };
+                    TreeNode {
+                        item,
+                        children: Vec::new(),
+                        has_more,
+                    }
+                })
+                .collect();
+            return Ok((nodes, cut));
+        }
+
+        let results: Vec<Result<TreeNode>> = futures::stream::iter(items)
+            .map(|item| {
+                let sem = std::sync::Arc::clone(&sem);
+                async move {
+                    if item.is_folder {
+                        let (children, child_cut) = build_tree_inner(
+                            graph,
+                            storage,
+                            drive_id,
+                            Some(&item.id),
+                            depth - 1,
+                            sem,
+                        )
                         .await
                         .with_context(|| {
                             format!(
@@ -2844,17 +2901,27 @@ fn build_tree<'a>(
                                 item.id
                             )
                         })?;
-                (children, Some(child_cut))
-            } else if item.is_folder {
-                (Vec::new(), item.child_count.map(|count| count > 0))
-            } else {
-                (Vec::new(), Some(false))
-            };
-            nodes.push(TreeNode {
-                item,
-                children,
-                has_more,
-            });
+                        Ok(TreeNode {
+                            item,
+                            children,
+                            has_more: Some(child_cut),
+                        })
+                    } else {
+                        Ok(TreeNode {
+                            item,
+                            children: Vec::new(),
+                            has_more: Some(false),
+                        })
+                    }
+                }
+            })
+            .buffered(TREE_FETCH_CONCURRENCY)
+            .collect()
+            .await;
+
+        let mut nodes = Vec::with_capacity(results.len());
+        for res in results {
+            nodes.push(res?);
         }
         Ok((nodes, cut))
     })
@@ -3316,5 +3383,188 @@ mod tests {
                 "expected DisplayHelp for {help_args:?}, got: {err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_sites_discover_drives_and_build_tree_run_concurrently() {
+        use axum::{extract::Path as AxumPath, routing::get, Json, Router};
+        use std::sync::Arc;
+        use tokio::{net::TcpListener, sync::Barrier};
+
+        // 1. fetch_sites overlaps /me/followedSites and /sites?search=*
+        let sites_barrier = Arc::new(Barrier::new(2));
+        let sb1 = Arc::clone(&sites_barrier);
+        let sb2 = Arc::clone(&sites_barrier);
+        let sites_router = Router::new()
+            .route(
+                "/v1.0/me/followedSites",
+                get(move || {
+                    let b = Arc::clone(&sb1);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{ "id": "site-a", "name": "alpha", "displayName": "Alpha" }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/sites",
+                get(move || {
+                    let b = Arc::clone(&sb2);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{ "id": "site-b", "name": "beta", "displayName": "Beta" }]
+                        }))
+                    }
+                }),
+            );
+        let listener1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base1 = format!("http://{}/v1.0", listener1.local_addr().unwrap());
+        let srv1 = tokio::spawn(async move { axum::serve(listener1, sites_router).await.unwrap() });
+
+        let make_graph = |base_url: String| {
+            let cfg = AppConfig {
+                graph_base_url: base_url,
+                ..AppConfig::default()
+            };
+            let auth = AuthManager::from_tokens(
+                cfg.clone(),
+                StoredTokens {
+                    access_token: "test-token".into(),
+                    refresh_token: None,
+                    expires_at: chrono::Utc::now().timestamp() + 3600,
+                    client_id: "cid".into(),
+                    tenant_id: "tid".into(),
+                    user_id: Some("u1".into()),
+                    user_display_name: None,
+                    user_email: None,
+                    auth_mode: "test".into(),
+                },
+            );
+            GraphClient::new(cfg, auth).unwrap()
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&tmp.path().join("cli-conc.db")).unwrap();
+        let g1 = make_graph(base1);
+
+        let sites = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            fetch_sites(&g1, &storage, None, 20, true, false, false),
+        )
+        .await
+        .expect("fetch_sites must overlap followedSites and sites discovery")
+        .unwrap();
+        assert_eq!(sites.len(), 2);
+        srv1.abort();
+
+        // 2. discover_drives overlaps /me/drive with fetch_sites, and build_tree overlaps sibling folders
+        let disc_barrier = Arc::new(Barrier::new(3));
+        let db1 = Arc::clone(&disc_barrier);
+        let db2 = Arc::clone(&disc_barrier);
+        let db3 = Arc::clone(&disc_barrier);
+        let tree_barrier = Arc::new(Barrier::new(2));
+        let tb = Arc::clone(&tree_barrier);
+
+        let router2 = Router::new()
+            .route(
+                "/v1.0/me/drive",
+                get(move || {
+                    let b = Arc::clone(&db1);
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "id": "drv-me", "name": "OneDrive", "driveType": "business" }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/followedSites",
+                get(move || {
+                    let b = Arc::clone(&db2);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{ "id": "site-1", "name": "eng", "displayName": "Engineering" }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/sites",
+                get(move || {
+                    let b = Arc::clone(&db3);
+                    async move {
+                        b.wait().await;
+                        Json(json!({ "value": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/sites/site-1/drives",
+                get(|| async {
+                    Json(json!({
+                        "value": [{ "id": "drv-eng", "name": "Documents", "driveType": "documentLibrary" }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/drives/drv-eng/root/children",
+                get(|| async {
+                    Json(json!({
+                        "value": [
+                            { "id": "fld-a", "name": "Alpha", "folder": { "childCount": 1 } },
+                            { "id": "fld-b", "name": "Beta", "folder": { "childCount": 1 } }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/drives/drv-eng/items/{item_id}/children",
+                get(move |AxumPath(item_id): AxumPath<String>| {
+                    let b = Arc::clone(&tb);
+                    async move {
+                        b.wait().await;
+                        Json(json!({
+                            "value": [{
+                                "id": format!("file-in-{item_id}"),
+                                "name": format!("{item_id}.txt"),
+                                "size": 10,
+                                "file": { "mimeType": "text/plain" }
+                            }]
+                        }))
+                    }
+                }),
+            );
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base2 = format!("http://{}/v1.0", listener2.local_addr().unwrap());
+        let srv2 = tokio::spawn(async move { axum::serve(listener2, router2).await.unwrap() });
+        let g2 = make_graph(base2);
+
+        let discovered = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            discover_drives(&g2, &storage, None, true, false, false),
+        )
+        .await
+        .expect("discover_drives must overlap get_my_drive with fetch_sites")
+        .unwrap();
+        assert_eq!(discovered.drives.len(), 2);
+
+        let (nodes, truncated) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            build_tree(&g2, &storage, "drv-eng", None, 2),
+        )
+        .await
+        .expect("build_tree must list sibling subfolders concurrently")
+        .unwrap();
+        assert!(!truncated);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].item.id, "fld-a");
+        assert_eq!(nodes[0].children[0].item.id, "file-in-fld-a");
+        assert_eq!(nodes[1].item.id, "fld-b");
+        assert_eq!(nodes[1].children[0].item.id, "file-in-fld-b");
+
+        srv2.abort();
     }
 }

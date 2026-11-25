@@ -745,7 +745,7 @@ async fn e2e_http_api_and_mcp_tools_parity() {
             "fields": ["mime_type", "parent_id", "web_url"],
             "versions": null
         },
-        "hint": "Call get_file_info with item_id \"item-readme\", drive \"drv-me\" and compact:false for every field."
+        "hint": "Call get_file_info with item_id \"item-readme\", drive \"drv-me\" and fields: [...] for specific fields or compact:false for every field."
     } }));
     let text = compact_info["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(&serde_json::from_str::<Value>(text).unwrap(), compact);
