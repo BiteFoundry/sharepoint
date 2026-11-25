@@ -1,6 +1,6 @@
 [package]
 name = "sharepoint-cli"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 default-run = "sharepoint"
 description = "Unified Microsoft SharePoint & OneDrive terminal client & AI agent toolkit — Sites, Document Libraries & Personal Files (CLI, TUI, HTTP API, MCP)"
