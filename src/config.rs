@@ -453,6 +453,12 @@ impl AppConfig {
     /// A loaded config carries values taken from the environment, so this writes those into
     /// the file as well. To change single settings use [`persist_config_keys`].
     pub fn save(&self) -> Result<()> {
+        #[cfg(test)]
+        if std::env::var_os("SHAREPOINT_CONFIG_DIR").is_none()
+            && std::env::var_os("ONEDRIVE_CONFIG_DIR").is_none()
+        {
+            return Ok(());
+        }
         self.save_to(&config_file_path())
     }
 
@@ -564,6 +570,12 @@ pub fn persist_keys(path: &Path, updates: &[(&str, toml::Value)]) -> Result<()> 
 
 /// [`persist_keys`] on the user's config file.
 pub fn persist_config_keys(updates: &[(&str, toml::Value)]) -> Result<()> {
+    #[cfg(test)]
+    if std::env::var_os("SHAREPOINT_CONFIG_DIR").is_none()
+        && std::env::var_os("ONEDRIVE_CONFIG_DIR").is_none()
+    {
+        return Ok(());
+    }
     persist_keys(&config_file_path(), updates)
 }
 
