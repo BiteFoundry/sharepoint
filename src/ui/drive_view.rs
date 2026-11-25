@@ -163,8 +163,9 @@ pub fn draw_list(
     if items.is_empty() {
         if app.loading_folder {
             frame.render_widget(
-                Paragraph::new(Span::styled(" Loading items...", theme.muted_style())),
-                Rect::new(area.x, list_start_y, area.width, 1),
+                Paragraph::new(Span::styled(" Loading items...", theme.muted_style()))
+                    .wrap(Wrap { trim: false }),
+                Rect::new(area.x, list_start_y, area.width, list_h as u16),
             );
             return;
         }
@@ -221,8 +222,9 @@ pub fn draw_list(
             Paragraph::new(Span::styled(
                 " (Empty folder — press Ctrl+F to upload or n to create a folder)",
                 theme.muted_style(),
-            )),
-            Rect::new(area.x, list_start_y, area.width, 1),
+            ))
+            .wrap(Wrap { trim: false }),
+            Rect::new(area.x, list_start_y, area.width, list_h as u16),
         );
         return;
     }
@@ -260,30 +262,6 @@ pub fn draw_list(
             Style::default().fg(theme.fg_primary)
         };
 
-        let badge = format!("[{:<4}]", item.type_badge());
-        let size_str = if item.is_folder {
-            match item.child_count {
-                Some(n) => format!("{n} items"),
-                None => "folder".to_string(),
-            }
-        } else {
-            format_human_size(item.size)
-        };
-        let date_str = item
-            .last_modified_at
-            .as_deref()
-            .map(|s| s.get(..10).unwrap_or(s))
-            .unwrap_or("");
-
-        let right_meta = format!("{size_str:>9}  {date_str}");
-        let name_budget = (area.width as usize).saturating_sub(badge.len() + right_meta.len() + 5);
-        let name_display = if item.is_folder {
-            format!("{}/", item.name)
-        } else {
-            item.name.clone()
-        };
-        let trunc_name = truncate_width(&name_display, name_budget.max(8));
-
         let badge_style = if is_sel && focused {
             row_style
         } else if item.is_folder {
@@ -293,28 +271,19 @@ pub fn draw_list(
         } else {
             theme.muted_style()
         };
+        let meta_style = if is_sel && focused {
+            row_style
+        } else {
+            theme.muted_style()
+        };
 
-        let line1 = Line::from(vec![
-            Span::styled(" ", row_style),
-            Span::styled(badge, badge_style),
-            Span::styled(format!(" {trunc_name}"), row_style),
-            Span::styled(
-                format!(
-                    "{:>width$}",
-                    right_meta,
-                    width = (area.width as usize)
-                        .saturating_sub(
-                            unicode_width::UnicodeWidthStr::width(trunc_name.as_str()) + 9
-                        )
-                        .max(right_meta.len() + 1)
-                ),
-                if is_sel && focused {
-                    row_style
-                } else {
-                    theme.muted_style()
-                },
-            ),
-        ]);
+        let line1 = build_file_row_line(
+            item,
+            area.width as usize,
+            row_style,
+            badge_style,
+            meta_style,
+        );
         frame.render_widget(Paragraph::new(line1), Rect::new(area.x, y, area.width, 1));
 
         if row_height == 2 && y + 1 < area.bottom() {
@@ -369,7 +338,8 @@ pub fn draw_inspector(
             Paragraph::new(Span::styled(
                 " Select a file or folder to inspect metadata, preview images, or read text",
                 theme.muted_style(),
-            )),
+            ))
+            .wrap(Wrap { trim: false }),
             area,
         );
         return;
@@ -693,36 +663,28 @@ pub fn draw_inspector(
                         lines.extend(cached.lines.iter().cloned());
                     }
                 } else {
+                    let total_lines = content.lines().count();
                     lines.push(Line::from(Span::styled(
                         format!(
                             " {} Source (Raw · {} lines · m Render · u Links):",
                             kind.label(),
-                            content.lines().count()
+                            total_lines
                         ),
                         theme.accent_style(),
                     )));
-                    for raw_line in content.lines().take(500) {
-                        lines.push(Line::from(Span::styled(
-                            format!(" {raw_line}"),
-                            Style::default().fg(theme.fg_primary),
-                        )));
-                    }
+                    push_capped_raw_preview_lines(&mut lines, content, total_lines, theme);
                 }
             } else {
+                let total_lines = content.lines().count();
                 lines.push(Line::from(Span::styled(
                     format!(
                         " File Preview ({} lines · u Links · h href {}):",
-                        content.lines().count(),
+                        total_lines,
                         if ui.show_link_urls { "ON" } else { "OFF" }
                     ),
                     theme.accent_style(),
                 )));
-                for raw_line in content.lines().take(500) {
-                    lines.push(Line::from(Span::styled(
-                        format!(" {raw_line}"),
-                        Style::default().fg(theme.fg_primary),
-                    )));
-                }
+                push_capped_raw_preview_lines(&mut lines, content, total_lines, theme);
             }
         } else if let Some(err) = app.text_preview_error_for(&item) {
             lines.push(Line::from(Span::styled(
@@ -810,6 +772,129 @@ fn truncation_hint_for_budget(app: &AppState, breadcrumb: &str, budget: usize) -
         short
     } else {
         String::new()
+    }
+}
+
+/// Maximum number of raw preview lines rendered before appending an explicit truncation banner.
+const RAW_PREVIEW_LINE_CAP: usize = 500;
+
+/// Builds a single file-list row whose rendered display width never exceeds `total_w`.
+/// At narrow widths (`< 40` cols), the modified date is omitted so the filename and size fit
+/// cleanly without pushing metadata past the right edge.
+fn build_file_row_line(
+    item: &crate::models::DriveItem,
+    total_w: usize,
+    row_style: Style,
+    badge_style: Style,
+    meta_style: Style,
+) -> Line<'static> {
+    use unicode_width::UnicodeWidthStr;
+
+    if total_w == 0 {
+        return Line::default();
+    }
+
+    let badge = format!("[{:<4}]", item.type_badge());
+    let badge_w = badge.width();
+    let name_display = if item.is_folder {
+        format!("{}/", item.name)
+    } else {
+        item.name.clone()
+    };
+
+    // Prefix: " " + badge + " "
+    let prefix_w = 2 + badge_w;
+    if total_w <= prefix_w + 1 {
+        let fallback = truncate_width(&format!(" {badge} {name_display}"), total_w);
+        return Line::from(Span::styled(fallback, row_style));
+    }
+
+    let size_str = if item.is_folder {
+        match item.child_count {
+            Some(n) => format!("{n} items"),
+            None => "folder".to_string(),
+        }
+    } else {
+        format_human_size(item.size)
+    };
+    let date_str = item
+        .last_modified_at
+        .as_deref()
+        .map(|s| s.get(..10).unwrap_or(s))
+        .unwrap_or("");
+
+    let full_meta = if total_w >= 40 && !date_str.is_empty() {
+        format!("{size_str:>9}  {date_str}")
+    } else if total_w >= 40 {
+        format!("{size_str:>9}")
+    } else {
+        size_str.clone()
+    };
+
+    let min_name_w: usize = 4;
+    let fit_meta = |candidate: &str| -> Option<(usize, usize)> {
+        let mw = candidate.width();
+        let needed_padded = prefix_w + 1 + mw + 1;
+        if total_w >= needed_padded + min_name_w {
+            return Some((total_w - needed_padded, 1));
+        }
+        let needed_flush = prefix_w + 1 + mw;
+        if total_w >= needed_flush + min_name_w {
+            return Some((total_w - needed_flush, 0));
+        }
+        None
+    };
+
+    let chosen_meta: Option<(&str, usize, usize)> = if let Some((budget, trail)) = fit_meta(&full_meta)
+    {
+        Some((full_meta.as_str(), budget, trail))
+    } else if total_w >= 40 {
+        fit_meta(&size_str).map(|(budget, trail)| (size_str.as_str(), budget, trail))
+    } else {
+        None
+    };
+
+    if let Some((meta, name_budget, trailing_w)) = chosen_meta {
+        let trunc_name = truncate_width(&name_display, name_budget);
+        let trunc_w = trunc_name.width();
+        let meta_w = meta.width();
+        let gap_w = total_w.saturating_sub(prefix_w + trunc_w + meta_w + trailing_w);
+        let right_text = format!("{}{meta}{}", " ".repeat(gap_w), " ".repeat(trailing_w));
+        Line::from(vec![
+            Span::styled(" ", row_style),
+            Span::styled(badge, badge_style),
+            Span::styled(format!(" {trunc_name}"), row_style),
+            Span::styled(right_text, meta_style),
+        ])
+    } else {
+        let name_budget = total_w.saturating_sub(prefix_w);
+        let trunc_name = truncate_width(&name_display, name_budget);
+        Line::from(vec![
+            Span::styled(" ", row_style),
+            Span::styled(badge, badge_style),
+            Span::styled(format!(" {trunc_name}"), row_style),
+        ])
+    }
+}
+
+fn push_capped_raw_preview_lines(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    total_lines: usize,
+    theme: &crate::ui::theme::Theme,
+) {
+    for raw_line in content.lines().take(RAW_PREVIEW_LINE_CAP) {
+        lines.push(Line::from(Span::styled(
+            format!(" {raw_line}"),
+            Style::default().fg(theme.fg_primary),
+        )));
+    }
+    if total_lines > RAW_PREVIEW_LINE_CAP {
+        let remaining = total_lines - RAW_PREVIEW_LINE_CAP;
+        lines.push(Line::from(Span::styled(
+            format!(" … ({remaining} more lines omitted — press 'o' or download for full file)"),
+            theme.muted_style(),
+        )));
     }
 }
 
@@ -1501,5 +1586,248 @@ $$
         assert!(!screen.contains("---"), "inspector leaked raw ---:\n{screen}");
         assert!(!screen.contains("<br"), "inspector leaked raw <br>:\n{screen}");
         assert!(!screen.contains("<a href"), "inspector leaked raw <a href>:\n{screen}");
+    }
+
+    fn render_list_to_string(
+        app: &AppState,
+        ui: &mut UiState,
+        width: u16,
+        height: u16,
+    ) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        let mut hitmap = HitMap::new();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw_list(frame, area, app, ui, &mut hitmap);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        let mut lines = Vec::with_capacity(height as usize);
+        for y in 0..height {
+            let mut row = String::new();
+            for x in 0..width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            lines.push(row);
+        }
+        lines.join("\n")
+    }
+
+    fn collapse_ws(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[tokio::test]
+    async fn drive_view_32_col_empty_folder_and_unselected_notices_wrap_without_clipping() {
+        let (mut app, mut ui, _rx) = build_test_app_and_ui();
+        app.active_source = crate::ui::app::ActiveViewSource::Drive {
+            drive_id: "d1".into(),
+            label: "Docs".into(),
+        };
+        app.current_items.clear();
+        app.loading_folder = false;
+
+        // 1. Empty folder notice at 32 cols must wrap across multiple rows without clipping.
+        let list_screen = render_list_to_string(&app, &mut ui, 32, 12);
+        let list_norm = collapse_ws(&list_screen);
+        assert!(
+            list_norm.contains("(Empty folder — press Ctrl+F to upload or n to create a folder)"),
+            "empty folder notice clipped at 32 cols:\n{list_screen}"
+        );
+
+        // 2. Unselected inspector notice at 32 cols must wrap without clipping.
+        app.active_selected_id = None;
+        let mut hitmap = HitMap::new();
+        let insp_screen = render_inspector_to_string(&app, &mut ui, &mut hitmap, 32, 12);
+        let insp_norm = collapse_ws(&insp_screen);
+        assert!(
+            insp_norm.contains(
+                "Select a file or folder to inspect metadata, preview images, or read text"
+            ),
+            "unselected inspector notice clipped at 32 cols:\n{insp_screen}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_view_32_col_file_rows_never_exceed_area_width() {
+        let (mut app, mut ui, _rx) = build_test_app_and_ui();
+        app.active_source = crate::ui::app::ActiveViewSource::Drive {
+            drive_id: "d1".into(),
+            label: "Docs".into(),
+        };
+
+        let items = vec![
+            DriveItem {
+                id: "f-ascii".into(),
+                drive_id: "d1".into(),
+                name: "Quarterly_Financial_Review_2026_Final.pdf".into(),
+                size: 1_572_864,
+                last_modified_at: Some("2026-11-25T10:30:00Z".into()),
+                ..Default::default()
+            },
+            DriveItem {
+                id: "f-cjk".into(),
+                drive_id: "d1".into(),
+                name: "2026년_분기별_매출_보고서_최종본.xlsx".into(),
+                size: 48_128,
+                last_modified_at: Some("2026-11-25T10:30:00Z".into()),
+                ..Default::default()
+            },
+            DriveItem {
+                id: "d-folder".into(),
+                drive_id: "d1".into(),
+                name: "프로젝트_설계_문서함".into(),
+                is_folder: true,
+                child_count: Some(128),
+                last_modified_at: Some("2026-11-25T10:30:00Z".into()),
+                ..Default::default()
+            },
+            DriveItem {
+                id: "f-short".into(),
+                drive_id: "d1".into(),
+                name: "a.txt".into(),
+                size: 42,
+                last_modified_at: None,
+                ..Default::default()
+            },
+        ];
+
+        // Width invariant across narrow, boundary, and wide widths
+        for item in &items {
+            for width in [8usize, 12, 20, 32, 39, 40, 54, 100] {
+                let line = build_file_row_line(
+                    item,
+                    width,
+                    Style::default(),
+                    Style::default(),
+                    Style::default(),
+                );
+                assert!(
+                    line.width() <= width,
+                    "item `{}` exceeded width {width}: got {} (`{}`)",
+                    item.name,
+                    line.width(),
+                    line
+                );
+            }
+        }
+
+        // At 32 cols: date_str is omitted, size_str remains cleanly visible inside 32 cols
+        app.current_items = items;
+        ui.density = DensityMode::Compact;
+        let narrow_screen = render_list_to_string(&app, &mut ui, 32, 12);
+        assert!(narrow_screen.contains("1.5 MiB"), "{narrow_screen}");
+        assert!(narrow_screen.contains("47.0 KiB"), "{narrow_screen}");
+        assert!(narrow_screen.contains("128 items"), "{narrow_screen}");
+        assert!(narrow_screen.contains("42 B"), "{narrow_screen}");
+        assert!(
+            !narrow_screen.contains("2026-11-25"),
+            "date should be omitted at width < 40:\n{narrow_screen}"
+        );
+
+        // At 54 cols: both size and date render without clipping
+        let wide_screen = render_list_to_string(&app, &mut ui, 54, 12);
+        assert!(wide_screen.contains("1.5 MiB"), "{wide_screen}");
+        assert!(wide_screen.contains("2026-11-25"), "{wide_screen}");
+    }
+
+    #[tokio::test]
+    async fn drive_view_raw_preview_600_lines_appends_explicit_omission_banner() {
+        let content_600: String = (1..=600)
+            .map(|i| format!("line-{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 1. Plain text file at 32 cols scrolled to bottom: line-500 visible, line-501 absent,
+        //    explicit omission banner with remaining count (100) present and unwrapped-lossless.
+        let (mut app, mut ui, _rx) = build_test_app_and_ui();
+        let txt_item = DriveItem {
+            id: "txt-600".into(),
+            drive_id: "d1".into(),
+            name: "server.log".into(),
+            size: content_600.len() as u64,
+            ..Default::default()
+        };
+        app.current_items = vec![txt_item.clone()];
+        app.active_selected_id = Some(txt_item.id.clone());
+        app.set_text_preview(
+            txt_item.effective_drive_id(),
+            &txt_item.id,
+            content_600.clone(),
+        );
+
+        ui.inspector_scroll.offset = usize::MAX;
+        let mut hitmap = HitMap::new();
+        let txt_screen = render_inspector_to_string(&app, &mut ui, &mut hitmap, 32, 20);
+        let txt_norm = collapse_ws(&txt_screen);
+        assert!(txt_norm.contains("line-500"), "{txt_screen}");
+        assert!(!txt_norm.contains("line-501"), "{txt_screen}");
+        assert!(
+            txt_norm.contains(
+                "… (100 more lines omitted — press 'o' or download for full file)"
+            ),
+            "expected explicit omission banner for 600-line plain text:\n{txt_screen}"
+        );
+
+        // 2. Markdown file in Raw mode (`render_markup = false`) at 32 cols also shows banner.
+        let md_item = DriveItem {
+            id: "md-600".into(),
+            drive_id: "d1".into(),
+            name: "SPEC.md".into(),
+            size: content_600.len() as u64,
+            ..Default::default()
+        };
+        app.current_items = vec![md_item.clone()];
+        app.active_selected_id = Some(md_item.id.clone());
+        app.set_text_preview(
+            md_item.effective_drive_id(),
+            &md_item.id,
+            content_600,
+        );
+        ui.render_markup = false;
+        ui.inspector_scroll.offset = usize::MAX;
+
+        let mut md_hitmap = HitMap::new();
+        let md_screen = render_inspector_to_string(&app, &mut ui, &mut md_hitmap, 32, 20);
+        let md_norm = collapse_ws(&md_screen);
+        assert!(md_norm.contains("line-500"), "{md_screen}");
+        assert!(!md_norm.contains("line-501"), "{md_screen}");
+        assert!(
+            md_norm.contains(
+                "… (100 more lines omitted — press 'o' or download for full file)"
+            ),
+            "expected explicit omission banner for 600-line raw markdown:\n{md_screen}"
+        );
+
+        // 3. Exactly 500 lines must NOT append an omission banner.
+        let content_500: String = (1..=500)
+            .map(|i| format!("line-{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let exact_item = DriveItem {
+            id: "txt-500".into(),
+            drive_id: "d1".into(),
+            name: "exact.txt".into(),
+            size: content_500.len() as u64,
+            ..Default::default()
+        };
+        app.current_items = vec![exact_item.clone()];
+        app.active_selected_id = Some(exact_item.id.clone());
+        app.set_text_preview(
+            exact_item.effective_drive_id(),
+            &exact_item.id,
+            content_500,
+        );
+        ui.inspector_scroll.offset = usize::MAX;
+
+        let mut exact_hitmap = HitMap::new();
+        let exact_screen = render_inspector_to_string(&app, &mut ui, &mut exact_hitmap, 32, 20);
+        let exact_norm = collapse_ws(&exact_screen);
+        assert!(exact_norm.contains("line-500"), "{exact_screen}");
+        assert!(
+            !exact_norm.contains("more lines omitted"),
+            "500-line file must not show omission banner:\n{exact_screen}"
+        );
     }
 }
