@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use bitefoundry_html::{HtmlEffect, HtmlTheme, HtmlViewSession};
+use bitefoundry_html::{ContentKind, HtmlEffect, HtmlTheme, HtmlViewSession, SourceKind};
 use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style},
@@ -54,6 +54,7 @@ impl fmt::Debug for HtmlPreviewOverlay {
             .field("item_id", &self.item_id)
             .field("revision", &self.revision)
             .field("title", &self.title)
+            .field("source_kind", &self.session.source_kind())
             .field("raw_mode", &self.session.raw_mode)
             .field("scroll_y", &self.session.scroll_y)
             .field("js_active", &self.session.js_active)
@@ -64,20 +65,45 @@ impl fmt::Debug for HtmlPreviewOverlay {
 }
 
 impl HtmlPreviewOverlay {
-    pub fn new(title: impl Into<String>, raw_html: String, item_id: Option<String>) -> Self {
-        let title_str = title.into();
-        let session = HtmlViewSession::new(Some(title_str.clone()), raw_html);
+    fn from_session(title: String, session: HtmlViewSession, item_id: Option<String>) -> Self {
         Self {
             drive_id: None,
             item_id,
             revision: None,
-            title: title_str,
+            title,
             session,
             viewport: Rect::default(),
             max_scroll_y: 0,
             graphic_cache: HashMap::new(),
             graphic_cache_env: None,
         }
+    }
+
+    pub fn new(title: impl Into<String>, raw_html: String, item_id: Option<String>) -> Self {
+        let title_str = title.into();
+        let session = HtmlViewSession::new(Some(title_str.clone()), raw_html);
+        Self::from_session(title_str, session, item_id)
+    }
+
+    pub fn new_markdown(
+        title: impl Into<String>,
+        raw_md: String,
+        item_id: Option<String>,
+    ) -> Self {
+        let title_str = title.into();
+        let session = HtmlViewSession::new_markdown(Some(title_str.clone()), raw_md);
+        Self::from_session(title_str, session, item_id)
+    }
+
+    pub fn from_content(
+        title: impl Into<String>,
+        kind: ContentKind,
+        raw: String,
+        item_id: Option<String>,
+    ) -> Self {
+        let title_str = title.into();
+        let session = HtmlViewSession::from_content(Some(title_str.clone()), kind, raw);
+        Self::from_session(title_str, session, item_id)
     }
 
     pub fn with_source(mut self, drive_id: impl Into<String>, revision: impl Into<String>) -> Self {
@@ -310,7 +336,7 @@ impl HtmlPreviewOverlay {
             | Action::OpenActiveWebUrl
             | Action::ServeActiveHtml => OverlayOutcome::Dispatch(Action::ServeHtmlInBrowser {
                 title: self.title.clone(),
-                html: self.session.raw_html().to_string(),
+                html: self.session.serve_html(),
             }),
             Action::MoveUp | Action::Input('k') => {
                 self.session.scroll_y = self.session.scroll_y.saturating_sub(2);
@@ -398,13 +424,19 @@ impl HtmlPreviewOverlay {
             0
         };
 
-        let js_badge = if self.session.js_active {
-            "⚡ JS"
-        } else {
-            "Static"
+        let (kind_prefix, mode_badge) = match self.session.source_kind() {
+            SourceKind::Markdown => ("MD", "Markdown"),
+            SourceKind::Html => (
+                "HTML",
+                if self.session.js_active {
+                    "⚡ JS"
+                } else {
+                    "Static"
+                },
+            ),
         };
         let title_budget = rect.width.saturating_sub(2 + right_pills_w) as usize;
-        let title = format!(" HTML: {} · {js_badge} ", self.title);
+        let title = format!(" {kind_prefix}: {} · {mode_badge} ", self.title);
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -651,7 +683,14 @@ impl HtmlPreviewOverlay {
                 format!(" {} controls  |  ", control_count)
             };
             let hints = if self.session.raw_mode {
-                "Raw HTML · m Rendered · o Serve · j/k/Wheel Scroll · Esc Close"
+                match self.session.source_kind() {
+                    SourceKind::Markdown => {
+                        "Raw Markdown · m Rendered · o Serve · j/k/Wheel Scroll · Esc Close"
+                    }
+                    SourceKind::Html => {
+                        "Raw HTML · m Rendered · o Serve · j/k/Wheel Scroll · Esc Close"
+                    }
+                }
             } else {
                 "Tab Focus · Enter/Space/Click Activate · m Raw · o Serve · j/k Scroll · Esc Close"
             };
@@ -1034,5 +1073,56 @@ mod tests {
             })
             .unwrap();
         assert!(buffer_text(&terminal).contains("Clicked Pixel"));
+    }
+
+    #[test]
+    fn markdown_overlay_renders_toggles_raw_and_serves_html_document() {
+        let md = "# Release Notes\n\nCheck **bold** and [Docs](https://example.com/docs).\n";
+        let (app, mut ui) = test_app_and_ui();
+        let mut overlay = HtmlPreviewOverlay::from_content(
+            "README.md",
+            ContentKind::Markdown,
+            md.to_string(),
+            Some("md-1".into()),
+        );
+        assert_eq!(overlay.session.source_kind(), SourceKind::Markdown);
+        assert!(!overlay.session.js_active);
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let mut hitmap = HitMap::new();
+        terminal
+            .draw(|frame| {
+                overlay.draw(frame, frame.area(), &app, &mut ui, &mut hitmap);
+            })
+            .unwrap();
+        let rendered_screen = buffer_text(&terminal);
+        assert!(rendered_screen.contains("MD: README.md"), "{rendered_screen}");
+        assert!(rendered_screen.contains("Release Notes"), "{rendered_screen}");
+        assert!(!rendered_screen.contains("**bold**"), "{rendered_screen}");
+
+        // `m` toggles to Raw Markdown
+        overlay.handle(&Action::Input('m'), &ui);
+        assert!(overlay.session.raw_mode);
+        terminal
+            .draw(|frame| {
+                hitmap.clear();
+                overlay.draw(frame, frame.area(), &app, &mut ui, &mut hitmap);
+            })
+            .unwrap();
+        let raw_screen = buffer_text(&terminal);
+        assert!(raw_screen.contains("# Release Notes"), "{raw_screen}");
+        assert!(raw_screen.contains("Raw Markdown"), "{raw_screen}");
+
+        // `o` dispatches compiled standalone HTML via `session.serve_html()`
+        let serve_out = overlay.handle(&Action::Input('o'), &ui);
+        match serve_out {
+            OverlayOutcome::Dispatch(Action::ServeHtmlInBrowser { title, html }) => {
+                assert_eq!(title, "README.md");
+                assert!(html.contains("<!DOCTYPE html>"), "{html}");
+                assert!(html.contains("<h1>Release Notes</h1>"), "{html}");
+                assert!(html.contains("<strong>bold</strong>"), "{html}");
+            }
+            other => panic!("expected ServeHtmlInBrowser dispatch, got {other:?}"),
+        }
     }
 }

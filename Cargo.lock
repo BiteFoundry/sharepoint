@@ -3265,7 +3265,6 @@ dependencies = [
  "keyring",
  "notify-rust",
  "open",
- "pulldown-cmark",
  "rand 0.8.8",
  "ratatui",
  "reqwest",

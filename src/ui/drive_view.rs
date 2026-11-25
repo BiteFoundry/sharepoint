@@ -1388,4 +1388,118 @@ mod tests {
         assert!(matches!(ui.overlays.last(), Some(crate::ui::overlays::Overlay::Settings(_))));
         ui.pop_overlay();
     }
+
+    #[tokio::test]
+    async fn inspector_markdown_frontmatter_math_footnotes_table_br() {
+        let md = "\
+---
+title: Quarterly Spec
+tags: [track-c, markdown]
+---
+
+# Overview
+
+See <a href=\"https://contoso.sharepoint.com/spec\">SharePoint Spec</a> and note[^1].
+
+$$
+a
++b
+$$
+
+| Feature | Notes |
+| :--- | :--- |
+| **Bold** `code`<br>Line2 | Multi-line cell |
+
+[^1]: Footnote explanation body.
+";
+
+        // 1. Direct `markup::render_markdown` checks for multiline math, multiline table cell,
+        //    style retention, footnotes, and zero raw markup leakage.
+        let theme = crate::ui::theme::Theme::midnight_dark();
+        let rendered_lines = markup::render_markdown(md, 80, &theme, false);
+        let plain: String = rendered_lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(plain.contains("title: Quarterly Spec"), "{plain}");
+        assert!(plain.contains("tags: [track-c, markdown]"), "{plain}");
+        assert!(plain.contains("SharePoint Spec"), "{plain}");
+        assert!(plain.contains("[^1]"), "{plain}");
+        assert!(plain.contains("Footnote explanation body."), "{plain}");
+        assert!(plain.contains("┌─ math"), "{plain}");
+        assert!(plain.contains("Bold"), "{plain}");
+        assert!(plain.contains("code"), "{plain}");
+        assert!(plain.contains("Line2"), "{plain}");
+
+        assert!(!plain.contains("---"), "raw frontmatter --- leaked:\n{plain}");
+        assert!(!plain.contains("<br"), "raw <br> leaked:\n{plain}");
+        assert!(!plain.contains("<a href"), "raw <a href> leaked:\n{plain}");
+        assert!(!plain.contains("$$"), "raw $$ leaked:\n{plain}");
+
+        let math_a_line = rendered_lines
+            .iter()
+            .position(|l| l.to_string().contains("│ a"))
+            .expect("expected math line `a`");
+        let math_b_line = rendered_lines
+            .iter()
+            .position(|l| l.to_string().contains("│ +b"))
+            .expect("expected math line `+b`");
+        assert!(
+            math_b_line > math_a_line,
+            "multiline DisplayMath must render on separate lines:\n{plain}"
+        );
+
+        let cell_bold_line = rendered_lines
+            .iter()
+            .position(|l| l.to_string().contains("Bold"))
+            .expect("expected table cell Bold line");
+        let cell_line2_line = rendered_lines
+            .iter()
+            .position(|l| l.to_string().contains("Line2"))
+            .expect("expected table cell Line2 line");
+        assert!(
+            cell_line2_line > cell_bold_line,
+            "table cell <br> must split onto a second row:\n{plain}"
+        );
+        let has_bold_in_cell = rendered_lines[cell_bold_line].spans.iter().any(|s| {
+            s.content.contains("Bold")
+                && s.style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+        });
+        assert!(has_bold_in_cell, "table cell must preserve BOLD style");
+
+        // 2. Full end-to-end Inspector rendering via `CachedMarkupPreview`.
+        let (mut app, mut ui, _rx) = build_test_app_and_ui();
+        let md_item = DriveItem {
+            id: "md-ssot-1".into(),
+            drive_id: "d1".into(),
+            name: "SPEC.md".into(),
+            size: md.len() as u64,
+            ..Default::default()
+        };
+        app.current_items = vec![md_item.clone()];
+        app.active_selected_id = Some(md_item.id.clone());
+        app.set_text_preview(md_item.effective_drive_id(), &md_item.id, md.to_string());
+
+        let mut hitmap = HitMap::new();
+        let screen = render_inspector_to_string(&app, &mut ui, &mut hitmap, 90, 48);
+        assert!(screen.contains("title: Quarterly Spec"), "{screen}");
+        assert!(screen.contains("SharePoint Spec"), "{screen}");
+        assert!(screen.contains("┌─ math"), "{screen}");
+        assert!(screen.contains("│ a"), "{screen}");
+        assert!(screen.contains("│ +b"), "{screen}");
+        assert!(screen.contains("Line2"), "{screen}");
+        assert!(screen.contains("Footnote explanation body."), "{screen}");
+        assert!(!screen.contains("---"), "inspector leaked raw ---:\n{screen}");
+        assert!(!screen.contains("<br"), "inspector leaked raw <br>:\n{screen}");
+        assert!(!screen.contains("<a href"), "inspector leaked raw <a href>:\n{screen}");
+    }
 }
