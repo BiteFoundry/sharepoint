@@ -55,9 +55,17 @@ impl Keymap {
         map.bind(Some(Focus::Overlay), Delete, M::NONE, Action::DeleteForward);
 
         // --- Browse modes (Nav / List / Inspector) ---
-        map.bind(Some(Focus::Nav), Char('l'), M::NONE, Action::Activate);
-        map.bind(Some(Focus::Nav), Right, M::NONE, Action::Activate);
+        // Sidebar tree: Right / l expands (never collapses), Left / h collapses or steps out
+        // to the parent row; Enter / Space toggle.
+        map.bind(Some(Focus::Nav), Char('l'), M::NONE, Action::NavExpand);
+        map.bind(Some(Focus::Nav), Right, M::NONE, Action::NavExpand);
+        map.bind(Some(Focus::Nav), Char('h'), M::NONE, Action::NavCollapse);
+        map.bind(Some(Focus::Nav), Left, M::NONE, Action::NavCollapse);
         map.bind(Some(Focus::Nav), Char(' '), M::NONE, Action::Activate);
+
+        // File list: Right / l opens the selected folder, mirroring Left / Backspace (up).
+        map.bind(Some(Focus::List), Right, M::NONE, Action::Activate);
+        map.bind(Some(Focus::List), Char('l'), M::NONE, Action::Activate);
 
         for focus in [Focus::List, Focus::Inspector] {
             map.bind(Some(focus), Backspace, M::NONE, Action::NavigateUp);

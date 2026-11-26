@@ -10,7 +10,7 @@ use super::app::{
     copy_text_to_clipboard, ActiveViewSource, AppState, Focus, LoadMoreOutcome, LocalUploadPreview,
     NarrowPane, UiMsg, UiState,
 };
-use super::drive_view::inspector_body_height;
+use super::drive_view::{inspector_body_height, list_visible_items};
 use super::hitmap::{ButtonId, HitTarget};
 use super::nav_pane::{build_nav_rows, NavRow};
 use super::overlays::context_menu::{ContextMenu, ContextTarget};
@@ -54,6 +54,11 @@ pub enum Action {
         row: u16,
     },
     Activate,
+    /// Sidebar: expand the selected section or site (never collapses), step into an already
+    /// expanded one, or open a leaf row.
+    NavExpand,
+    /// Sidebar: collapse the selected section or site, or step out to its parent row.
+    NavCollapse,
     NavigateUp,
     OpenOneDriveRoot,
     OpenRecent,
@@ -367,14 +372,22 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
             }
             Focus::Overlay => {}
         },
-        Action::ScrollPageUp => {
-            let vh = inspector_body_height(ui.inspector_scroll.area).max(4);
-            ui.inspector_scroll.scroll_up(vh / 2);
-        }
-        Action::ScrollPageDown => {
-            let vh = inspector_body_height(ui.inspector_scroll.area).max(4);
-            ui.inspector_scroll.scroll_down(vh / 2, vh);
-        }
+        Action::ScrollPageUp => match ui.focus {
+            Focus::List => page_list_selection(-1, app, ui),
+            Focus::Nav => page_nav_selection(-1, app, ui),
+            Focus::Inspector | Focus::Overlay => {
+                let vh = inspector_body_height(ui.inspector_scroll.area).max(4);
+                ui.inspector_scroll.scroll_up(vh / 2);
+            }
+        },
+        Action::ScrollPageDown => match ui.focus {
+            Focus::List => page_list_selection(1, app, ui),
+            Focus::Nav => page_nav_selection(1, app, ui),
+            Focus::Inspector | Focus::Overlay => {
+                let vh = inspector_body_height(ui.inspector_scroll.area).max(4);
+                ui.inspector_scroll.scroll_down(vh / 2, vh);
+            }
+        },
         Action::ScrollTop => match ui.focus {
             Focus::List => select_list_index(0, app, ui),
             Focus::Inspector => ui.inspector_scroll.top(),
@@ -456,8 +469,25 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
             }
             Focus::Overlay => {}
         },
+        Action::NavExpand => {
+            if ui.focus == Focus::Nav {
+                expand_nav_row(ui.nav_selected, app, ui);
+            }
+        }
+        Action::NavCollapse => {
+            if ui.focus == Focus::Nav {
+                collapse_nav_row(ui.nav_selected, app, ui);
+            }
+        }
         Action::NavigateUp => {
             if app.folder_stack.pop().is_some() {
+                // Leaving the top folder of a hop into another drive returns to the view the
+                // hop started from: that drive's root is usually not readable (403).
+                if app.folder_stack.is_empty() {
+                    if let Some(origin) = app.origin_source.take() {
+                        app.active_source = origin;
+                    }
+                }
                 app.navigate_to_active_folder(ui);
             } else if ui.focus == Focus::Inspector {
                 ui.focus = Focus::List;
@@ -467,6 +497,7 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
         Action::OpenOneDriveRoot => {
             app.initial_persona_library_selected = true;
             app.active_source = ActiveViewSource::OneDriveRoot;
+            app.origin_source = None;
             app.folder_stack.clear();
             ui.focus = Focus::List;
             app.navigate_to_active_folder(ui);
@@ -474,6 +505,7 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
         Action::OpenRecent => {
             app.initial_persona_library_selected = true;
             app.active_source = ActiveViewSource::Recent;
+            app.origin_source = None;
             app.folder_stack.clear();
             ui.focus = Focus::List;
             app.navigate_to_active_folder(ui);
@@ -481,6 +513,7 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
         Action::OpenSharedWithMe => {
             app.initial_persona_library_selected = true;
             app.active_source = ActiveViewSource::SharedWithMe;
+            app.origin_source = None;
             app.folder_stack.clear();
             ui.focus = Focus::List;
             app.navigate_to_active_folder(ui);
@@ -488,6 +521,7 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
         Action::SelectDrive { drive_id, label } => {
             app.initial_persona_library_selected = true;
             app.active_source = ActiveViewSource::Drive { drive_id, label };
+            app.origin_source = None;
             app.folder_stack.clear();
             ui.focus = Focus::List;
             app.navigate_to_active_folder(ui);
@@ -1076,6 +1110,7 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
                     drive_id: target_drive,
                     label: "Search Result".to_string(),
                 };
+                app.origin_source = None;
                 app.folder_stack.clear();
                 app.reset_folder_listing_state();
                 app.sync_ctrl.set_focus(FocusTarget::default());
@@ -1199,10 +1234,26 @@ fn open_folder_item(item: &crate::models::DriveItem, app: &mut AppState, ui: &mu
     let target_drive = item.effective_drive_id().to_string();
     let leave_search = matches!(app.active_source, ActiveViewSource::SearchResult { .. });
     if leave_search || app.active_drive_id().as_deref() != Some(target_drive.as_str()) {
+        // A folder opened from Recent / Shared with Me, or one living in a drive outside the
+        // sidebar (a `remoteItem` shortcut), remembers where it was opened from, so going up
+        // past it returns there instead of listing a drive root the user cannot read.
+        let from_list_view = matches!(
+            app.active_source,
+            ActiveViewSource::Recent | ActiveViewSource::SharedWithMe
+        );
+        let origin = if from_list_view || !app.is_known_drive(&target_drive) {
+            app.return_source_for_hop()
+        } else {
+            None
+        };
+        let label = app
+            .known_drive_label(&target_drive)
+            .unwrap_or_else(|| item.name.clone());
         app.active_source = ActiveViewSource::Drive {
             drive_id: target_drive,
-            label: item.name.clone(),
+            label,
         };
+        app.origin_source = origin;
         app.folder_stack.clear();
     }
     app.folder_stack
@@ -1233,9 +1284,10 @@ fn select_list_index(idx: usize, app: &mut AppState, ui: &mut UiState) {
 /// Applies one activation of a SharePoint site row and returns whether its libraries must
 /// be fetched.
 ///
-/// A site whose libraries are not loaded renders as expanded-but-empty, so its first
-/// activation must load them and leave the row expanded (toggling here would collapse an
-/// empty row and need a second activation). Only a loaded site toggles collapse.
+/// A site whose libraries are not loaded yet (past the sidebar prefetch, or a failed load)
+/// renders collapsed (`▸`); its activation loads them and marks the row expanded so it opens
+/// once they arrive (toggling here would collapse it and need a second activation). Only a
+/// loaded site toggles collapse.
 pub(crate) fn site_row_activation(
     collapsed_sites: &mut std::collections::HashSet<String>,
     site_id: &str,
@@ -1249,6 +1301,153 @@ pub(crate) fn site_row_activation(
         collapsed_sites.insert(site_id.to_string());
     }
     false
+}
+
+/// Loads a site's document libraries for the sidebar. A failure is shown rather than dropped;
+/// the row stays collapsed (`▸`) and activating it again retries.
+fn spawn_site_drives_load(app: &AppState, site_id: String, label: String) {
+    let graph = app.graph.clone();
+    let storage = app.storage.clone();
+    let tx = app.ui_tx.clone();
+    tokio::spawn(async move {
+        match graph.list_site_drives(&site_id, Some(&label)).await {
+            Ok(drives) => {
+                let _ = storage.upsert_drives(&drives);
+                let _ = tx.send(UiMsg::SiteDrivesLoaded { site_id, drives });
+            }
+            Err(err) => {
+                let _ = tx.send(UiMsg::Toast {
+                    message: format!("Libraries for {label} failed to load: {err:#}"),
+                    kind: ToastKind::Error,
+                });
+            }
+        }
+    });
+}
+
+/// Moves the file-list selection one visible page (`direction` 1 = down, -1 = up).
+fn page_list_selection(direction: i32, app: &mut AppState, ui: &mut UiState) {
+    let len = app.current_items.len();
+    if len == 0 {
+        return;
+    }
+    let page = list_visible_items(ui.list_scroll.area, ui.density);
+    let cur = ui.list_scroll.selected_idx.unwrap_or(0).min(len - 1);
+    let next = if direction < 0 {
+        cur.saturating_sub(page)
+    } else {
+        cur.saturating_add(page).min(len - 1)
+    };
+    select_list_index(next, app, ui);
+}
+
+/// Moves the sidebar selection one visible page (`direction` 1 = down, -1 = up).
+fn page_nav_selection(direction: i32, app: &AppState, ui: &mut UiState) {
+    let rows = build_nav_rows(app, ui);
+    if rows.is_empty() {
+        return;
+    }
+    let page = (ui.nav_area.height.saturating_sub(2) as usize).max(1);
+    let cur = ui.nav_selected.min(rows.len() - 1);
+    ui.nav_selected = if direction < 0 {
+        cur.saturating_sub(page)
+    } else {
+        cur.saturating_add(page).min(rows.len() - 1)
+    };
+}
+
+/// `Right` / `l` in the sidebar: expands a collapsed section or site (loading the site's
+/// libraries when needed), steps into an expanded one, and opens a leaf row. It never
+/// collapses anything; `Left` / `h` does that.
+fn expand_nav_row(row_idx: usize, app: &mut AppState, ui: &mut UiState) {
+    let rows = build_nav_rows(app, ui);
+    let Some(row) = rows.get(row_idx).cloned() else {
+        return;
+    };
+    match row {
+        NavRow::SectionHeader {
+            section_id,
+            collapsed,
+            ..
+        } => {
+            if collapsed {
+                ui.collapsed_sections.remove(section_id);
+            } else if rows.len() > row_idx + 1
+                && !matches!(rows[row_idx + 1], NavRow::SectionHeader { .. })
+            {
+                ui.nav_selected = row_idx + 1;
+            }
+        }
+        NavRow::SharePointSite {
+            site_id,
+            label,
+            collapsed,
+            ..
+        } => {
+            if !app.site_drives.contains_key(&site_id) {
+                ui.collapsed_sites.remove(&site_id);
+                spawn_site_drives_load(app, site_id, label);
+            } else if collapsed {
+                ui.collapsed_sites.remove(&site_id);
+            } else if matches!(rows.get(row_idx + 1), Some(NavRow::SharePointLibrary { .. })) {
+                ui.nav_selected = row_idx + 1;
+            }
+        }
+        NavRow::OneDriveMyFiles
+        | NavRow::OneDriveRecent
+        | NavRow::OneDriveShared
+        | NavRow::SharePointLibrary { .. }
+        | NavRow::PinnedItem { .. } => activate_nav_row(row_idx, app, ui),
+    }
+}
+
+/// `Left` / `h` in the sidebar: collapses an expanded section or site; on a collapsed one,
+/// or on a row inside one, moves the selection to the parent row (library -> site,
+/// site / OneDrive / pinned row -> section header).
+fn collapse_nav_row(row_idx: usize, app: &AppState, ui: &mut UiState) {
+    let rows = build_nav_rows(app, ui);
+    let Some(row) = rows.get(row_idx) else {
+        return;
+    };
+    let parent_where = |pred: &dyn Fn(&NavRow) -> bool| {
+        rows[..row_idx].iter().rposition(|r| pred(r))
+    };
+    let is_section = |r: &NavRow| matches!(r, NavRow::SectionHeader { .. });
+    match row {
+        NavRow::SectionHeader {
+            section_id,
+            collapsed,
+            ..
+        } => {
+            if !*collapsed {
+                ui.collapsed_sections.insert(*section_id);
+            }
+        }
+        NavRow::SharePointSite {
+            site_id, collapsed, ..
+        } => {
+            if !*collapsed {
+                ui.collapsed_sites.insert(site_id.clone());
+            } else if let Some(parent) = parent_where(&is_section) {
+                ui.nav_selected = parent;
+            }
+        }
+        NavRow::SharePointLibrary { site_id, .. } => {
+            let is_parent_site =
+                |r: &NavRow| matches!(r, NavRow::SharePointSite { site_id: sid, .. } if sid == site_id);
+            if let Some(parent) = parent_where(&is_parent_site) {
+                ui.nav_selected = parent;
+            }
+        }
+        NavRow::OneDriveMyFiles
+        | NavRow::OneDriveRecent
+        | NavRow::OneDriveShared
+        | NavRow::PinnedItem { .. } => {
+            if let Some(parent) = parent_where(&is_section) {
+                ui.nav_selected = parent;
+            }
+        }
+    }
 }
 
 fn activate_nav_row(row_idx: usize, app: &mut AppState, ui: &mut UiState) {
@@ -1274,15 +1473,7 @@ fn activate_nav_row(row_idx: usize, app: &mut AppState, ui: &mut UiState) {
         NavRow::SharePointSite { site_id, label, .. } => {
             let drives_loaded = app.site_drives.contains_key(&site_id);
             if site_row_activation(&mut ui.collapsed_sites, &site_id, drives_loaded) {
-                let graph = app.graph.clone();
-                let storage = app.storage.clone();
-                let tx = app.ui_tx.clone();
-                tokio::spawn(async move {
-                    if let Ok(drives) = graph.list_site_drives(&site_id, Some(&label)).await {
-                        let _ = storage.upsert_drives(&drives);
-                        let _ = tx.send(UiMsg::SiteDrivesLoaded { site_id, drives });
-                    }
-                });
+                spawn_site_drives_load(app, site_id, label);
             }
         }
         NavRow::SharePointLibrary {
@@ -1298,10 +1489,21 @@ fn activate_nav_row(row_idx: usize, app: &mut AppState, ui: &mut UiState) {
         } => {
             if let Some(did) = drive_id {
                 app.initial_persona_library_selected = true;
+                // A pinned folder in a drive outside the sidebar (pinned from Shared with Me)
+                // goes back to the view it was opened from, never to that drive's root.
+                let origin = if item_id.is_some() && !app.is_known_drive(&did) {
+                    app.return_source_for_hop()
+                } else {
+                    None
+                };
+                let drive_label = app
+                    .known_drive_label(&did)
+                    .unwrap_or_else(|| label.clone());
                 app.active_source = ActiveViewSource::Drive {
                     drive_id: did,
-                    label: label.clone(),
+                    label: drive_label,
                 };
+                app.origin_source = origin;
                 app.folder_stack.clear();
                 if let Some(iid) = item_id {
                     app.folder_stack.push((iid, label));
@@ -2097,5 +2299,449 @@ mod tests {
             }
             other => panic!("expected Help overlay, got {other:?}"),
         }
+    }
+
+    type NudgeRx = tokio::sync::mpsc::UnboundedReceiver<crate::sync::SyncCommand>;
+
+    /// Like `build_action_test_env`, but keeps the sync request channel (to check which
+    /// folders were asked for) and can point Graph at a local mock.
+    fn build_nav_test_env(
+        base_url: Option<&str>,
+    ) -> (
+        super::AppState,
+        super::UiState,
+        tokio::sync::mpsc::UnboundedReceiver<super::UiMsg>,
+        NudgeRx,
+    ) {
+        use crate::{
+            auth::{AuthManager, StoredTokens},
+            config::{AppConfig, Persona},
+            graph::GraphClient,
+            storage::Storage,
+            sync::{FocusTarget, SyncCommand, SyncController},
+        };
+        let mut cfg = AppConfig::default();
+        let auth = match base_url {
+            Some(url) => {
+                cfg.graph_base_url = url.to_string();
+                AuthManager::from_tokens(
+                    cfg.clone(),
+                    StoredTokens {
+                        access_token: "test-token".into(),
+                        refresh_token: None,
+                        expires_at: chrono::Utc::now().timestamp() + 3600,
+                        client_id: "cid".into(),
+                        tenant_id: "tid".into(),
+                        user_id: Some("u1".into()),
+                        user_display_name: None,
+                        user_email: None,
+                        auth_mode: "test".into(),
+                    },
+                )
+            }
+            None => AuthManager::empty_for_test(cfg.clone()),
+        };
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(FocusTarget::default());
+        let (nudge_tx, nudge_rx) = tokio::sync::mpsc::unbounded_channel::<SyncCommand>();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx);
+        let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel::<super::UiMsg>();
+        let ui = super::UiState::from_config(&cfg);
+        let app = super::AppState::new(cfg, Persona::SharePoint, auth, graph, storage, sync_ctrl, ui_tx);
+        (app, ui, ui_rx, nudge_rx)
+    }
+
+    /// Folder listings requested from the sync engine since the last call.
+    fn drain_folder_requests(nudge_rx: &mut NudgeRx) -> Vec<(String, Option<String>)> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = nudge_rx.try_recv() {
+            if let crate::sync::SyncCommand::SyncFolder { drive_id, parent_id, .. } = cmd {
+                out.push((drive_id, parent_id));
+            }
+        }
+        out
+    }
+
+    fn folder(drive_id: &str, id: &str, name: &str) -> crate::models::DriveItem {
+        crate::models::DriveItem {
+            id: id.into(),
+            drive_id: drive_id.into(),
+            name: name.into(),
+            is_folder: true,
+            child_count: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn select_only(app: &mut super::AppState, ui: &mut super::UiState, item: crate::models::DriveItem) {
+        app.active_selected_id = Some(item.id.clone());
+        app.current_items = vec![item];
+        ui.list_scroll.selected_idx = Some(0);
+    }
+
+    fn my_drive() -> crate::models::DriveInfo {
+        crate::models::DriveInfo {
+            id: "drv-me".into(),
+            name: "OneDrive".into(),
+            drive_type: "business".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_with_me_folder_navigate_up_returns_to_shared_with_me() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use super::{ActiveViewSource, Focus};
+
+        let (mut app, mut ui, _ui_rx, mut nudge_rx) = build_nav_test_env(None);
+        app.my_drive = Some(my_drive());
+        let keymap = crate::ui::keymap::Keymap::default_sharepoint();
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+
+        super::dispatch(super::Action::OpenSharedWithMe, &mut app, &mut ui);
+        // A folder shared out of someone else's drive (`remoteItem`).
+        let mut shared = folder("drv-foreign", "local-shortcut", "Budget");
+        shared.remote_drive_id = Some("drv-foreign".into());
+        shared.remote_item_id = Some("remote-fld".into());
+        select_only(&mut app, &mut ui, shared);
+        ui.focus = Focus::List;
+        super::dispatch(super::Action::Activate, &mut app, &mut ui);
+
+        assert_eq!(
+            app.active_source,
+            ActiveViewSource::Drive { drive_id: "drv-foreign".into(), label: "Budget".into() }
+        );
+        assert_eq!(app.origin_source, Some(ActiveViewSource::SharedWithMe));
+        assert_eq!(app.folder_stack, vec![("remote-fld".to_string(), "Budget".to_string())]);
+        assert_eq!(app.breadcrumb_label(), "OneDrive > Shared with Me > Budget");
+
+        // One level deeper, then back up twice with Backspace.
+        select_only(&mut app, &mut ui, folder("drv-foreign", "q4", "Q4"));
+        super::dispatch(super::Action::Activate, &mut app, &mut ui);
+        assert_eq!(app.breadcrumb_label(), "OneDrive > Shared with Me > Budget > Q4");
+        assert_eq!(app.origin_source, Some(ActiveViewSource::SharedWithMe));
+
+        let up = keymap.resolve(Focus::List, backspace).expect("Backspace is bound in the list");
+        assert_eq!(up, super::Action::NavigateUp);
+        super::dispatch(up.clone(), &mut app, &mut ui);
+        assert_eq!(app.active_folder_target(), Some(("drv-foreign".into(), Some("remote-fld".into()))));
+
+        super::dispatch(up, &mut app, &mut ui);
+        assert_eq!(app.active_source, ActiveViewSource::SharedWithMe);
+        assert!(app.folder_stack.is_empty());
+        assert_eq!(app.origin_source, None);
+        assert_eq!(app.breadcrumb_label(), "OneDrive > Shared with Me");
+
+        let requested = drain_folder_requests(&mut nudge_rx);
+        assert!(
+            requested.iter().all(|(d, p)| !(d == "drv-foreign" && p.is_none())),
+            "the foreign drive's /root/children (403) must never be requested: {requested:?}"
+        );
+        assert!(requested.contains(&("drv-foreign".to_string(), Some("remote-fld".to_string()))));
+
+        // Recent works the same way, and a folder in the user's own drive reads as OneDrive.
+        super::dispatch(super::Action::OpenRecent, &mut app, &mut ui);
+        select_only(&mut app, &mut ui, folder("drv-me", "notes", "Notes"));
+        super::dispatch(super::Action::Activate, &mut app, &mut ui);
+        assert_eq!(app.origin_source, Some(ActiveViewSource::Recent));
+        assert_eq!(app.breadcrumb_label(), "OneDrive > Recent > Notes");
+        super::dispatch(super::Action::NavigateUp, &mut app, &mut ui);
+        assert_eq!(app.active_source, ActiveViewSource::Recent);
+
+        // A pinned folder of the user's own drive: "OneDrive", no repeated name, and up goes
+        // to the drive root as before.
+        app.pins = vec![crate::models::PinnedTarget {
+            key: "folder:drv-me:proj".into(),
+            kind: "folder".into(),
+            drive_id: Some("drv-me".into()),
+            item_id: Some("proj".into()),
+            site_id: None,
+            label: "Projects".into(),
+        }];
+        let rows = super::build_nav_rows(&app, &ui);
+        let pin_row = rows
+            .iter()
+            .position(|r| matches!(r, super::NavRow::PinnedItem { .. }))
+            .unwrap();
+        ui.focus = Focus::Nav;
+        ui.nav_selected = pin_row;
+        super::dispatch(super::Action::Activate, &mut app, &mut ui);
+        assert_eq!(app.origin_source, None);
+        assert_eq!(app.breadcrumb_label(), "OneDrive > My Files > Projects");
+
+        // A pinned folder of a foreign drive goes back to the view it was opened from.
+        app.pins.push(crate::models::PinnedTarget {
+            key: "folder:drv-foreign:remote-fld".into(),
+            kind: "folder".into(),
+            drive_id: Some("drv-foreign".into()),
+            item_id: Some("remote-fld".into()),
+            site_id: None,
+            label: "Budget".into(),
+        });
+        super::dispatch(super::Action::OpenSharedWithMe, &mut app, &mut ui);
+        let rows = super::build_nav_rows(&app, &ui);
+        ui.nav_selected = rows
+            .iter()
+            .position(|r| matches!(r, super::NavRow::PinnedItem { item_id: Some(i), .. } if i == "remote-fld"))
+            .unwrap();
+        ui.focus = Focus::Nav;
+        super::dispatch(super::Action::Activate, &mut app, &mut ui);
+        assert_eq!(app.origin_source, Some(ActiveViewSource::SharedWithMe));
+        assert_eq!(app.breadcrumb_label(), "OneDrive > Shared with Me > Budget");
+        ui.focus = Focus::List;
+        super::dispatch(super::Action::NavigateUp, &mut app, &mut ui);
+        assert_eq!(app.active_source, ActiveViewSource::SharedWithMe);
+        assert!(drain_folder_requests(&mut nudge_rx)
+            .iter()
+            .all(|(d, p)| !(d == "drv-foreign" && p.is_none())));
+    }
+
+    fn buffer_lines(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn unloaded_site_past_prefetch_renders_collapsed_and_reports_load_errors() {
+        use axum::{http::StatusCode as AxumStatus, routing::get, Json, Router};
+        use ratatui::{backend::TestBackend, Terminal};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1.0", listener.local_addr().unwrap());
+        let router = Router::new().route(
+            "/v1.0/sites/site-13/drives",
+            get(|| async {
+                (
+                    AxumStatus::FORBIDDEN,
+                    Json(json!({ "error": { "code": "accessDenied", "message": "No access" } })),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let (mut app, mut ui, mut ui_rx, _nudge_rx) = build_nav_test_env(Some(&base));
+        // 13 sites; the sidebar prefetch loaded libraries for the first 12 only.
+        app.sites = (1..=13)
+            .map(|i| crate::models::SharePointSite {
+                id: format!("site-{i}"),
+                name: format!("site{i}"),
+                display_name: format!("Site {i:02}"),
+                ..Default::default()
+            })
+            .collect();
+        for i in 1..=crate::sync::SIDEBAR_DRIVE_PREFETCH_SITES {
+            app.site_drives.insert(
+                format!("site-{i}"),
+                vec![crate::models::DriveInfo {
+                    id: format!("drv-{i}"),
+                    name: "Documents".into(),
+                    drive_type: "documentLibrary".into(),
+                    site_id: Some(format!("site-{i}")),
+                    ..Default::default()
+                }],
+            );
+        }
+
+        let rows = super::build_nav_rows(&app, &ui);
+        let site_row = |id: &str| {
+            rows.iter()
+                .position(|r| matches!(r, super::NavRow::SharePointSite { site_id, .. } if site_id == id))
+                .unwrap()
+        };
+        let s12 = site_row("site-12");
+        let s13 = site_row("site-13");
+        assert!(matches!(rows[s12], super::NavRow::SharePointSite { collapsed: false, .. }));
+        assert!(matches!(rows[s13], super::NavRow::SharePointSite { collapsed: true, .. }));
+        assert!(
+            !matches!(rows.get(s13 + 1), Some(super::NavRow::SharePointLibrary { .. })),
+            "an unloaded site shows no library rows"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 60)).unwrap();
+        terminal.draw(|f| { crate::ui::draw(f, &mut app, &mut ui); }).unwrap();
+        let lines = buffer_lines(&terminal);
+        let line_of = |label: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(label))
+                .unwrap_or_else(|| panic!("{label} not drawn:\n{}", lines.join("\n")))
+                .clone()
+        };
+        assert!(line_of("Site 13").contains("▸ Site 13"), "{}", line_of("Site 13"));
+        assert!(line_of("Site 12").contains("▾ Site 12"), "{}", line_of("Site 12"));
+
+        // Expanding site #13 asks for its libraries; a failure is reported, not swallowed,
+        // and the row stays collapsed.
+        ui.focus = super::Focus::Nav;
+        ui.nav_selected = s13;
+        super::dispatch(super::Action::NavExpand, &mut app, &mut ui);
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("the failed library load must be reported")
+            .unwrap();
+        match &msg {
+            super::UiMsg::Toast { message, kind } => {
+                assert_eq!(*kind, super::ToastKind::Error);
+                assert!(message.contains("Libraries for Site 13"), "{message}");
+                assert!(message.contains("403"), "{message}");
+            }
+            _ => panic!("expected an error toast"),
+        }
+        app.apply_ui_msg(msg, &mut ui);
+        let rows = super::build_nav_rows(&app, &ui);
+        assert!(matches!(rows[s13], super::NavRow::SharePointSite { collapsed: true, .. }));
+
+        // Once the libraries arrive, the row opens on its own.
+        app.apply_ui_msg(
+            super::UiMsg::SiteDrivesLoaded {
+                site_id: "site-13".into(),
+                drives: vec![crate::models::DriveInfo {
+                    id: "drv-13".into(),
+                    name: "Documents".into(),
+                    drive_type: "documentLibrary".into(),
+                    site_id: Some("site-13".into()),
+                    ..Default::default()
+                }],
+            },
+            &mut ui,
+        );
+        let rows = super::build_nav_rows(&app, &ui);
+        assert!(matches!(rows[s13], super::NavRow::SharePointSite { collapsed: false, .. }));
+        assert!(matches!(rows.get(s13 + 1), Some(super::NavRow::SharePointLibrary { drive_id, .. }) if drive_id == "drv-13"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn right_opens_list_folder_and_left_collapses_or_climbs_in_nav() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use super::{Action, ActiveViewSource, Focus, NavRow};
+
+        let keymap = crate::ui::keymap::Keymap::default_sharepoint();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(keymap.resolve(Focus::List, key(KeyCode::Right)), Some(Action::Activate));
+        assert_eq!(keymap.resolve(Focus::List, key(KeyCode::Char('l'))), Some(Action::Activate));
+        assert_eq!(keymap.resolve(Focus::List, key(KeyCode::Left)), Some(Action::NavigateUp));
+        assert_eq!(keymap.resolve(Focus::Nav, key(KeyCode::Left)), Some(Action::NavCollapse));
+        assert_eq!(keymap.resolve(Focus::Nav, key(KeyCode::Char('h'))), Some(Action::NavCollapse));
+        assert_eq!(keymap.resolve(Focus::Nav, key(KeyCode::Right)), Some(Action::NavExpand));
+        assert_eq!(keymap.resolve(Focus::Nav, key(KeyCode::Char('l'))), Some(Action::NavExpand));
+        assert_eq!(keymap.resolve(Focus::Nav, key(KeyCode::Char(' '))), Some(Action::Activate));
+        // `h` keeps toggling href URLs in the list.
+        assert_eq!(
+            keymap.resolve(Focus::List, key(KeyCode::Char('h'))),
+            Some(Action::ToggleShowLinkUrls)
+        );
+
+        let (mut app, mut ui, _ui_rx, _nudge_rx) = build_nav_test_env(None);
+
+        // --- List: Right opens the selected folder, Left goes back up.
+        app.active_source = ActiveViewSource::Drive { drive_id: "d1".into(), label: "Docs".into() };
+        select_only(&mut app, &mut ui, folder("d1", "fld-1", "Projects"));
+        ui.focus = Focus::List;
+        let right = keymap.resolve(Focus::List, key(KeyCode::Right)).unwrap();
+        super::dispatch(right, &mut app, &mut ui);
+        assert_eq!(app.folder_stack, vec![("fld-1".to_string(), "Projects".to_string())]);
+        let left = keymap.resolve(Focus::List, key(KeyCode::Left)).unwrap();
+        super::dispatch(left, &mut app, &mut ui);
+        assert!(app.folder_stack.is_empty());
+
+        // --- Space pages the focused pane: the list selection in the list ...
+        app.current_items = (0..40)
+            .map(|i| crate::models::DriveItem {
+                id: format!("f-{i:02}"),
+                drive_id: "d1".into(),
+                name: format!("f-{i:02}.txt"),
+                ..Default::default()
+            })
+            .collect();
+        app.active_selected_id = Some("f-00".into());
+        ui.list_scroll.selected_idx = Some(0);
+        ui.list_scroll.area = ratatui::layout::Rect::new(0, 0, 60, 12);
+        ui.inspector_scroll.area = ratatui::layout::Rect::new(60, 0, 40, 12);
+        ui.inspector_scroll.total_lines = 200;
+        ui.inspector_scroll.offset = 0;
+        let page = super::list_visible_items(ui.list_scroll.area, ui.density);
+        let space = keymap.resolve(Focus::List, key(KeyCode::Char(' '))).unwrap();
+        assert_eq!(space, Action::ScrollPageDown);
+        super::dispatch(space.clone(), &mut app, &mut ui);
+        assert_eq!(ui.list_scroll.selected_idx, Some(page));
+        assert_eq!(ui.inspector_scroll.offset, 0, "Space in the list must not scroll the inspector");
+        super::dispatch(Action::ScrollPageUp, &mut app, &mut ui);
+        assert_eq!(ui.list_scroll.selected_idx, Some(0));
+
+        // ... and the preview in the inspector.
+        ui.focus = Focus::Inspector;
+        super::dispatch(space, &mut app, &mut ui);
+        assert!(ui.inspector_scroll.offset > 0);
+        assert_eq!(ui.list_scroll.selected_idx, Some(0));
+
+        // --- Nav: Left steps out / collapses, Right expands and never collapses.
+        app.sites = vec![crate::models::SharePointSite {
+            id: "site-1".into(),
+            name: "eng".into(),
+            display_name: "Engineering".into(),
+            ..Default::default()
+        }];
+        app.site_drives.insert(
+            "site-1".into(),
+            vec![crate::models::DriveInfo {
+                id: "drv-1".into(),
+                name: "Documents".into(),
+                drive_type: "documentLibrary".into(),
+                site_id: Some("site-1".into()),
+                ..Default::default()
+            }],
+        );
+        ui.focus = Focus::Nav;
+        let rows = super::build_nav_rows(&app, &ui);
+        let header = rows
+            .iter()
+            .position(|r| matches!(r, NavRow::SectionHeader { section_id: "sharepoint", .. }))
+            .unwrap();
+        let site = rows
+            .iter()
+            .position(|r| matches!(r, NavRow::SharePointSite { .. }))
+            .unwrap();
+        assert!(matches!(rows[site + 1], NavRow::SharePointLibrary { .. }));
+        let nav_left = keymap.resolve(Focus::Nav, key(KeyCode::Left)).unwrap();
+        let nav_right = keymap.resolve(Focus::Nav, key(KeyCode::Right)).unwrap();
+
+        ui.nav_selected = site + 1;
+        super::dispatch(nav_left.clone(), &mut app, &mut ui);
+        assert_eq!(ui.nav_selected, site, "Left on a library jumps to its site");
+        super::dispatch(nav_left.clone(), &mut app, &mut ui);
+        assert!(ui.collapsed_sites.contains("site-1"), "Left collapses an expanded site");
+        super::dispatch(nav_left.clone(), &mut app, &mut ui);
+        assert_eq!(ui.nav_selected, header, "Left on a collapsed site goes to its section");
+        super::dispatch(nav_left, &mut app, &mut ui);
+        assert!(ui.collapsed_sections.contains("sharepoint"), "Left collapses the section");
+
+        super::dispatch(nav_right.clone(), &mut app, &mut ui);
+        assert!(!ui.collapsed_sections.contains("sharepoint"));
+        ui.nav_selected = site;
+        super::dispatch(nav_right.clone(), &mut app, &mut ui);
+        assert!(!ui.collapsed_sites.contains("site-1"), "Right expands a collapsed site");
+        super::dispatch(nav_right.clone(), &mut app, &mut ui);
+        assert!(
+            !ui.collapsed_sites.contains("site-1"),
+            "Right never collapses an expanded site"
+        );
+        assert_eq!(ui.nav_selected, site + 1, "Right on an expanded site steps into it");
+        super::dispatch(nav_right, &mut app, &mut ui);
+        assert_eq!(
+            app.active_source,
+            ActiveViewSource::Drive { drive_id: "drv-1".into(), label: "Documents".into() },
+            "Right on a library opens it"
+        );
     }
 }

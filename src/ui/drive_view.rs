@@ -20,6 +20,15 @@ use crate::{
     },
 };
 
+/// File-list entries that fit in the list pane `area` at `density`: the breadcrumb bar
+/// and, when the pane is tall enough, the toolbar sit above the entries.
+pub fn list_visible_items(area: Rect, density: DensityMode) -> usize {
+    let header_rows = if area.height >= 4 { 2 } else { 1 };
+    let list_h = area.height.saturating_sub(header_rows) as usize;
+    let row_height: usize = if density == DensityMode::Cozy { 2 } else { 1 };
+    (list_h / row_height).max(1)
+}
+
 /// Number of header rows rendered at the top of the Inspector pane (title row + action pill bar when tall enough).
 pub fn inspector_header_rows(area: Rect) -> u16 {
     if area.height >= 4 {
@@ -235,7 +244,7 @@ pub fn draw_list(
         .unwrap_or(0)
         .min(items.len().saturating_sub(1));
     let row_height: usize = if ui.density == DensityMode::Cozy { 2 } else { 1 };
-    let visible_items = (list_h / row_height).max(1);
+    let visible_items = list_visible_items(area, ui.density);
     let skip = selected.saturating_sub(visible_items.saturating_sub(1));
 
     for (vis_idx, (idx, item)) in items

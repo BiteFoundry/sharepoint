@@ -2,8 +2,9 @@
 //! pixel graphics overlay flush, mouse capture, event loop, and shared IPC daemon attachment.
 
 use std::borrow::Cow;
-use std::io::{self, Stdout, Write};
+use std::io::{self, BufWriter, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -11,15 +12,14 @@ use anyhow::Result;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
     DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-    Event as CrosstermEvent, EventStream, KeyEventKind,
+    Event as CrosstermEvent, KeyEventKind,
 };
-use crossterm::execute;
+use crossterm::{execute, queue};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, BeginSynchronizedUpdate,
     EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
@@ -345,6 +345,119 @@ fn evaluate_pixel_placement(
     Ok(Rect::new(rect.x, rect.y, rendered_cols, rendered_rows))
 }
 
+/// Frame output buffer: a full frame (and any pixel graphic escapes) leaves in one flush.
+const TERMINAL_WRITE_BUFFER: usize = 64 * 1024;
+
+type TuiBackend = CrosstermBackend<BufWriter<Stdout>>;
+
+/// How long the reader thread blocks in `crossterm::event::poll` before re-checking its stop
+/// flag; bounds how long `TerminalEventReader::pause` waits.
+const EVENT_READER_POLL: Duration = Duration::from_millis(25);
+
+enum ReaderMsg {
+    Event(CrosstermEvent),
+    Eof,
+}
+
+/// Terminal input read on a dedicated OS thread and handed to the event loop over an
+/// unbounded channel.
+///
+/// `crossterm::event::EventStream` reads through crossterm's global event reader from the
+/// async runtime: on Windows a read parks a Tokio worker until the next console event, and a
+/// stream dropped and recreated around a resize can lose its waker. Here the blocking
+/// `poll`/`read` pair never runs on Tokio, and `recv` is a plain channel receive.
+///
+/// `pause` stops and joins the thread so a VT probe (cell pixel size after a Windows resize)
+/// can read the console's reply itself; `resume` starts reading again.
+struct TerminalEventReader {
+    rx: mpsc::UnboundedReceiver<ReaderMsg>,
+    tx: mpsc::UnboundedSender<ReaderMsg>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TerminalEventReader {
+    fn start() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut reader = Self {
+            rx,
+            tx,
+            stop: Arc::new(AtomicBool::new(false)),
+            handle: None,
+        };
+        reader.resume();
+        reader
+    }
+
+    #[cfg(test)]
+    fn from_channel(
+        tx: mpsc::UnboundedSender<ReaderMsg>,
+        rx: mpsc::UnboundedReceiver<ReaderMsg>,
+    ) -> Self {
+        Self {
+            rx,
+            tx,
+            stop: Arc::new(AtomicBool::new(true)),
+            handle: None,
+        }
+    }
+
+    fn resume(&mut self) {
+        if self.handle.is_some() {
+            return;
+        }
+        self.stop.store(false, Ordering::Release);
+        let stop = Arc::clone(&self.stop);
+        let tx = self.tx.clone();
+        self.handle = std::thread::Builder::new()
+            .name("tui-event-reader".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    match crossterm::event::poll(EVENT_READER_POLL) {
+                        Ok(true) => match crossterm::event::read() {
+                            Ok(ev) => {
+                                if tx.send(ReaderMsg::Event(ev)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                let _ = tx.send(ReaderMsg::Eof);
+                                break;
+                            }
+                        },
+                        Ok(false) => {}
+                        Err(_) => {
+                            let _ = tx.send(ReaderMsg::Eof);
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+
+    fn pause(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// Next terminal event; `None` once the terminal input ended or failed.
+    async fn recv(&mut self) -> Option<CrosstermEvent> {
+        match self.rx.recv().await {
+            Some(ReaderMsg::Event(ev)) => Some(ev),
+            Some(ReaderMsg::Eof) | None => None,
+        }
+    }
+}
+
+impl Drop for TerminalEventReader {
+    fn drop(&mut self) {
+        self.pause();
+    }
+}
+
 struct TerminalGuard {
     keyboard_enhanced: bool,
     kitty_used: bool,
@@ -357,7 +470,7 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter(
         image_pref: ImageProtocolPreference,
-    ) -> Result<(Self, Terminal<CrosstermBackend<Stdout>>, TerminalGraphicsCaps)> {
+    ) -> Result<(Self, Terminal<TuiBackend>, TerminalGraphicsCaps)> {
         #[cfg(windows)]
         let orig_conin_mode = win_console::snapshot_console_mode();
 
@@ -400,7 +513,9 @@ impl TerminalGuard {
             let _ = write_vt_mouse_enable(&mut stdout);
         }
 
-        let backend = CrosstermBackend::new(stdout);
+        // One frame is assembled in a 64 KiB buffer and written in a single flush, instead of
+        // one console write per cell run.
+        let backend = CrosstermBackend::new(BufWriter::with_capacity(TERMINAL_WRITE_BUFFER, stdout));
         let mut terminal = Terminal::new(backend)?;
         terminal.hide_cursor()?;
         terminal.clear()?;
@@ -534,20 +649,50 @@ pub async fn run_tui(
     app.spawn_bootstrap_from_cache();
     sync_ctrl.request(SyncCommand::Bootstrap);
 
-    let mut events = EventStream::new();
+    let mut events = TerminalEventReader::start();
     let mut tick = tokio::time::interval(Duration::from_millis(120));
     let mut dirty = true;
+    // A burst of Resize events (dragging a window edge) is answered once, before the next
+    // frame, rather than once per event.
+    let mut pending_resize = false;
     let mut last_activity_sent: Option<Instant> = None;
 
     loop {
+        if pending_resize {
+            pending_resize = false;
+            // Windows answers the cell-size VT probe on console input: stop the reader thread
+            // so the probe reads its own reply, then restore ConPTY mouse capture and resume.
+            #[cfg(windows)]
+            {
+                events.pause();
+                img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
+                win_console::enforce_windows_mouse_capture();
+                let _ = write_vt_mouse_enable(terminal.backend_mut());
+                events.resume();
+            }
+            #[cfg(not(windows))]
+            {
+                img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
+            }
+            app.rendered_images.retain(|k, _| !k.starts_with("inline:"));
+            if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
+                if action::dispatch(Action::LoadPreviewImage, &mut app, &mut ui) {
+                    break;
+                }
+            } else {
+                app.ensure_inspector_loaded(&ui);
+            }
+            dirty = true;
+        }
+
         if dirty {
             draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
             dirty = false;
         }
 
         tokio::select! {
-            maybe_ev = events.next() => {
-                let Some(Ok(ev)) = maybe_ev else { break; };
+            maybe_ev = events.recv() => {
+                let Some(ev) = maybe_ev else { break; };
                 if last_activity_sent.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
                     app.sync_ctrl.request(SyncCommand::NotifyUserActivity);
                     last_activity_sent = Some(Instant::now());
@@ -561,26 +706,9 @@ pub async fn run_tui(
                     CrosstermEvent::Resize(w, h) => {
                         ui.term_width = w;
                         ui.term_height = h;
-                        #[cfg(windows)]
-                        {
-                            drop(events);
-                            img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
-                            win_console::enforce_windows_mouse_capture();
-                            let _ = write_vt_mouse_enable(&mut io::stdout());
-                            events = EventStream::new();
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
-                        }
-                        app.rendered_images.retain(|k, _| !k.starts_with("inline:"));
+                        pending_resize = true;
                         dirty = true;
-                        if matches!(ui.overlays.last(), Some(Overlay::ImagePreview(_))) {
-                            Some(Action::LoadPreviewImage)
-                        } else {
-                            app.ensure_inspector_loaded(&ui);
-                            None
-                        }
+                        None
                     }
                     CrosstermEvent::FocusGained => {
                         app.sync_ctrl.request(SyncCommand::FocusGained);
@@ -615,19 +743,21 @@ pub async fn run_tui(
         }
     }
 
+    events.pause();
     app.html_server.shutdown();
     app.sync_ctrl.request(SyncCommand::Shutdown);
     Ok(())
 }
 
 fn draw_frame(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<TuiBackend>,
     app: &mut AppState,
     ui: &mut UiState,
     guard: &mut TerminalGuard,
 ) -> Result<()> {
-    let mut stdout = io::stdout();
-    let _ = execute!(stdout, BeginSynchronizedUpdate);
+    // Everything below goes through the terminal's buffered writer, so the synchronized
+    // update markers, the cells and the pixel escapes reach the console in order.
+    let _ = queue!(terminal.backend_mut(), BeginSynchronizedUpdate);
 
     let mut cursor_pos = None;
     terminal.draw(|frame| {
@@ -745,9 +875,10 @@ fn draw_frame(
         .plan_transition(&desired, term_size, guard.kitty_used);
 
     if plan.erase_and_redraw {
+        let out = terminal.backend_mut();
         if plan.delete_kitty {
-            let _ = stdout.write_all(img_preview::kitty_delete_preview_sequence().as_bytes());
-            let _ = stdout.write_all(img_preview::kitty_delete_all_sequence().as_bytes());
+            let _ = out.write_all(img_preview::kitty_delete_preview_sequence().as_bytes());
+            let _ = out.write_all(img_preview::kitty_delete_all_sequence().as_bytes());
         }
         for rect in &plan.erase_rects {
             let erase = img_preview::erase_pixel_rect_sequence(
@@ -759,10 +890,10 @@ fn draw_frame(
                 ui.term_height,
             );
             if !erase.is_empty() {
-                let _ = stdout.write_all(erase.as_bytes());
+                let _ = out.write_all(erase.as_bytes());
             }
         }
-        let _ = stdout.flush();
+        let _ = out.flush();
         terminal.clear()?;
         terminal.draw(|frame| {
             cursor_pos = ui::draw(frame, app, ui);
@@ -778,10 +909,11 @@ fn draw_frame(
     }
 
     if plan.emit_desired {
+        let out = terminal.backend_mut();
         for (graphic, payload) in desired.iter().zip(emitted_payloads.iter()) {
             let move_seq = format!("\x1b[{};{}H", graphic.rect.y + 1, graphic.rect.x + 1);
-            let _ = stdout.write_all(move_seq.as_bytes());
-            let _ = stdout.write_all(payload.as_bytes());
+            let _ = out.write_all(move_seq.as_bytes());
+            let _ = out.write_all(payload.as_bytes());
             if graphic.protocol == TerminalImageProtocol::Kitty {
                 guard.kitty_used = true;
                 KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
@@ -793,8 +925,7 @@ fn draw_frame(
 
     guard.pixel_tracker.commit(desired, term_size);
 
-    let _ = execute!(stdout, EndSynchronizedUpdate);
-    let _ = stdout.flush();
+    let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
     Ok(())
 }
 
@@ -803,6 +934,30 @@ mod tests {
     use super::*;
     use crate::models::DriveItem;
     use crate::ui::overlays::image_preview::ImagePreviewOverlay;
+
+    #[tokio::test]
+    async fn terminal_event_reader_delivers_events_in_order_and_ends_on_eof() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut reader = TerminalEventReader::from_channel(tx.clone(), rx);
+        // No reader thread is running: pausing is a no-op and must not block.
+        reader.pause();
+
+        let key = CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        tx.send(ReaderMsg::Event(key.clone())).unwrap();
+        tx.send(ReaderMsg::Event(CrosstermEvent::Resize(100, 40))).unwrap();
+        tx.send(ReaderMsg::Eof).unwrap();
+
+        async fn next(r: &mut TerminalEventReader) -> Option<CrosstermEvent> {
+            tokio::time::timeout(Duration::from_secs(1), r.recv())
+                .await
+                .expect("recv blocked")
+        }
+        assert_eq!(next(&mut reader).await, Some(key));
+        assert_eq!(next(&mut reader).await, Some(CrosstermEvent::Resize(100, 40)));
+        assert_eq!(next(&mut reader).await, None, "Eof ends the event loop");
+    }
 
     fn sample_graphic(
         key: &str,

@@ -100,7 +100,9 @@ sharepoint whoami --json
 | --- | --- |
 | `Tab` / `Shift+Tab` | Cycle focus (Sidebar → File List → Inspector) |
 | `j` / `k` · `↑` / `↓` | Move selection / scroll Inspector preview |
-| `Enter` / `Backspace` | Open folder or site / navigate to parent folder |
+| `Enter` · `→` / `l` | Open folder or site (sidebar: `→` / `l` expand, `←` / `h` collapse or go to parent) |
+| `Backspace` · `←` | Parent folder; at the top of a shared or recent folder, back to that list |
+| `Space` / `PgDn` / `PgUp` | Page the focused file list or inspector |
 | `S` | Cycle sort order (Name / Modified / Size / Type) |
 | `Ctrl+F` | Upload file via interactive File Picker (`z` for `zoxide` jump) |
 | `Ctrl+V` | Encode clipboard image as PNG & upload to current folder |

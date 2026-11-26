@@ -191,6 +191,18 @@ pub fn is_delta_unsupported_error(err: &anyhow::Error) -> bool {
         || lower.contains("notsupported")
 }
 
+/// `true` when Graph refused the request for lack of permission (`403 Forbidden` /
+/// `accessDenied`).
+///
+/// A folder shared with the user (a `remoteItem` from Shared with Me, Recent or a shortcut)
+/// lives in someone else's drive: the user may list that folder's `/children` but not the
+/// drive root, so the drive-wide `/root/delta` answers 403 even though the folder itself
+/// is readable.
+pub fn is_access_denied_error(err: &anyhow::Error) -> bool {
+    let lower = format!("{err:#}").to_ascii_lowercase();
+    lower.contains("403 forbidden") || lower.contains("accessdenied")
+}
+
 pub fn is_socketio_unsupported_error(err: &anyhow::Error) -> bool {
     let lower = format!("{err:#}").to_ascii_lowercase();
     lower.contains("404 not found")

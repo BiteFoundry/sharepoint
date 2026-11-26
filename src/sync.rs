@@ -28,8 +28,8 @@ use crate::{
     config::AppConfig,
     graph::{
         drives::{
-            is_delta_unsupported_error, is_socketio_unsupported_error, DriveDeltaChange,
-            DriveDeltaPageResponse,
+            is_access_denied_error, is_delta_unsupported_error, is_socketio_unsupported_error,
+            DriveDeltaChange, DriveDeltaPageResponse,
         },
         socketio::{self, SocketIoSignal},
         GraphClient,
@@ -862,9 +862,17 @@ pub fn spawn_sync_engine(
                                 sync_sites_once(&graph, &storage, &event_tx, active_site_id.as_deref()).await;
                             }
                             SyncCommand::SyncSiteDrives { site_id, site_name } => {
-                                if let Ok(drives) = graph.list_site_drives(&site_id, site_name.as_deref()).await {
-                                    let _ = storage.upsert_drives(&drives);
-                                    let _ = event_tx.send(CoreEvent::DrivesUpdated { site_id, drives });
+                                match graph.list_site_drives(&site_id, site_name.as_deref()).await {
+                                    Ok(drives) => {
+                                        let _ = storage.upsert_drives(&drives);
+                                        let _ = event_tx.send(CoreEvent::DrivesUpdated { site_id, drives });
+                                    }
+                                    Err(err) => {
+                                        let site = site_name.as_deref().unwrap_or(site_id.as_str());
+                                        let _ = event_tx.send(CoreEvent::SyncError(format!(
+                                            "Libraries for {site}: {err:#}"
+                                        )));
+                                    }
                                 }
                             }
                             SyncCommand::SyncFolder { drive_id, parent_id, reuse_startup_root, limit } => {
@@ -1247,6 +1255,10 @@ async fn run_socketio_manager(
 /// 1. Acquire latest delta start token (`?token=latest`) BEFORE reading the folder
 /// 2. Read the open folder (`/children`) and persist/emit
 /// 3. Immediately catch up any delta changes that occurred during the folder load
+///
+/// A drive whose delta feed is unsupported, or refused with `403 accessDenied` (a shared
+/// folder in someone else's drive, where only the folder is readable), is marked
+/// delta-unavailable and the folder is listed directly; later passes poll `/children`.
 pub async fn bootstrap_drive_with_delta(
     graph: &GraphClient,
     storage: &Storage,
@@ -1258,7 +1270,7 @@ pub async fn bootstrap_drive_with_delta(
 ) -> Result<()> {
     let seed_link = match graph.get_drive_delta_latest_link(drive_id).await {
         Ok(link) => Some(link),
-        Err(err) if is_delta_unsupported_error(&err) => {
+        Err(err) if is_delta_unsupported_error(&err) || is_access_denied_error(&err) => {
             rt.delta_unsupported_drives.insert(drive_id.to_string());
             None
         }
@@ -2623,6 +2635,135 @@ mod tests {
             .unwrap();
         assert_eq!(leaf_items.len(), 1);
         assert_eq!(leaf_items[0].id, "file-leaf");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_falls_back_to_children_when_foreign_delta_is_access_denied() {
+        use axum::{http::StatusCode as AxumStatus, routing::get, Json, Router};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        // A folder shared from someone else's drive: the folder is readable, but the drive-wide
+        // delta feed and the drive root both answer 403 accessDenied.
+        let delta_calls = Arc::new(AtomicUsize::new(0));
+        let root_calls = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1.0", listener.local_addr().unwrap());
+
+        let dc = Arc::clone(&delta_calls);
+        let rc = Arc::clone(&root_calls);
+        let denied = || {
+            (
+                AxumStatus::FORBIDDEN,
+                Json(json!({ "error": { "code": "accessDenied", "message": "Access denied" } })),
+            )
+        };
+        let app = Router::new()
+            .route(
+                "/v1.0/drives/drv-foreign/root/delta",
+                get(move || {
+                    let dc = Arc::clone(&dc);
+                    async move {
+                        dc.fetch_add(1, Ordering::SeqCst);
+                        denied()
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/drives/drv-foreign/root/children",
+                get(move || {
+                    let rc = Arc::clone(&rc);
+                    async move {
+                        rc.fetch_add(1, Ordering::SeqCst);
+                        denied()
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/drives/drv-foreign/items/shared-fld/children",
+                get(|| async {
+                    Json(json!({
+                        "value": [{
+                            "id": "budget-1",
+                            "name": "budget.xlsx",
+                            "size": 2048,
+                            "file": { "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+                            "parentReference": { "driveId": "drv-foreign", "id": "shared-fld" }
+                        }]
+                    }))
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let graph = test_graph_client(base);
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&tmp.path().join("foreign-delta.db")).unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut rt = DriveSyncRuntime::default();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            bootstrap_drive_with_delta(
+                &graph,
+                &storage,
+                &event_tx,
+                &mut rt,
+                "drv-foreign",
+                Some("shared-fld"),
+                FOLDER_PAGE_SIZE,
+            ),
+        )
+        .await
+        .expect("bootstrap must not hang")
+        .expect("403 accessDenied on the foreign /root/delta must fall back to listing the folder");
+
+        assert_eq!(delta_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(root_calls.load(Ordering::SeqCst), 0, "the foreign drive root must never be listed");
+        assert!(rt.delta_unsupported_drives.contains("drv-foreign"));
+
+        let mut listed = None;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let CoreEvent::FolderItemsUpdated { drive_id, parent_id, items, truncated } = ev {
+                listed = Some((drive_id, parent_id, items, truncated));
+            }
+        }
+        let (drive_id, parent_id, items, truncated) =
+            listed.expect("the shared folder's children must be emitted");
+        assert_eq!(drive_id, "drv-foreign");
+        assert_eq!(parent_id.as_deref(), Some("shared-fld"));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "budget-1");
+        assert!(!truncated);
+        let (cached, _) = storage
+            .list_folder_children_page("drv-foreign", Some("shared-fld"), 50)
+            .unwrap();
+        assert_eq!(cached.len(), 1, "the listing is cached for the next view");
+
+        // The next pass polls the folder and does not ask for the refused delta again.
+        sync_drive_delta_once(
+            &graph,
+            &storage,
+            &event_tx,
+            &mut rt,
+            "drv-foreign",
+            Some("shared-fld"),
+            FOLDER_PAGE_SIZE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(delta_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(root_calls.load(Ordering::SeqCst), 0);
+
+        // Only permission refusals take this path; other failures still surface.
+        assert!(is_access_denied_error(&anyhow::anyhow!(
+            "Graph API error (GET /drives/x/root/delta): 403 Forbidden [accessDenied] Access denied"
+        )));
+        assert!(!is_access_denied_error(&anyhow::anyhow!(
+            "Graph API error (GET /drives/x/root/delta): 500 Internal Server Error"
+        )));
 
         server.abort();
     }

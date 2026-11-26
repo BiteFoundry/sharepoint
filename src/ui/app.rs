@@ -361,6 +361,11 @@ pub struct AppState {
     pub site_drives: HashMap<String, Vec<DriveInfo>>,
     pub pins: Vec<PinnedTarget>,
     pub active_source: ActiveViewSource,
+    /// View the user came from when they opened a folder of a drive they may not be allowed
+    /// to list from its root: a Shared with Me / Recent entry, a shortcut, or a pinned remote
+    /// folder. Popping the last `folder_stack` entry returns here instead of asking Graph for
+    /// that drive's `/root/children` (403 for a folder shared out of someone else's drive).
+    pub origin_source: Option<ActiveViewSource>,
     /// True once initial SharePoint persona library selection has occurred or the user explicitly navigated.
     pub initial_persona_library_selected: bool,
     pub recent_status: Option<VirtualListStatus>,
@@ -445,6 +450,7 @@ impl AppState {
             site_drives: HashMap::new(),
             pins: Vec::new(),
             active_source,
+            origin_source: None,
             initial_persona_library_selected: false,
             recent_status: None,
             shared_status: None,
@@ -543,12 +549,81 @@ impl AppState {
         self.folder_stack.last().map(|(id, _)| id.clone())
     }
 
+    /// True for the user's own OneDrive and for the libraries loaded for the sidebar's sites.
+    pub fn is_known_drive(&self, drive_id: &str) -> bool {
+        self.my_drive.as_ref().is_some_and(|d| d.id == drive_id)
+            || self.site_drives.values().flatten().any(|d| d.id == drive_id)
+    }
+
+    /// Display name of a drive the sidebar knows: `My Files` for the user's OneDrive, the
+    /// library label for a SharePoint document library.
+    pub fn known_drive_label(&self, drive_id: &str) -> Option<String> {
+        if self.my_drive.as_ref().is_some_and(|d| d.id == drive_id) {
+            return Some("My Files".to_string());
+        }
+        self.site_drives
+            .values()
+            .flatten()
+            .find(|d| d.id == drive_id)
+            .map(DriveInfo::display_label)
+    }
+
+    /// Breadcrumb product prefix for a drive: `OneDrive` for personal drives, `SharePoint`
+    /// for site libraries. A drive outside the sidebar falls back to the running persona.
+    fn drive_family_label(&self, drive_id: &str) -> &'static str {
+        if self.my_drive.as_ref().is_some_and(|d| d.id == drive_id) {
+            return "OneDrive";
+        }
+        if let Some(d) = self.site_drives.values().flatten().find(|d| d.id == drive_id) {
+            return if d.is_personal_onedrive() { "OneDrive" } else { "SharePoint" };
+        }
+        match self.persona {
+            Persona::OneDrive => "OneDrive",
+            Persona::SharePoint => "SharePoint",
+        }
+    }
+
+    /// The view to come back to after opening a folder that lives in another drive: the
+    /// current view, or, when the current view is itself such a hop, the view that hop started
+    /// from (a search hit has no listing of its own, so it falls back to My Files).
+    pub(crate) fn return_source_for_hop(&mut self) -> Option<ActiveViewSource> {
+        match &self.active_source {
+            ActiveViewSource::OneDriveRoot
+            | ActiveViewSource::Recent
+            | ActiveViewSource::SharedWithMe => Some(self.active_source.clone()),
+            ActiveViewSource::Drive { .. } => self
+                .origin_source
+                .take()
+                .or_else(|| Some(self.active_source.clone())),
+            ActiveViewSource::SearchResult { .. } => self
+                .origin_source
+                .take()
+                .or(Some(ActiveViewSource::OneDriveRoot)),
+        }
+    }
+
     pub fn breadcrumb_label(&self) -> String {
         let root = match &self.active_source {
             ActiveViewSource::OneDriveRoot => "OneDrive > My Files".to_string(),
             ActiveViewSource::Recent => "OneDrive > Recent".to_string(),
             ActiveViewSource::SharedWithMe => "OneDrive > Shared with Me".to_string(),
-            ActiveViewSource::Drive { label, .. } => format!("SharePoint > {label}"),
+            ActiveViewSource::Drive { drive_id, label } => match &self.origin_source {
+                // Opened from a list view: the path reads from that list.
+                Some(ActiveViewSource::Recent) => "OneDrive > Recent".to_string(),
+                Some(ActiveViewSource::SharedWithMe) => "OneDrive > Shared with Me".to_string(),
+                _ => {
+                    let family = self.drive_family_label(drive_id);
+                    // A drive outside the sidebar is entered through one of its folders, and
+                    // its label is that folder's name: the trail already says it.
+                    let label_repeats_folder = !self.is_known_drive(drive_id)
+                        && self.folder_stack.first().is_some_and(|(_, name)| name == label);
+                    if label.trim().is_empty() || label_repeats_folder {
+                        family.to_string()
+                    } else {
+                        format!("{family} > {label}")
+                    }
+                }
+            },
             ActiveViewSource::SearchResult { label, .. } => label.clone(),
         };
         if self.folder_stack.is_empty() {

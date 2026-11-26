@@ -72,7 +72,10 @@ pub fn build_nav_rows(app: &AppState, ui: &UiState) -> Vec<NavRow> {
         });
         if !collapsed {
             for site in &app.sites {
-                let site_collapsed = ui.collapsed_sites.contains(&site.id);
+                // Libraries not loaded yet (sites past the sidebar prefetch): the row stays
+                // collapsed until activating it loads them, never `▾` over nothing.
+                let site_collapsed = ui.collapsed_sites.contains(&site.id)
+                    || !app.site_drives.contains_key(&site.id);
                 rows.push(NavRow::SharePointSite {
                     site_id: site.id.clone(),
                     label: site.effective_name().to_string(),

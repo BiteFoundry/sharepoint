@@ -1024,14 +1024,21 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 false,
             )
             .await?;
-            let parent_id = match path_or_id.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "/") {
-                Some(p) => Some(resolver::resolve_item(&graph, &storage, &target_drive.id, p, false).await?.id),
-                None => None,
+            // A shortcut / shared folder (`remoteItem`) is listed in the drive it points into.
+            let (tree_drive_id, parent_id) = match path_or_id.as_deref().map(str::trim).filter(|s| !s.is_empty() && *s != "/") {
+                Some(p) => {
+                    let item = resolver::resolve_item(&graph, &storage, &target_drive.id, p, false).await?;
+                    (
+                        item.effective_drive_id().to_string(),
+                        Some(item.effective_item_id().to_string()),
+                    )
+                }
+                None => (target_drive.id.clone(), None),
             };
             let (nodes, root_cut) = build_tree(
                 &graph,
                 &storage,
-                &target_drive.id,
+                &tree_drive_id,
                 parent_id.as_deref(),
                 usize::from(depth),
             )
@@ -2885,11 +2892,13 @@ fn build_tree_inner<'a>(
                 let sem = std::sync::Arc::clone(&sem);
                 async move {
                     if item.is_folder {
+                        // A shortcut / shared folder (`remoteItem`) lists its children in the
+                        // drive it points into, under its remote id.
                         let (children, child_cut) = build_tree_inner(
                             graph,
                             storage,
-                            drive_id,
-                            Some(&item.id),
+                            item.effective_drive_id(),
+                            Some(item.effective_item_id()),
                             depth - 1,
                             sem,
                         )
@@ -2928,16 +2937,29 @@ fn build_tree_inner<'a>(
 }
 
 fn print_tree_nodes(nodes: &[TreeNode], prefix: &str) {
+    let mut lines = Vec::new();
+    tree_lines(nodes, prefix, &mut lines);
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+/// Renders `nodes` as box-drawing tree lines. A folder past `--depth` that still holds items
+/// ends in `…`; an expanded folder cut at the per-folder limit gets a note line.
+fn tree_lines(nodes: &[TreeNode], prefix: &str, out: &mut Vec<String>) {
     for (idx, node) in nodes.iter().enumerate() {
         let is_last = idx + 1 == nodes.len();
         let branch = if is_last { "└── " } else { "├── " };
         let suffix = if node.item.is_folder { "/" } else { "" };
-        println!("{prefix}{branch}{}{suffix}", node.item.name);
+        let depth_capped =
+            node.item.is_folder && node.children.is_empty() && node.has_more == Some(true);
+        let cue = if depth_capped { " …" } else { "" };
+        out.push(format!("{prefix}{branch}{}{suffix}{cue}", node.item.name));
         if !node.children.is_empty() {
             let next_prefix = format!("{prefix}{}", if is_last { "    " } else { "│   " });
-            print_tree_nodes(&node.children, &next_prefix);
+            tree_lines(&node.children, &next_prefix, out);
             if node.has_more == Some(true) {
-                println!("{next_prefix}… more items not shown (200 per folder)");
+                out.push(format!("{next_prefix}… more items not shown (200 per folder)"));
             }
         }
     }
@@ -3566,5 +3588,134 @@ mod tests {
         assert_eq!(nodes[1].children[0].item.id, "file-in-fld-b");
 
         srv2.abort();
+    }
+
+    #[tokio::test]
+    async fn build_tree_descends_shortcuts_with_effective_ids_and_marks_depth_cut_folders() {
+        use axum::{http::StatusCode as AxumStatus, routing::get, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::net::TcpListener;
+
+        // My drive holds a shortcut to a folder shared out of another drive (`remoteItem`).
+        // Its children live at /drives/drv-remote/items/remote-fld; the shortcut's own id in
+        // drv-me lists nothing the user can read.
+        let wrong_calls = Arc::new(AtomicUsize::new(0));
+        let wc = Arc::clone(&wrong_calls);
+        let router = Router::new()
+            .route(
+                "/v1.0/drives/drv-me/root/children",
+                get(|| async {
+                    Json(json!({
+                        "value": [{
+                            "id": "shortcut-1",
+                            "name": "Team Share",
+                            "parentReference": { "driveId": "drv-me", "id": "root-me" },
+                            "remoteItem": {
+                                "id": "remote-fld",
+                                "folder": { "childCount": 2 },
+                                "parentReference": { "driveId": "drv-remote" }
+                            }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/drives/drv-me/items/shortcut-1/children",
+                get(move || {
+                    let wc = Arc::clone(&wc);
+                    async move {
+                        wc.fetch_add(1, Ordering::SeqCst);
+                        (
+                            AxumStatus::NOT_FOUND,
+                            Json(json!({ "error": { "code": "itemNotFound", "message": "not here" } })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/drives/drv-remote/items/remote-fld/children",
+                get(|| async {
+                    Json(json!({
+                        "value": [
+                            {
+                                "id": "deep-fld",
+                                "name": "Deep",
+                                "folder": { "childCount": 5 },
+                                "parentReference": { "driveId": "drv-remote", "id": "remote-fld" }
+                            },
+                            {
+                                "id": "plan-1",
+                                "name": "plan.md",
+                                "size": 3,
+                                "file": { "mimeType": "text/markdown" },
+                                "parentReference": { "driveId": "drv-remote", "id": "remote-fld" }
+                            }
+                        ]
+                    }))
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1.0", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let cfg = AppConfig {
+            graph_base_url: base,
+            ..AppConfig::default()
+        };
+        let auth = AuthManager::from_tokens(
+            cfg.clone(),
+            StoredTokens {
+                access_token: "test-token".into(),
+                refresh_token: None,
+                expires_at: chrono::Utc::now().timestamp() + 3600,
+                client_id: "cid".into(),
+                tenant_id: "tid".into(),
+                user_id: Some("u1".into()),
+                user_display_name: None,
+                user_email: None,
+                auth_mode: "test".into(),
+            },
+        );
+        let graph = GraphClient::new(cfg, auth).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&tmp.path().join("cli-tree-remote.db")).unwrap();
+
+        let (nodes, truncated) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            build_tree(&graph, &storage, "drv-me", None, 2),
+        )
+        .await
+        .expect("build_tree must not hang")
+        .expect("a shortcut folder must be listed through its remote drive and item ids");
+        assert!(!truncated);
+        assert_eq!(wrong_calls.load(Ordering::SeqCst), 0, "the shortcut's local id was listed");
+
+        assert_eq!(nodes.len(), 1);
+        let share = &nodes[0];
+        assert_eq!(share.item.effective_drive_id(), "drv-remote");
+        assert_eq!(share.item.effective_item_id(), "remote-fld");
+        assert_eq!(share.has_more, Some(false));
+        let child_ids: Vec<&str> = share.children.iter().map(|n| n.item.id.as_str()).collect();
+        assert_eq!(child_ids, ["deep-fld", "plan-1"]);
+        let deep = &share.children[0];
+        assert!(deep.children.is_empty(), "Deep sits past --depth 2");
+        assert_eq!(deep.has_more, Some(true));
+
+        let mut lines = Vec::new();
+        tree_lines(&nodes, "", &mut lines);
+        assert_eq!(
+            lines,
+            [
+                "└── Team Share/",
+                "    ├── Deep/ …",
+                "    └── plan.md",
+            ],
+            "a folder cut by --depth that still holds items ends in …"
+        );
+
+        server.abort();
     }
 }
