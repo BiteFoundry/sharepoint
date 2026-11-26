@@ -5,7 +5,7 @@
 # seconds and match the published release artifact.
 FROM debian:bookworm-slim
 
-ARG SHAREPOINT_VERSION=0.4.4
+ARG SHAREPOINT_VERSION=0.4.5
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="sharepoint" \
