@@ -3,7 +3,7 @@
   "name": "io.github.BiteFoundry/sharepoint",
   "title": "SharePoint & OneDrive (TUI, CLI & MCP)",
   "description": "SharePoint & OneDrive MCP server, CLI, and TUI in Rust with list rows & conditional uploads.",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "websiteUrl": "https://bitefoundry.dev/#app-sharepoint",
   "repository": {
     "url": "https://github.com/BiteFoundry/sharepoint",
@@ -12,7 +12,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/bitefoundry/sharepoint:0.4.6",
+      "identifier": "ghcr.io/bitefoundry/sharepoint:0.4.7",
       "transport": {
         "type": "stdio"
       },
