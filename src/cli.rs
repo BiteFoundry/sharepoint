@@ -28,6 +28,7 @@ use crate::{
         TreeNode,
     },
     resolver,
+    safe_text::{sanitize_terminal_inline, sanitize_terminal_text},
     serve::{self, ServeOptions},
     storage::Storage,
     tui, updater,
@@ -830,11 +831,13 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             } else {
                 println!(
                     "Signed in as {} ({})",
-                    tokens
-                        .user_display_name
-                        .as_deref()
-                        .or(tokens.user_email.as_deref())
-                        .unwrap_or("Microsoft 365 User"),
+                    sanitize_terminal_inline(
+                        tokens
+                            .user_display_name
+                            .as_deref()
+                            .or(tokens.user_email.as_deref())
+                            .unwrap_or("Microsoft 365 User")
+                    ),
                     tokens.auth_mode
                 );
             }
@@ -873,9 +876,9 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     let star = if s.is_followed { "*" } else { " " };
                     println!(
                         "{star} {:<32}  {}  ({})",
-                        s.effective_name(),
-                        s.web_url.as_deref().unwrap_or(""),
-                        s.id
+                        sanitize_terminal_inline(s.effective_name()),
+                        sanitize_terminal_inline(s.web_url.as_deref().unwrap_or("")),
+                        sanitize_terminal_inline(&s.id)
                     );
                 }
             }
@@ -906,10 +909,10 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     };
                     println!(
                         "{:<34}  {:<16}{}  ({})",
-                        d.display_label(),
-                        d.drive_type,
+                        sanitize_terminal_inline(&d.display_label()),
+                        sanitize_terminal_inline(&d.drive_type),
                         quota,
-                        d.id
+                        sanitize_terminal_inline(&d.id)
                     );
                 }
             }
@@ -971,8 +974,8 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             } else {
                 println!(
                     "{} ({})",
-                    target_drive.display_label(),
-                    path_or_id.as_deref().unwrap_or("/")
+                    sanitize_terminal_inline(&target_drive.display_label()),
+                    sanitize_terminal_inline(path_or_id.as_deref().unwrap_or("/"))
                 );
                 if listing.items.is_empty() {
                     println!("  (empty)");
@@ -994,10 +997,10 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                         println!(
                             "  [{:<4}] {:<38} {:>10}  {}  ({})",
                             item.type_badge(),
-                            item.name,
+                            sanitize_terminal_inline(&item.name),
                             size,
-                            modified,
-                            item.id
+                            sanitize_terminal_inline(modified),
+                            sanitize_terminal_inline(&item.id)
                         );
                     }
                 }
@@ -1053,7 +1056,7 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     }))?
                 );
             } else {
-                println!("{}", target_drive.display_label());
+                println!("{}", sanitize_terminal_inline(&target_drive.display_label()));
                 print_tree_nodes(&nodes, "");
                 if root_cut {
                     println!("… more items not shown (200 per folder)");
@@ -1108,23 +1111,30 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 }
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
-                println!("Name:      {}", item.name);
-                println!("ID:        {}", item.id);
-                println!("Drive:     {}", item.drive_id);
-                println!("Path:      {}", item.display_path());
-                println!("Type:      {}", if item.is_folder { "Folder" } else { item.mime_type.as_deref().unwrap_or("File") });
+                println!("Name:      {}", sanitize_terminal_inline(&item.name));
+                println!("ID:        {}", sanitize_terminal_inline(&item.id));
+                println!("Drive:     {}", sanitize_terminal_inline(&item.drive_id));
+                println!("Path:      {}", sanitize_terminal_inline(&item.display_path()));
+                println!(
+                    "Type:      {}",
+                    if item.is_folder {
+                        std::borrow::Cow::Borrowed("Folder")
+                    } else {
+                        sanitize_terminal_inline(item.mime_type.as_deref().unwrap_or("File"))
+                    }
+                );
                 println!("Size:      {} ({} bytes)", format_human_size(item.size), item.size);
                 if let Some(m) = &item.last_modified_at {
-                    println!("Modified:  {m}");
+                    println!("Modified:  {}", sanitize_terminal_inline(m));
                 }
                 if let Some(a) = &item.last_modified_by {
-                    println!("Author:    {a}");
+                    println!("Author:    {}", sanitize_terminal_inline(a));
                 }
                 if let Some(s) = &item.shared_scope {
-                    println!("Sharing:   {s}");
+                    println!("Sharing:   {}", sanitize_terminal_inline(s));
                 }
                 if let Some(u) = &item.web_url {
-                    println!("Web URL:   {u}");
+                    println!("Web URL:   {}", sanitize_terminal_inline(u));
                 }
                 if let Some(page) = &vers {
                     if !page.versions.is_empty() {
@@ -1132,10 +1142,10 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                         for v in &page.versions {
                             println!(
                                 "  v{}  {}  {}  {}",
-                                v.id,
+                                sanitize_terminal_inline(&v.id),
                                 format_human_size(v.size),
-                                v.last_modified_at.as_deref().unwrap_or(""),
-                                v.last_modified_by.as_deref().unwrap_or("")
+                                sanitize_terminal_inline(v.last_modified_at.as_deref().unwrap_or("")),
+                                sanitize_terminal_inline(v.last_modified_by.as_deref().unwrap_or(""))
                             );
                         }
                     }
@@ -1194,7 +1204,8 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     }))?
                 );
             } else {
-                io::stdout().lock().write_all(text.as_bytes())?;
+                let safe_text = sanitize_terminal_text(&text);
+                io::stdout().lock().write_all(safe_text.as_bytes())?;
             }
             Ok(())
         }
@@ -1238,9 +1249,9 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             } else {
                 println!(
                     "Downloaded {} ({}) -> {}",
-                    downloaded.file_name,
+                    sanitize_terminal_inline(&downloaded.file_name),
                     format_human_size(downloaded.size_bytes),
-                    downloaded.path.display()
+                    sanitize_terminal_inline(&downloaded.path.display().to_string())
                 );
             }
             Ok(())
@@ -1329,10 +1340,10 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             } else {
                 println!(
                     "Uploaded {} ({}) -> {} (id: {})",
-                    uploaded.name,
+                    sanitize_terminal_inline(&uploaded.name),
                     format_human_size(uploaded.size),
-                    uploaded.display_path(),
-                    uploaded.id
+                    sanitize_terminal_inline(&uploaded.display_path()),
+                    sanitize_terminal_inline(&uploaded.id)
                 );
             }
             Ok(())
@@ -1373,7 +1384,11 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&folder)?);
             } else {
-                println!("Created folder '{}' (id: {})", folder.display_path(), folder.id);
+                println!(
+                    "Created folder '{}' (id: {})",
+                    sanitize_terminal_inline(&folder.display_path()),
+                    sanitize_terminal_inline(&folder.id)
+                );
             }
             Ok(())
         }
@@ -1437,7 +1452,11 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&updated)?);
             } else {
-                println!("Updated item -> {} (id: {})", updated.display_path(), updated.id);
+                println!(
+                    "Updated item -> {} (id: {})",
+                    sanitize_terminal_inline(&updated.display_path()),
+                    sanitize_terminal_inline(&updated.id)
+                );
             }
             Ok(())
         }
@@ -1465,7 +1484,11 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                 resolver::resolve_item_for_write(&graph, &storage, &target_drive.id, &item_or_path)
                     .await?;
             if !yes {
-                eprint!("Delete '{}' ({})? [y/N]: ", item.display_path(), item.id);
+                eprint!(
+                    "Delete '{}' ({})? [y/N]: ",
+                    sanitize_terminal_inline(&item.display_path()),
+                    sanitize_terminal_inline(&item.id)
+                );
                 let _ = io::stderr().flush();
                 let mut answer = String::new();
                 io::stdin().read_line(&mut answer)?;
@@ -1488,7 +1511,11 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     }))?
                 );
             } else {
-                println!("Deleted '{}' ({}).", item.display_path(), item.id);
+                println!(
+                    "Deleted '{}' ({}).",
+                    sanitize_terminal_inline(&item.display_path()),
+                    sanitize_terminal_inline(&item.id)
+                );
             }
             Ok(())
         }
@@ -1523,17 +1550,20 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
             } else if results.is_empty() {
-                println!("No matching files found for '{query}'.");
+                println!(
+                    "No matching files found for '{}'.",
+                    sanitize_terminal_inline(&query)
+                );
             } else {
                 for item in &results {
                     println!(
                         "[{:<4}] {:<36} {:>10}  {}  (drive: {}, id: {})",
                         item.type_badge(),
-                        item.name,
+                        sanitize_terminal_inline(&item.name),
                         format_human_size(item.size),
-                        item.display_path(),
-                        item.drive_id,
-                        item.id
+                        sanitize_terminal_inline(&item.display_path()),
+                        sanitize_terminal_inline(&item.drive_id),
+                        sanitize_terminal_inline(&item.id)
                     );
                 }
             }
@@ -1575,7 +1605,9 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             } else {
                 println!(
                     "Share link ({} / {}): {}",
-                    link.link_type, link.scope, link.web_url
+                    sanitize_terminal_inline(&link.link_type),
+                    sanitize_terminal_inline(&link.scope),
+                    sanitize_terminal_inline(&link.web_url)
                 );
             }
             Ok(())
@@ -1612,13 +1644,15 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     println!(
                         "[{:<4}] {:<36} {:>10}  {}  ({})",
                         item.type_badge(),
-                        item.name,
+                        sanitize_terminal_inline(&item.name),
                         format_human_size(item.size),
-                        item.last_modified_at
-                            .as_deref()
-                            .map(|s| s.get(..16).unwrap_or(s))
-                            .unwrap_or(""),
-                        item.id
+                        sanitize_terminal_inline(
+                            item.last_modified_at
+                                .as_deref()
+                                .map(|s| s.get(..16).unwrap_or(s))
+                                .unwrap_or("")
+                        ),
+                        sanitize_terminal_inline(&item.id)
                     );
                 }
             }
@@ -1656,10 +1690,10 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
                     println!(
                         "[{:<4}] {:<36} {:>10}  {}  ({})",
                         item.type_badge(),
-                        item.name,
+                        sanitize_terminal_inline(&item.name),
                         format_human_size(item.size),
-                        item.last_modified_by.as_deref().unwrap_or(""),
-                        item.id
+                        sanitize_terminal_inline(item.last_modified_by.as_deref().unwrap_or("")),
+                        sanitize_terminal_inline(&item.id)
                     );
                 }
             }
@@ -1817,7 +1851,11 @@ async fn run_list_action(config: &AppConfig, action: ListAction, as_json: bool) 
                 } else {
                     for list in lists {
                         let display = list.display_name.as_deref().unwrap_or(&list.name);
-                        println!("{}  {display}", list.id);
+                        println!(
+                            "{}  {}",
+                            sanitize_terminal_inline(&list.id),
+                            sanitize_terminal_inline(display)
+                        );
                     }
                 }
             }
@@ -1848,11 +1886,12 @@ async fn run_list_action(config: &AppConfig, action: ListAction, as_json: bool) 
                     );
                 } else {
                     for item in &page.items {
+                        let fields_json = serde_json::to_string(&item.fields)?;
                         println!(
                             "{}  {}  {}",
-                            item.id,
-                            item.e_tag.as_deref().unwrap_or(""),
-                            serde_json::to_string(&item.fields)?
+                            sanitize_terminal_inline(&item.id),
+                            sanitize_terminal_inline(item.e_tag.as_deref().unwrap_or("")),
+                            sanitize_terminal_inline(&fields_json)
                         );
                     }
                     if let Some(next) = &page.next_cursor {
@@ -1875,7 +1914,11 @@ async fn run_list_action(config: &AppConfig, action: ListAction, as_json: bool) 
                         } else {
                             ""
                         };
-                        println!("{}  {display}{access}", column.name);
+                        println!(
+                            "{}  {}{access}",
+                            sanitize_terminal_inline(&column.name),
+                            sanitize_terminal_inline(display)
+                        );
                     }
                 }
             }
@@ -1899,7 +1942,11 @@ async fn run_list_action(config: &AppConfig, action: ListAction, as_json: bool) 
                 if as_json {
                     println!("{}", serde_json::to_string_pretty(&update)?);
                 } else {
-                    println!("Updated {} on row {}.", update.field, update.item_id);
+                    println!(
+                        "Updated {} on row {}.",
+                        sanitize_terminal_inline(&update.field),
+                        sanitize_terminal_inline(&update.item_id)
+                    );
                 }
             }
         }
@@ -1976,13 +2023,13 @@ async fn cmd_whoami(config: &AppConfig, persona: Persona, as_json: bool) -> Resu
         println!("Persona:  {}", persona.display_name());
         println!(
             "User:     {} ({})",
-            tok.user_display_name.as_deref().unwrap_or("Unknown"),
-            tok.user_email.as_deref().unwrap_or("-")
+            sanitize_terminal_inline(tok.user_display_name.as_deref().unwrap_or("Unknown")),
+            sanitize_terminal_inline(tok.user_email.as_deref().unwrap_or("-"))
         );
-        println!("Auth:     {} ({})", tok.auth_mode, source);
+        println!("Auth:     {} ({})", tok.auth_mode, sanitize_terminal_inline(&source));
         if !diag.warnings.is_empty() {
             for w in &diag.warnings {
-                println!("Warning:  {w}");
+                println!("Warning:  {}", sanitize_terminal_inline(w));
             }
         }
     }
@@ -3001,7 +3048,10 @@ fn tree_lines(nodes: &[TreeNode], prefix: &str, out: &mut Vec<String>) {
         let depth_capped =
             node.item.is_folder && node.children.is_empty() && node.has_more == Some(true);
         let cue = if depth_capped { " …" } else { "" };
-        out.push(format!("{prefix}{branch}{}{suffix}{cue}", node.item.name));
+        out.push(format!(
+            "{prefix}{branch}{}{suffix}{cue}",
+            sanitize_terminal_inline(&node.item.name)
+        ));
         if !node.children.is_empty() {
             let next_prefix = format!("{prefix}{}", if is_last { "    " } else { "│   " });
             tree_lines(&node.children, &next_prefix, out);
@@ -3031,7 +3081,7 @@ fn render_image_to_stdout(
     )?;
     print!("{out}");
     let _ = io::stdout().flush();
-    eprintln!("{label}");
+    eprintln!("{}", sanitize_terminal_inline(label));
     Ok(())
 }
 
@@ -3041,7 +3091,10 @@ fn print_daemon_status(status: &crate::daemon::DaemonStatus, as_json: bool) -> R
     } else if status.running {
         println!(
             "Daemon running (pid={:?}, transport={:?}, clients={}, summary={})",
-            status.pid, status.transport, status.attached_clients, status.sync_summary
+            status.pid,
+            status.transport,
+            status.attached_clients,
+            sanitize_terminal_inline(&status.sync_summary)
         );
     } else {
         println!("Daemon is not running.");

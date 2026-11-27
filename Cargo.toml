@@ -5,6 +5,18 @@ edition = "2021"
 default-run = "sharepoint"
 description = "Unified Microsoft SharePoint & OneDrive terminal client & AI agent toolkit — Sites, Document Libraries & Personal Files (CLI, TUI, HTTP API, MCP)"
 license = "MIT"
+repository = "https://github.com/BiteFoundry/sharepoint"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/sharepoint-{ version }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "sharepoint{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [lib]
 name = "sharepoint_cli"
