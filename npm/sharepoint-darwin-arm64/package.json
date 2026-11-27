@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/sharepoint-darwin-arm64",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "Prebuilt sharepoint binary for macOS arm64",
   "repository": {
     "type": "git",
