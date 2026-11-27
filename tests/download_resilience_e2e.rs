@@ -53,7 +53,7 @@ fn slow_payload() -> Vec<u8> {
 
 /// A body whose first chunk is sent at once and every later one after `gap`.
 fn drip_body(chunks: usize, gap: Duration) -> Body {
-    Body::from_stream(futures::stream::unfold(0usize, move |i| async move {
+    Body::from_stream(futures_util::stream::unfold(0usize, move |i| async move {
         if i >= chunks {
             return None;
         }

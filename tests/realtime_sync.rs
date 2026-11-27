@@ -22,7 +22,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use futures::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::{
     net::TcpListener,

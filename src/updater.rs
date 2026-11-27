@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use rand::RngCore;
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -486,13 +487,66 @@ pub(crate) fn verify_sha256_sums(
     Ok(())
 }
 
+struct TempExtractDir {
+    path: PathBuf,
+}
+
+impl TempExtractDir {
+    fn new() -> Result<Self> {
+        let base = std::env::temp_dir();
+        let mut rng = rand::thread_rng();
+        let mut nonce = [0u8; 16];
+
+        for _ in 0..32 {
+            rng.fill_bytes(&mut nonce);
+            let candidate = base.join(format!("sharepoint-update-{}", hex::encode(nonce)));
+            match create_private_dir(&candidate) {
+                Ok(()) => return Ok(Self { path: candidate }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "Failed to create temporary directory for update extraction: {}",
+                            candidate.display()
+                        )
+                    });
+                }
+            }
+        }
+
+        bail!("Failed to create unique temporary directory for update extraction after retries")
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempExtractDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
+}
+
 fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec<u8>> {
     let lower = asset_name.to_ascii_lowercase();
     if !lower.ends_with(".tar.gz") && !lower.ends_with(".tgz") && !lower.ends_with(".zip") {
         return Ok(asset_bytes.to_vec());
     }
 
-    let tmp = tempfile::tempdir().context("Failed to create temporary directory for update extraction")?;
+    let tmp = TempExtractDir::new()?;
     let archive_path = tmp.path().join(asset_name);
     std::fs::write(&archive_path, asset_bytes)
         .with_context(|| format!("Failed to save temporary archive: {}", archive_path.display()))?;
@@ -1075,5 +1129,25 @@ mod tests {
             assert_eq!(std::fs::read(&victim).unwrap(), b"PROTECTED");
             assert_eq!(std::fs::read(&target_exe).unwrap(), b"OLD");
         }
+    }
+
+    #[test]
+    fn test_temp_extract_dir_creates_and_cleans_up_on_drop() {
+        let dir_path = {
+            let tmp = TempExtractDir::new().unwrap();
+            let path = tmp.path().to_path_buf();
+            assert!(path.is_dir());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700);
+            }
+            let nested = path.join("nested.bin");
+            std::fs::write(&nested, b"payload").unwrap();
+            assert!(nested.is_file());
+            path
+        };
+        assert!(!dir_path.exists(), "TempExtractDir should remove directory on Drop");
     }
 }

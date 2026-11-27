@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use crate::{
@@ -2197,7 +2197,7 @@ pub async fn discover_drives(
         .iter()
         .map(|s| (s.id.clone(), s.effective_name().to_string()))
         .collect();
-    let results: Vec<_> = futures::stream::iter(site_targets)
+    let results: Vec<_> = futures_util::stream::iter(site_targets)
         .map(|(id, name)| async move { graph.list_site_drives(&id, Some(&name)).await })
         .buffered(8)
         .collect()
@@ -2934,7 +2934,7 @@ fn build_tree_inner<'a>(
             return Ok((nodes, cut));
         }
 
-        let results: Vec<Result<TreeNode>> = futures::stream::iter(items)
+        let results: Vec<Result<TreeNode>> = futures_util::stream::iter(items)
             .map(|item| {
                 let sem = std::sync::Arc::clone(&sem);
                 async move {

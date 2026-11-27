@@ -10,7 +10,7 @@
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use rand::Rng;
 use reqwest::StatusCode;
 use serde::Deserialize;

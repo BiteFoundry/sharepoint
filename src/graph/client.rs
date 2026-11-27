@@ -4,7 +4,7 @@
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use rand::Rng;
 use reqwest::{Method, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};

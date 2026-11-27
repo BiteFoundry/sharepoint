@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use futures::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::{

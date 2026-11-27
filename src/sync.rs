@@ -16,7 +16,7 @@ use std::{
 };
 
 use anyhow::Result;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -578,7 +578,7 @@ pub async fn bootstrap_sharepoint(graph: &GraphClient, storage: &Storage) -> Res
                 .iter()
                 .map(|site| (site.id.clone(), site.effective_name().to_string()))
                 .collect();
-            let drive_lists: Vec<_> = futures::stream::iter(targets)
+            let drive_lists: Vec<_> = futures_util::stream::iter(targets)
                 .map(|(site_id, site_name)| async move {
                     graph.list_site_drives(&site_id, Some(&site_name)).await
                 })
@@ -1659,7 +1659,7 @@ async fn resync_drive_after_410_or_overflow(
             folder_requests.push((Some(ancestor.clone()), FOLDER_PAGE_SIZE, false));
         }
     }
-    let fetched_folders: Vec<_> = futures::stream::iter(folder_requests)
+    let fetched_folders: Vec<_> = futures_util::stream::iter(folder_requests)
         .map(|(folder_id, lim, required)| async move {
             let res = graph
                 .list_children_detailed(drive_id, folder_id.as_deref(), Some(lim))
@@ -2003,7 +2003,7 @@ async fn sync_sites_once(
         }
         // `buffered` preserves site priority order (followed sites first, ensuring deterministic
         // initial SharePoint library selection) while overlapping up to 4 drive fetches.
-        let mut stream = futures::stream::iter(targets)
+        let mut stream = futures_util::stream::iter(targets)
             .map(|(site_id, site_name)| async move {
                 let res = graph.list_site_drives(&site_id, site_name.as_deref()).await;
                 (site_id, res)
