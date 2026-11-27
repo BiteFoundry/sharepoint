@@ -1353,7 +1353,15 @@ pub fn is_image_mime_or_name(content_type: &str, file_name: Option<&str>) -> boo
 /// Strictly validates raw bytes before decode so spoofed HTML is never passed to the image pipeline.
 pub fn validate_raster_image_bytes(bytes: &[u8]) -> Result<()> {
     match sniff_content_kind(None, None, Some(bytes)) {
-        ContentKind::RasterImage | ContentKind::Svg => Ok(()),
+        ContentKind::RasterImage => Ok(()),
+        #[cfg(feature = "svg-graphics")]
+        ContentKind::Svg => Ok(()),
+        #[cfg(not(feature = "svg-graphics"))]
+        ContentKind::Svg => {
+            bail!(
+                "SVG rasterization is disabled in this build (rebuild with `--features svg-graphics`)"
+            )
+        }
         ContentKind::Html => {
             bail!("Content is HTML rather than a raster image (open in interactive HTML viewer)")
         }
@@ -1363,6 +1371,7 @@ pub fn validate_raster_image_bytes(bytes: &[u8]) -> Result<()> {
 
 enum PreparedImageBytes<'a> {
     Raster(&'a [u8]),
+    #[cfg(feature = "svg-graphics")]
     RasterizedSvg(Arc<[u8]>),
 }
 
@@ -1370,15 +1379,24 @@ impl<'a> PreparedImageBytes<'a> {
     fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Raster(b) => b,
+            #[cfg(feature = "svg-graphics")]
             Self::RasterizedSvg(b) => b.as_ref(),
         }
     }
 
     fn is_svg(&self) -> bool {
-        matches!(self, Self::RasterizedSvg(_))
+        #[cfg(feature = "svg-graphics")]
+        {
+            matches!(self, Self::RasterizedSvg(_))
+        }
+        #[cfg(not(feature = "svg-graphics"))]
+        {
+            false
+        }
     }
 }
 
+#[cfg(feature = "svg-graphics")]
 fn svg_raster_budget(fit: FitBox, cell_px: (u16, u16)) -> (u32, u32) {
     let cap = bitefoundry_html::graphics::MAX_RASTER_DIM_PX;
     if fit.scrollable {
@@ -1407,6 +1425,7 @@ fn prepare_image_bytes<'a>(
 ) -> Result<PreparedImageBytes<'a>> {
     match sniff_content_kind(None, None, Some(bytes)) {
         ContentKind::RasterImage => Ok(PreparedImageBytes::Raster(bytes)),
+        #[cfg(feature = "svg-graphics")]
         ContentKind::Svg => {
             let (max_px_w, max_px_h) = svg_raster_budget(fit, cell_px);
             let raster = bitefoundry_html::graphics::rasterize_svg_to_png(
@@ -1414,6 +1433,13 @@ fn prepare_image_bytes<'a>(
             )
             .context("Failed to rasterize SVG image")?;
             Ok(PreparedImageBytes::RasterizedSvg(raster.png_bytes))
+        }
+        #[cfg(not(feature = "svg-graphics"))]
+        ContentKind::Svg => {
+            let _ = (fit, cell_px);
+            bail!(
+                "SVG rasterization is disabled in this build (rebuild with `--features svg-graphics`)"
+            )
         }
         ContentKind::Html => {
             bail!("Content is HTML rather than a raster image (open in interactive HTML viewer)")
@@ -2930,38 +2956,49 @@ mod tests {
         assert!(format!("{err_html:#}").contains("HTML"), "{err_html:#}");
 
         let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="#e11d48"/></svg>"##;
-        let hb = decode_and_render_halfblocks(svg, 20, 10, (0, 0, 0)).expect("svg halfblock");
-        assert_eq!(hb.format_label, "SVG");
-        assert_eq!(hb.protocol, TerminalImageProtocol::Halfblock);
-        assert!(!hb.lines.is_empty());
-        assert!(hb.lines.iter().any(|l| l.spans.iter().any(|s| s.content.contains('▀'))));
+        #[cfg(feature = "svg-graphics")]
+        {
+            let hb = decode_and_render_halfblocks(svg, 20, 10, (0, 0, 0)).expect("svg halfblock");
+            assert_eq!(hb.format_label, "SVG");
+            assert_eq!(hb.protocol, TerminalImageProtocol::Halfblock);
+            assert!(!hb.lines.is_empty());
+            assert!(hb.lines.iter().any(|l| l.spans.iter().any(|s| s.content.contains('▀'))));
 
-        let sixel = decode_and_render_for_protocol(
-            svg,
-            FitBox::fixed(20, 10),
-            (0, 0, 0),
-            TerminalGraphicsCaps {
-                protocol: TerminalImageProtocol::Sixel,
-                ..Default::default()
-            },
-        )
-        .expect("svg sixel");
-        assert_eq!(sixel.format_label, "SVG");
-        assert_eq!(sixel.protocol, TerminalImageProtocol::Sixel);
-        assert!(sixel.pixel_payload.as_deref().is_some_and(|p| p.starts_with("\x1bP0;1;q")));
+            let sixel = decode_and_render_for_protocol(
+                svg,
+                FitBox::fixed(20, 10),
+                (0, 0, 0),
+                TerminalGraphicsCaps {
+                    protocol: TerminalImageProtocol::Sixel,
+                    ..Default::default()
+                },
+            )
+            .expect("svg sixel");
+            assert_eq!(sixel.format_label, "SVG");
+            assert_eq!(sixel.protocol, TerminalImageProtocol::Sixel);
+            assert!(sixel.pixel_payload.as_deref().is_some_and(|p| p.starts_with("\x1bP0;1;q")));
 
-        let kitty = decode_and_render_for_protocol(
-            svg,
-            FitBox::fixed(20, 10),
-            (0, 0, 0),
-            TerminalGraphicsCaps {
-                protocol: TerminalImageProtocol::Kitty,
-                ..Default::default()
-            },
-        )
-        .expect("svg kitty");
-        assert_eq!(kitty.format_label, "SVG");
-        assert!(kitty.pixel_payload.as_deref().is_some_and(|p| p.starts_with("\x1b_G")));
+            let kitty = decode_and_render_for_protocol(
+                svg,
+                FitBox::fixed(20, 10),
+                (0, 0, 0),
+                TerminalGraphicsCaps {
+                    protocol: TerminalImageProtocol::Kitty,
+                    ..Default::default()
+                },
+            )
+            .expect("svg kitty");
+            assert_eq!(kitty.format_label, "SVG");
+            assert!(kitty.pixel_payload.as_deref().is_some_and(|p| p.starts_with("\x1b_G")));
+        }
+        #[cfg(not(feature = "svg-graphics"))]
+        {
+            let err_svg = decode_and_render_halfblocks(svg, 20, 10, (0, 0, 0)).unwrap_err();
+            assert!(
+                format!("{err_svg:#}").contains("svg-graphics"),
+                "{err_svg:#}"
+            );
+        }
     }
 
     #[test]

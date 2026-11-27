@@ -758,6 +758,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "html-js")]
     fn interactive_button_onclick_click_at_raw_toggle_and_serve_action() {
         let html = r#"
             <html><body>
@@ -922,6 +923,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "svg-graphics", feature = "html-js"))]
     fn inline_svg_renders_halfblock_in_reserved_slot_and_preserves_button_click_coords() {
         let html = r##"
             <html><body>
@@ -1006,6 +1008,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "svg-graphics", feature = "html-js"))]
     fn inline_svg_pixel_protocol_pushes_pending_graphic_and_marks_cells_skip() {
         let html = r##"
             <html><body>

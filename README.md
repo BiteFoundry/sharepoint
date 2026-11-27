@@ -14,7 +14,7 @@
 
 <br />
 
-![Microsoft SharePoint & OneDrive TUI Demo](https://raw.githubusercontent.com/BiteFoundry/sharepoint/master/assets/demo.gif)
+![Microsoft SharePoint & OneDrive TUI Demo](https://bitefoundry.dev/assets/demos/sharepoint.gif)
 
 </div>
 
