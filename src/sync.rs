@@ -523,18 +523,35 @@ impl DriveSyncRuntime {
     }
 }
 
+async fn run_blocking<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| anyhow::anyhow!("blocking storage task failed: {e}"))?
+}
+
 /// Reads the active folder from the cache for a `FolderItemsUpdated` event.
 /// The folder counts as truncated when the cache holds more than `limit` rows or when the
 /// last Graph listing of it stopped early.
-fn cached_folder_page(
+async fn cached_folder_page(
     storage: &Storage,
     rt: &DriveSyncRuntime,
     drive_id: &str,
     parent_id: Option<&str>,
     limit: usize,
 ) -> Result<(Vec<DriveItem>, bool)> {
-    let (items, cut) = storage.list_folder_children_page(drive_id, parent_id, limit)?;
-    Ok((items, cut || rt.folder_is_incomplete(drive_id, parent_id)))
+    let incomplete = rt.folder_is_incomplete(drive_id, parent_id);
+    let storage = storage.clone();
+    let did = drive_id.to_string();
+    let pid = parent_id.map(str::to_string);
+    let (items, cut) = run_blocking(move || {
+        storage.list_folder_children_page(&did, pid.as_deref(), limit)
+    })
+    .await?;
+    Ok((items, cut || incomplete))
 }
 
 /// Performs an initial bootstrap of `/me/drive`, `/me/followedSites`, `/sites?search=*`,
@@ -542,7 +559,12 @@ fn cached_folder_page(
 pub async fn bootstrap_sharepoint(graph: &GraphClient, storage: &Storage) -> Result<()> {
     let my_drive_fut = async {
         if let Ok(drive) = graph.get_my_drive().await {
-            let _ = storage.upsert_drives(std::slice::from_ref(&drive));
+            let st = storage.clone();
+            let d = drive.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = st.upsert_drives(std::slice::from_ref(&d));
+            })
+            .await;
             let (dummy_tx, _) = mpsc::unbounded_channel();
             let mut rt = DriveSyncRuntime::default();
             let _ = sync_drive_delta_once(
@@ -568,10 +590,17 @@ pub async fn bootstrap_sharepoint(graph: &GraphClient, storage: &Storage) -> Res
             followed_res.unwrap_or_default(),
             discovered_res.unwrap_or_default(),
         );
-        if authoritative_follow {
-            let _ = storage.upsert_sites_with_follow_state(&sites);
-        } else if !sites.is_empty() {
-            let _ = storage.upsert_sites(&sites);
+        if authoritative_follow || !sites.is_empty() {
+            let st = storage.clone();
+            let sites_for_db = sites.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if authoritative_follow {
+                    let _ = st.upsert_sites_with_follow_state(&sites_for_db);
+                } else {
+                    let _ = st.upsert_sites(&sites_for_db);
+                }
+            })
+            .await;
         }
         if !sites.is_empty() {
             let targets: Vec<(String, String)> = sites_for_drive_prefetch(&sites)
@@ -585,8 +614,13 @@ pub async fn bootstrap_sharepoint(graph: &GraphClient, storage: &Storage) -> Res
                 .buffered(SITE_DRIVE_FETCH_CONCURRENCY)
                 .collect()
                 .await;
-            for drives in drive_lists.into_iter().flatten() {
-                let _ = storage.upsert_drives(&drives);
+            let all_drives: Vec<DriveInfo> = drive_lists.into_iter().flatten().flatten().collect();
+            if !all_drives.is_empty() {
+                let st = storage.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = st.upsert_drives(&all_drives);
+                })
+                .await;
             }
         }
     };
@@ -594,7 +628,12 @@ pub async fn bootstrap_sharepoint(graph: &GraphClient, storage: &Storage) -> Res
     let recent_fut = async {
         if let Ok(recent) = graph.fetch_virtual_list(VirtualListKind::Recent, 50).await {
             if recent.status.is_available() {
-                let _ = storage.replace_recent_items(&recent.items);
+                let st = storage.clone();
+                let items = recent.items;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = st.replace_recent_items(&items);
+                })
+                .await;
             }
         }
     };
@@ -605,7 +644,12 @@ pub async fn bootstrap_sharepoint(graph: &GraphClient, storage: &Storage) -> Res
             .await
         {
             if shared.status.is_available() {
-                let _ = storage.replace_shared_items(&shared.items);
+                let st = storage.clone();
+                let items = shared.items;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = st.replace_shared_items(&items);
+                })
+                .await;
             }
         }
     };
@@ -864,7 +908,12 @@ pub fn spawn_sync_engine(
                             SyncCommand::SyncSiteDrives { site_id, site_name } => {
                                 match graph.list_site_drives(&site_id, site_name.as_deref()).await {
                                     Ok(drives) => {
-                                        let _ = storage.upsert_drives(&drives);
+                                        let st = storage.clone();
+                                        let drives_for_db = drives.clone();
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            let _ = st.upsert_drives(&drives_for_db);
+                                        })
+                                        .await;
                                         let _ = event_tx.send(CoreEvent::DrivesUpdated { site_id, drives });
                                     }
                                     Err(err) => {
@@ -883,13 +932,17 @@ pub fn spawn_sync_engine(
                                 let result = match initial_result {
                                     Some(true) => Ok(()),
                                     Some(false) => sync_folder_once(&graph, &storage, &event_tx, &mut rt, &drive_id, None, limit).await,
-                                    None => match storage.get_sync_cursor(&drive_cursor_scope_key(&drive_id)) {
-                                        Ok(None) if !rt.delta_unsupported_drives.contains(&drive_id) => {
-                                            bootstrap_drive_with_delta(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref(), limit).await
+                                    None => {
+                                        let st = storage.clone();
+                                        let scope = drive_cursor_scope_key(&drive_id);
+                                        match run_blocking(move || st.get_sync_cursor(&scope)).await {
+                                            Ok(None) if !rt.delta_unsupported_drives.contains(&drive_id) => {
+                                                bootstrap_drive_with_delta(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref(), limit).await
+                                            }
+                                            Ok(_) => sync_folder_once(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref(), limit).await,
+                                            Err(err) => Err(err),
                                         }
-                                        Ok(_) => sync_folder_once(&graph, &storage, &event_tx, &mut rt, &drive_id, parent_id.as_deref(), limit).await,
-                                        Err(err) => Err(err),
-                                    },
+                                    }
                                 };
                                 if let Err(err) = result {
                                     let _ = event_tx.send(CoreEvent::SyncError(format!("List folder: {err:#}")));
@@ -1293,10 +1346,20 @@ pub async fn bootstrap_drive_with_delta(
     if seed_link.is_some() && inferred_root_id.is_none() {
         inferred_root_id = graph.get_drive_root_id_cached(drive_id).await.ok();
     }
-    if page.complete {
-        storage.replace_folder_children(drive_id, active_parent_id, &page.items)?;
-    } else {
-        storage.upsert_drive_items(&page.items)?;
+    {
+        let st = storage.clone();
+        let did = drive_id.to_string();
+        let pid = active_parent_id.map(str::to_string);
+        let complete = page.complete;
+        let items_for_db = page.items.clone();
+        run_blocking(move || {
+            if complete {
+                st.replace_folder_children(&did, pid.as_deref(), &items_for_db)
+            } else {
+                st.upsert_drive_items(&items_for_db).map(|_| ())
+            }
+        })
+        .await?;
     }
     let (items, truncated, progress) = if let Some(seed_url) = seed_link {
         let progress = pull_delta_pages_and_emit(
@@ -1312,7 +1375,7 @@ pub async fn bootstrap_drive_with_delta(
         )
         .await?;
         let (items, truncated) =
-            cached_folder_page(storage, rt, drive_id, active_parent_id, limit)?;
+            cached_folder_page(storage, rt, drive_id, active_parent_id, limit).await?;
         (items, truncated, progress)
     } else {
         (page.items, !page.complete, DeltaProgress::CaughtUp)
@@ -1347,7 +1410,9 @@ pub async fn sync_drive_delta_once(
 
     let scope_key = drive_cursor_scope_key(drive_id);
     for _ in 0..MAX_DELTA_PASSES_PER_SYNC {
-        let existing_cursor = storage.get_sync_cursor(&scope_key)?;
+        let st = storage.clone();
+        let sk = scope_key.clone();
+        let existing_cursor = run_blocking(move || st.get_sync_cursor(&sk)).await?;
         let Some(saved_delta_link) = existing_cursor
             .as_ref()
             .and_then(|c| c.delta_link.clone())
@@ -1466,12 +1531,19 @@ async fn pull_delta_pages_once(
                     last_synced_at: now_rfc3339(),
                 });
 
-                let outcome = storage.apply_delta_page(
-                    drive_id,
-                    &page.changes,
-                    known_root_id.as_deref(),
-                    commit_cursor.as_ref(),
-                )?;
+                let st = storage.clone();
+                let did = drive_id.to_string();
+                let changes = page.changes;
+                let root_for_db = known_root_id.clone();
+                let outcome = run_blocking(move || {
+                    st.apply_delta_page(
+                        &did,
+                        &changes,
+                        root_for_db.as_deref(),
+                        commit_cursor.as_ref(),
+                    )
+                })
+                .await?;
                 if let Some(det) = outcome.detected_root_id {
                     known_root_id = Some(det);
                 }
@@ -1493,7 +1565,7 @@ async fn pull_delta_pages_once(
     // Read the active folder after any changed pass so the old parent loses moved items.
     if changed_items {
         let (items, truncated) =
-            cached_folder_page(storage, rt, drive_id, active_parent_id, limit)?;
+            cached_folder_page(storage, rt, drive_id, active_parent_id, limit).await?;
         let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
             drive_id: drive_id.to_string(),
             parent_id: active_parent_id.map(str::to_string),
@@ -1612,16 +1684,22 @@ async fn resync_drive_after_410_or_overflow(
                     history_next_link: encode_root_id(known_root_id.as_deref()),
                     last_synced_at: now_rfc3339(),
                 };
-                storage.replace_drive_items_from_resync(
-                    drive_id,
-                    &collected,
-                    known_root_id.as_deref(),
-                    &cursor,
-                )?;
+                let st = storage.clone();
+                let did = drive_id.to_string();
+                let root_for_db = known_root_id.clone();
+                run_blocking(move || {
+                    st.replace_drive_items_from_resync(
+                        &did,
+                        &collected,
+                        root_for_db.as_deref(),
+                        &cursor,
+                    )
+                })
+                .await?;
                 // The resync enumerated the whole drive, so the cache is now the full picture.
                 rt.incomplete_folders.retain(|(drive, _)| drive != drive_id);
                 let (items, truncated) =
-                    cached_folder_page(storage, rt, drive_id, active_parent_id, limit)?;
+                    cached_folder_page(storage, rt, drive_id, active_parent_id, limit).await?;
                 let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
                     drive_id: drive_id.to_string(),
                     parent_id: active_parent_id.map(str::to_string),
@@ -1641,7 +1719,14 @@ async fn resync_drive_after_410_or_overflow(
     // the breadcrumb never shows rows the resync could not check. Read the chain from the
     // cache before the root re-list can drop part of it.
     let ancestors = match active_parent_id {
-        Some(pid) => cached_ancestor_ids(storage, drive_id, pid, known_root_id.as_deref())?,
+        Some(pid) => {
+            let st = storage.clone();
+            let did = drive_id.to_string();
+            let pid = pid.to_string();
+            let root_for_db = known_root_id.clone();
+            run_blocking(move || cached_ancestor_ids(&st, &did, &pid, root_for_db.as_deref()))
+                .await?
+        }
         None => Vec::new(),
     };
 
@@ -1692,13 +1777,21 @@ async fn resync_drive_after_410_or_overflow(
             }
         }
         rt.note_folder_listing(drive_id, folder_id.as_deref(), page.complete);
-        if page.complete {
-            storage.replace_folder_children(drive_id, folder_id.as_deref(), &page.items)?;
-        } else {
-            storage.upsert_drive_items(&page.items)?;
-        }
+        let st = storage.clone();
+        let did = drive_id.to_string();
+        let fid = folder_id.clone();
+        let complete = page.complete;
+        let items = page.items;
+        run_blocking(move || {
+            if complete {
+                st.replace_folder_children(&did, fid.as_deref(), &items)
+            } else {
+                st.upsert_drive_items(&items).map(|_| ())
+            }
+        })
+        .await?;
     }
-    let (items, truncated) = cached_folder_page(storage, rt, drive_id, active_parent_id, limit)?;
+    let (items, truncated) = cached_folder_page(storage, rt, drive_id, active_parent_id, limit).await?;
     let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
         drive_id: drive_id.to_string(),
         parent_id: active_parent_id.map(str::to_string),
@@ -1801,7 +1894,12 @@ async fn sync_core_discovery(
     let my_drive_fut = async {
         match graph.get_my_drive().await {
             Ok(drive) => {
-                let _ = storage.upsert_drives(std::slice::from_ref(&drive));
+                let st = storage.clone();
+                let d = drive.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = st.upsert_drives(std::slice::from_ref(&d));
+                })
+                .await;
                 let _ = event_tx.send(CoreEvent::MyDriveLoaded(drive.clone()));
                 let skipped_for_active =
                     overlap_drive_id.as_deref() == Some(drive.id.as_str());
@@ -1809,12 +1907,18 @@ async fn sync_core_discovery(
                 if rt_delta_unsupported.contains(&drive.id) {
                     local_rt.delta_unsupported_drives.insert(drive.id.clone());
                 }
-                let root_load = if !skipped_for_active
-                    && storage
-                        .get_sync_cursor(&drive_cursor_scope_key(&drive.id))
-                        .is_ok_and(|cursor| cursor.is_none())
+                let needs_bootstrap = if !skipped_for_active
                     && !local_rt.delta_unsupported_drives.contains(&drive.id)
                 {
+                    let st = storage.clone();
+                    let scope = drive_cursor_scope_key(&drive.id);
+                    run_blocking(move || st.get_sync_cursor(&scope))
+                        .await
+                        .is_ok_and(|cursor| cursor.is_none())
+                } else {
+                    false
+                };
+                let root_load = if needs_bootstrap {
                     let loaded = bootstrap_drive_with_delta(
                         graph,
                         storage,
@@ -1937,13 +2041,22 @@ async fn fetch_and_emit_virtual_list(
     let fetch = graph.fetch_virtual_list(kind, 50).await.ok()?;
     let unavailable = match &fetch.status.availability {
         VirtualListAvailability::Available => {
+            let st = storage.clone();
+            let items_for_db = fetch.items.clone();
+            let _ = tokio::task::spawn_blocking(move || match kind {
+                VirtualListKind::Recent => {
+                    let _ = st.replace_recent_items(&items_for_db);
+                }
+                VirtualListKind::SharedWithMe => {
+                    let _ = st.replace_shared_items(&items_for_db);
+                }
+            })
+            .await;
             match kind {
                 VirtualListKind::Recent => {
-                    let _ = storage.replace_recent_items(&fetch.items);
                     let _ = event_tx.send(CoreEvent::RecentItemsUpdated(fetch.items));
                 }
                 VirtualListKind::SharedWithMe => {
-                    let _ = storage.replace_shared_items(&fetch.items);
                     let _ = event_tx.send(CoreEvent::SharedItemsUpdated(fetch.items));
                 }
             }
@@ -1984,10 +2097,17 @@ async fn sync_sites_once(
         followed_res.unwrap_or_default(),
         discovered_res.unwrap_or_default(),
     );
-    if authoritative_follow {
-        let _ = storage.upsert_sites_with_follow_state(&combined);
-    } else if !combined.is_empty() {
-        let _ = storage.upsert_sites(&combined);
+    if authoritative_follow || !combined.is_empty() {
+        let st = storage.clone();
+        let sites_for_db = combined.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if authoritative_follow {
+                let _ = st.upsert_sites_with_follow_state(&sites_for_db);
+            } else {
+                let _ = st.upsert_sites(&sites_for_db);
+            }
+        })
+        .await;
     }
     if !combined.is_empty() || authoritative_follow {
         let _ = event_tx.send(CoreEvent::SitesUpdated(combined.clone()));
@@ -2011,7 +2131,12 @@ async fn sync_sites_once(
             .buffered(SITE_DRIVE_FETCH_CONCURRENCY);
         while let Some((site_id, res)) = stream.next().await {
             if let Ok(drives) = res {
-                let _ = storage.upsert_drives(&drives);
+                let st = storage.clone();
+                let drives_for_db = drives.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = st.upsert_drives(&drives_for_db);
+                })
+                .await;
                 let _ = event_tx.send(CoreEvent::DrivesUpdated { site_id, drives });
             }
         }
@@ -2031,10 +2156,20 @@ async fn sync_folder_once(
         .list_children_detailed(drive_id, parent_id, Some(limit))
         .await?;
     rt.note_folder_listing(drive_id, parent_id, page.complete);
-    if page.complete {
-        storage.replace_folder_children(drive_id, parent_id, &page.items)?;
-    } else {
-        storage.upsert_drive_items(&page.items)?;
+    {
+        let st = storage.clone();
+        let did = drive_id.to_string();
+        let pid = parent_id.map(str::to_string);
+        let complete = page.complete;
+        let items_for_db = page.items.clone();
+        run_blocking(move || {
+            if complete {
+                st.replace_folder_children(&did, pid.as_deref(), &items_for_db)
+            } else {
+                st.upsert_drive_items(&items_for_db).map(|_| ())
+            }
+        })
+        .await?;
     }
     let _ = event_tx.send(CoreEvent::FolderItemsUpdated {
         drive_id: drive_id.to_string(),

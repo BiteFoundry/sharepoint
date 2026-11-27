@@ -61,11 +61,13 @@ impl AppState {
             .map(DriveItem::content_revision);
         self.text_previews = Some((Self::text_preview_key(drive_id, item_id), content));
         self.text_preview_revision = rev;
+        self.text_preview_gen = self.text_preview_gen.wrapping_add(1);
     }
 
     pub fn clear_inspector_preview(&mut self, ui: &mut UiState) {
         self.text_previews = None;
         self.text_preview_revision = None;
+        self.text_preview_gen = self.text_preview_gen.wrapping_add(1);
         ui.markup_cache = None;
         self.preview_errors.retain(|k, _| !k.starts_with("txt:"));
     }
@@ -116,6 +118,7 @@ impl AppState {
                 if key_mismatch || rev_mismatch {
                     self.text_previews = None;
                     self.text_preview_revision = None;
+                    self.text_preview_gen = self.text_preview_gen.wrapping_add(1);
                     ui.markup_cache = None;
                     if rev_mismatch {
                         let inflight_same_rev = self

@@ -9,13 +9,13 @@ pub use crate::models::MarkupKind;
 use crate::ui::overlays::html_preview::HtmlPreviewOverlay;
 use crate::ui::theme::Theme;
 
-/// Cache key uniquely identifying a rendered markup preview for O(1) redraw/scroll reuse.
+/// Cache key uniquely identifying a pre-wrapped inspector text/markup preview for O(1) redraw/scroll reuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkupCacheKey {
     pub item_id: String,
-    pub kind: MarkupKind,
-    pub content_len: usize,
-    pub content_hash: u64,
+    pub kind: Option<MarkupKind>,
+    pub rendered: bool,
+    pub content_gen: u64,
     pub width: u16,
     pub theme_preset: ThemePreset,
     pub theme_no_color: bool,
@@ -23,10 +23,12 @@ pub struct MarkupCacheKey {
 }
 
 impl MarkupCacheKey {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         item_id: &str,
-        kind: MarkupKind,
-        content: &str,
+        kind: Option<MarkupKind>,
+        rendered: bool,
+        content_gen: u64,
         width: u16,
         theme_preset: ThemePreset,
         theme_no_color: bool,
@@ -35,8 +37,8 @@ impl MarkupCacheKey {
         Self {
             item_id: item_id.to_string(),
             kind,
-            content_len: content.len(),
-            content_hash: fnv1a_64(content.as_bytes()),
+            rendered,
+            content_gen,
             width,
             theme_preset,
             theme_no_color,
@@ -45,20 +47,11 @@ impl MarkupCacheKey {
     }
 }
 
-/// Cached rendered `Line`s for the active inspector markup file.
+/// Cached pre-wrapped `Line`s for the active inspector text/markup preview.
 #[derive(Debug, Clone)]
 pub struct CachedMarkupPreview {
     pub key: MarkupCacheKey,
-    pub lines: Vec<Line<'static>>,
-}
-
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+    pub wrapped_lines: Vec<Line<'static>>,
 }
 
 /// Maps the SharePoint TUI `Theme` to `bitefoundry_html::HtmlTheme`.

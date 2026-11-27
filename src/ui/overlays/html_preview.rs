@@ -502,31 +502,51 @@ impl HtmlPreviewOverlay {
         };
 
         let html_theme = Self::html_theme(&theme);
-        let initial_len = self
-            .session
-            .render(inner.width.max(12), &html_theme, ui.show_link_urls)
-            .lines
-            .len();
-        let show_scrollbar = initial_len > content_h as usize && inner.width > 2;
-        let avail_w = if show_scrollbar {
+        // Reserve 1 column for the vertical scrollbar up front so `HtmlViewSession`'s
+        // 1-slot width cache is never thrashed by a 2-pass `inner.width` -> `inner.width - 1` render.
+        let avail_w = if inner.width > 2 {
             inner.width.saturating_sub(1)
         } else {
             inner.width
         };
+        let prev_scroll_y = self.session.scroll_y;
+        let raw_mode = self.session.raw_mode;
 
-        let rendered = self
-            .session
-            .render(avail_w.max(12), &html_theme, ui.show_link_urls);
-        let total_lines = rendered.lines.len();
-        let control_count = rendered.controls.len();
-        let mut lines = rendered.lines.clone();
-        let graphics = rendered.graphics.clone();
+        let (total_lines, control_count, max_scroll_y, clamped_scroll_y, mut visible_lines, graphics) = {
+            let rendered = self
+                .session
+                .render(avail_w.max(12), &html_theme, ui.show_link_urls);
+            let total_lines = rendered.lines.len();
+            let control_count = rendered.controls.len();
+            let max_scroll_y = total_lines
+                .saturating_sub(content_h as usize)
+                .min(u16::MAX as usize) as u16;
+            let clamped_scroll_y = prev_scroll_y.min(max_scroll_y);
+            let view_top = (clamped_scroll_y as usize).min(total_lines);
+            let view_bottom = view_top.saturating_add(content_h as usize).min(total_lines);
+            let visible_lines: Vec<Line<'static>> = rendered.lines[view_top..view_bottom].to_vec();
+            let graphics = if !raw_mode && !rendered.graphics.is_empty() {
+                rendered.graphics.clone()
+            } else {
+                Vec::new()
+            };
+            (
+                total_lines,
+                control_count,
+                max_scroll_y,
+                clamped_scroll_y,
+                visible_lines,
+                graphics,
+            )
+        };
+        let show_scrollbar = total_lines > content_h as usize && inner.width > 2;
 
         self.viewport = Rect::new(inner.x, inner.y, avail_w, content_h);
-        self.max_scroll_y = total_lines
-            .saturating_sub(content_h as usize)
-            .min(u16::MAX as usize) as u16;
-        self.session.scroll_y = self.session.scroll_y.min(self.max_scroll_y);
+        self.max_scroll_y = max_scroll_y;
+        self.session.scroll_y = clamped_scroll_y;
+
+        let view_top = (clamped_scroll_y as usize).min(total_lines);
+        let view_bottom = view_top.saturating_add(content_h as usize).min(total_lines);
 
         let mut pixel_placements: Vec<(String, Rect, TerminalImageProtocol, String)> = Vec::new();
         if !self.session.raw_mode && !graphics.is_empty() && avail_w > 0 && content_h > 0 {
@@ -537,8 +557,6 @@ impl HtmlPreviewOverlay {
                 self.graphic_cache_env = Some((bg_rgb, caps.cell_px));
             }
 
-            let view_top = self.session.scroll_y as usize;
-            let view_bottom = view_top.saturating_add(content_h as usize);
             let max_safe_y = area.bottom().saturating_sub(1);
 
             for g in &graphics {
@@ -577,8 +595,8 @@ impl HtmlPreviewOverlay {
                     // click coordinates for controls below never shift.
                     for (i, hb_line) in rendered_img.lines.iter().take(g.line_count).enumerate() {
                         let target_idx = g_start + i;
-                        if target_idx < lines.len() {
-                            lines[target_idx] = hb_line.clone();
+                        if target_idx >= view_top && target_idx < view_bottom {
+                            visible_lines[target_idx - view_top] = hb_line.clone();
                         }
                     }
                 } else {
@@ -640,10 +658,7 @@ impl HtmlPreviewOverlay {
             }
         }
 
-        frame.render_widget(
-            Paragraph::new(lines).scroll((self.session.scroll_y, 0)),
-            self.viewport,
-        );
+        frame.render_widget(Paragraph::new(visible_lines), self.viewport);
 
         for (cache_key, draw_rect, protocol, payload) in pixel_placements {
             let buf = frame.buffer_mut();

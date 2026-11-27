@@ -913,9 +913,12 @@ async fn handle_create_folder(
         .graph
         .create_folder(&drive.id, body.parent_id.as_deref(), &body.name)
         .await?;
-    let _ = state
-        .storage
-        .upsert_drive_items(std::slice::from_ref(&created));
+    let storage = state.storage.clone();
+    let created_for_db = created.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = storage.upsert_drive_items(std::slice::from_ref(&created_for_db));
+    })
+    .await;
     Ok(Json(json!({ "item": created })))
 }
 
@@ -950,16 +953,26 @@ async fn handle_upload(
 
     let uploaded = if let Some(lp) = body.local_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         let path = PathBuf::from(lp);
-        let mut opts = cli::resolve_upload_options_for_local_file(
-            &state.storage,
-            &drive.id,
-            body.parent_id.as_deref(),
-            None,
-            body.file_name.as_deref(),
-            &path,
-            if_match.as_deref(),
-            explicit_conflict,
-        );
+        let storage_for_opts = state.storage.clone();
+        let drive_id_for_opts = drive.id.clone();
+        let parent_id_for_opts = body.parent_id.clone();
+        let file_name_for_opts = body.file_name.clone();
+        let path_for_opts = path.clone();
+        let if_match_for_opts = if_match.clone();
+        let mut opts = tokio::task::spawn_blocking(move || {
+            cli::resolve_upload_options_for_local_file(
+                &storage_for_opts,
+                &drive_id_for_opts,
+                parent_id_for_opts.as_deref(),
+                None,
+                file_name_for_opts.as_deref(),
+                &path_for_opts,
+                if_match_for_opts.as_deref(),
+                explicit_conflict,
+            )
+        })
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         if let Some(id) = body.item_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             if if_match.is_none() && opts.target_item_id.as_deref() != Some(id) {
                 opts.if_match = None;
@@ -977,7 +990,12 @@ async fn handle_upload(
                 &opts,
             )
             .await?;
-        cli::refresh_download_baseline_after_upload(&state.storage, &path, &item, &opts);
+        let storage_for_base = state.storage.clone();
+        let item_for_base = item.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            cli::refresh_download_baseline_after_upload(&storage_for_base, &path, &item_for_base, &opts);
+        })
+        .await;
         item
     } else if let Some(b64) = body.content_base64.as_deref() {
         let name = body
@@ -1027,9 +1045,12 @@ async fn handle_upload(
         ));
     };
 
-    let _ = state
-        .storage
-        .upsert_drive_items(std::slice::from_ref(&uploaded));
+    let storage = state.storage.clone();
+    let uploaded_for_db = uploaded.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = storage.upsert_drive_items(std::slice::from_ref(&uploaded_for_db));
+    })
+    .await;
     Ok(Json(json!({ "item": uploaded })))
 }
 
@@ -1075,7 +1096,13 @@ async fn handle_delete_item(
     )
     .await?;
     state.graph.delete_item(&drive.id, &id).await?;
-    let _ = state.storage.delete_drive_item(&drive.id, &id);
+    let storage = state.storage.clone();
+    let did = drive.id.clone();
+    let iid = id.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = storage.delete_drive_item(&did, &iid);
+    })
+    .await;
     Ok(Json(json!({ "ok": true, "deleted": true, "drive_id": drive.id, "item_id": id })))
 }
 
@@ -1114,10 +1141,18 @@ async fn handle_recent(
     let items = if limit == 0 {
         Vec::new()
     } else if q.offline {
-        state.storage.list_recent_items(limit)?
+        let storage = state.storage.clone();
+        tokio::task::spawn_blocking(move || storage.list_recent_items(limit))
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??
     } else {
         let live = state.graph.list_recent_items(limit).await?;
-        let _ = state.storage.replace_recent_items(&live);
+        let storage = state.storage.clone();
+        let live_for_db = live.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = storage.replace_recent_items(&live_for_db);
+        })
+        .await;
         live
     };
     Ok(Json(json!({ "items": items })))
@@ -1131,10 +1166,18 @@ async fn handle_shared(
     let items = if limit == 0 {
         Vec::new()
     } else if q.offline {
-        state.storage.list_shared_items(limit)?
+        let storage = state.storage.clone();
+        tokio::task::spawn_blocking(move || storage.list_shared_items(limit))
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??
     } else {
         let live = state.graph.list_shared_with_me(limit).await?;
-        let _ = state.storage.replace_shared_items(&live);
+        let storage = state.storage.clone();
+        let live_for_db = live.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = storage.replace_shared_items(&live_for_db);
+        })
+        .await;
         live
     };
     Ok(Json(json!({ "items": items })))
@@ -1198,7 +1241,7 @@ async fn handle_download(
     .await?;
     let item = resolver::resolve_item(&state.graph, &state.storage, &drive.id, target, false).await?;
     let dest_dir = cli::normalize_download_dir(&state.config, body.dir.as_deref());
-    let mut downloaded = state
+    let downloaded = state
         .graph
         .download_item_to_file(
             item.effective_drive_id(),
@@ -1209,7 +1252,14 @@ async fn handle_download(
             &dest_dir,
         )
         .await?;
-    cli::record_download_baseline(&state.storage, &item, &mut downloaded);
+    let storage = state.storage.clone();
+    let downloaded = tokio::task::spawn_blocking(move || {
+        let mut dl = downloaded;
+        cli::record_download_baseline(&storage, &item, &mut dl);
+        dl
+    })
+    .await
+    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let value = serde_json::to_value(downloaded)
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(value))

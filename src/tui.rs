@@ -773,9 +773,18 @@ fn draw_frame(
         }
     }
 
+    enum DeferredPixelPayload {
+        Direct(String),
+        Cached {
+            base_key: String,
+            crop: Option<(u16, u16, u16, u16)>,
+        },
+    }
+
     // Resolve desired pixel graphic placements with overlay Z-order, scroll, crop, and overflow guards.
+    // Payloads for cropped viewports are deferred until `pixel_tracker.plan_transition` confirms emission.
     let mut desired: Vec<ActivePixelGraphic> = Vec::new();
-    let mut desired_payloads: Vec<Cow<'_, str>> = Vec::new();
+    let mut desired_sources: Vec<DeferredPixelPayload> = Vec::new();
     let pending_list = std::mem::take(&mut ui.pending_pixel_graphics);
     let body_h = crate::ui::drive_view::inspector_body_height(ui.inspector_scroll.area);
     let max_off = ui.inspector_scroll.total_lines.saturating_sub(body_h);
@@ -787,33 +796,49 @@ fn draw_frame(
             continue;
         }
         let (base_key, crop) = parse_pixel_key(&pending.cache_key);
-        let (protocol, resolved): (TerminalImageProtocol, Option<(Cow<'_, str>, u16, u16)>) =
+        let resolved: Option<(TerminalImageProtocol, u16, u16, usize, DeferredPixelPayload)> =
             if let Some(direct_payload) = pending.payload {
-                (
+                let len = direct_payload.len();
+                Some((
                     pending.protocol,
-                    Some((
-                        Cow::Owned(direct_payload),
-                        pending.rect.width,
-                        pending.rect.height,
-                    )),
-                )
+                    pending.rect.width,
+                    pending.rect.height,
+                    len,
+                    DeferredPixelPayload::Direct(direct_payload),
+                ))
             } else {
                 let Some(rendered) = app.rendered_images.get(base_key) else {
                     continue;
                 };
-                let res = if let Some((sx, sy, vw, vh)) = crop {
-                    rendered
-                        .viewport_pixel_payload(sx, sy, vw, vh)
-                        .map(|(p, dw, dh)| (Cow::Owned(p), dw, dh))
+                if let Some((sx, sy, vw, vh)) = crop {
+                    rendered.viewport_pixel_dims(sx, sy, vw, vh).map(|(dw, dh)| {
+                        (
+                            rendered.protocol,
+                            dw,
+                            dh,
+                            rendered.pixel_payload.as_ref().map_or(0, String::len),
+                            DeferredPixelPayload::Cached {
+                                base_key: base_key.to_string(),
+                                crop: Some((sx, sy, vw, vh)),
+                            },
+                        )
+                    })
                 } else {
-                    rendered
-                        .pixel_payload
-                        .as_deref()
-                        .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
-                };
-                (rendered.protocol, res)
+                    rendered.pixel_payload.as_deref().map(|p| {
+                        (
+                            rendered.protocol,
+                            rendered.cols,
+                            rendered.rows,
+                            p.len(),
+                            DeferredPixelPayload::Cached {
+                                base_key: base_key.to_string(),
+                                crop: None,
+                            },
+                        )
+                    })
+                }
             };
-        let Some((payload, draw_cols, draw_rows)) = resolved else {
+        let Some((protocol, draw_cols, draw_rows, payload_len, source)) = resolved else {
             continue;
         };
 
@@ -832,9 +857,9 @@ fn draw_frame(
                     protocol,
                     cols: draw_cols,
                     rows: draw_rows,
-                    payload_len: payload.len(),
+                    payload_len,
                 });
-                desired_payloads.push(payload);
+                desired_sources.push(source);
             }
             Err(Some((fit_w, fit_h))) => {
                 redecode_requests.push((base_key.to_string(), fit_w, fit_h));
@@ -842,11 +867,6 @@ fn draw_frame(
             Err(None) => {}
         }
     }
-
-    let emitted_payloads: Vec<String> = desired_payloads
-        .into_iter()
-        .map(Cow::into_owned)
-        .collect();
 
     for (cache_key, fit_w, fit_h) in redecode_requests {
         app.rendered_images.remove(&cache_key);
@@ -908,7 +928,24 @@ fn draw_frame(
 
     if plan.emit_desired {
         let out = terminal.backend_mut();
-        for (graphic, payload) in desired.iter().zip(emitted_payloads.iter()) {
+        for (graphic, source) in desired.iter().zip(desired_sources) {
+            let payload: Option<Cow<'_, str>> = match source {
+                DeferredPixelPayload::Direct(p) => Some(Cow::Owned(p)),
+                DeferredPixelPayload::Cached { base_key, crop } => {
+                    app.rendered_images.get(&base_key).and_then(|rendered| {
+                        if let Some((sx, sy, vw, vh)) = crop {
+                            rendered
+                                .viewport_pixel_payload(sx, sy, vw, vh)
+                                .map(|(p, _, _)| Cow::Owned(p))
+                        } else {
+                            rendered.pixel_payload.as_deref().map(Cow::Borrowed)
+                        }
+                    })
+                }
+            };
+            let Some(payload) = payload else {
+                continue;
+            };
             let move_seq = format!("\x1b[{};{}H", graphic.rect.y + 1, graphic.rect.x + 1);
             let _ = out.write_all(move_seq.as_bytes());
             let _ = out.write_all(payload.as_bytes());

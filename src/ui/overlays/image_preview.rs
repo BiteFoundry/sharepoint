@@ -338,8 +338,13 @@ impl ImagePreviewOverlay {
                 let pad_x = avail_w.saturating_sub(view_w) / 2;
                 let pad_y = avail_h.saturating_sub(view_h) / 2;
                 let draw_rect = Rect::new(inner.x + pad_x, inner.y + pad_y, view_w, view_h);
+                let start = (sy as usize).min(rendered.lines.len());
+                let end = start
+                    .saturating_add(view_h as usize)
+                    .min(rendered.lines.len());
+                let visible_lines: Vec<Line<'static>> = rendered.lines[start..end].to_vec();
                 frame.render_widget(
-                    Paragraph::new(rendered.lines.clone()).scroll((sy, sx)),
+                    Paragraph::new(visible_lines).scroll((0, sx)),
                     draw_rect,
                 );
             }

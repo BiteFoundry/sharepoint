@@ -261,6 +261,104 @@ pub fn wrapped_line_count(lines: &[ratatui::text::Line<'_>], width: u16) -> usiz
     total
 }
 
+/// Pre-wraps styled `Line`s to `width` columns using word-boundary wrapping (`trim: false`),
+/// moving lines that already fit without reallocation so callers can slice only visible rows.
+pub fn wrap_lines_to_width(
+    lines: Vec<ratatui::text::Line<'static>>,
+    width: u16,
+) -> Vec<ratatui::text::Line<'static>> {
+    let max_w = width as usize;
+    if max_w == 0 {
+        return lines;
+    }
+    let mut out: Vec<ratatui::text::Line<'static>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.width() <= max_w {
+            out.push(line);
+            continue;
+        }
+        let line_style = line.style;
+        let mut styled_chars: Vec<(char, Style)> = Vec::new();
+        for span in line.spans {
+            let eff_style = line_style.patch(span.style);
+            for ch in span.content.chars() {
+                styled_chars.push((ch, eff_style));
+            }
+        }
+        if styled_chars.is_empty() {
+            out.push(ratatui::text::Line::default());
+            continue;
+        }
+        let push_styled_char = |spans: &mut Vec<Span<'static>>, ch: char, st: Style| {
+            if let Some(last) = spans.last_mut() {
+                if last.style == st {
+                    last.content.to_mut().push(ch);
+                    return;
+                }
+            }
+            spans.push(Span::styled(ch.to_string(), st));
+        };
+
+        let mut cur_spans: Vec<Span<'static>> = Vec::new();
+        let mut col = 0usize;
+        let mut idx = 0usize;
+        while idx < styled_chars.len() {
+            let is_ws = styled_chars[idx].0.is_whitespace();
+            let start = idx;
+            let mut tok_w = 0usize;
+            while idx < styled_chars.len() && styled_chars[idx].0.is_whitespace() == is_ws {
+                tok_w += styled_chars[idx].0.width().unwrap_or(0);
+                idx += 1;
+            }
+            let tok = &styled_chars[start..idx];
+            if tok_w == 0 {
+                for &(ch, st) in tok {
+                    push_styled_char(&mut cur_spans, ch, st);
+                }
+                continue;
+            }
+            if col + tok_w <= max_w {
+                for &(ch, st) in tok {
+                    push_styled_char(&mut cur_spans, ch, st);
+                }
+                col += tok_w;
+            } else if is_ws {
+                for &(ch, st) in tok {
+                    let cw = ch.width().unwrap_or(0);
+                    if col + cw > max_w {
+                        out.push(ratatui::text::Line::from(std::mem::take(&mut cur_spans)));
+                        col = 0;
+                    }
+                    push_styled_char(&mut cur_spans, ch, st);
+                    col += cw;
+                }
+            } else if tok_w <= max_w {
+                out.push(ratatui::text::Line::from(std::mem::take(&mut cur_spans)));
+                for &(ch, st) in tok {
+                    push_styled_char(&mut cur_spans, ch, st);
+                }
+                col = tok_w;
+            } else {
+                if col > 0 {
+                    out.push(ratatui::text::Line::from(std::mem::take(&mut cur_spans)));
+                    col = 0;
+                }
+                for &(ch, st) in tok {
+                    let cw = ch.width().unwrap_or(0);
+                    if col + cw > max_w && col > 0 {
+                        out.push(ratatui::text::Line::from(std::mem::take(&mut cur_spans)));
+                        col = 0;
+                    }
+                    push_styled_char(&mut cur_spans, ch, st);
+                    col += cw;
+                }
+            }
+        }
+        out.push(ratatui::text::Line::from(cur_spans));
+    }
+    out
+}
+
 pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(u16, u16)> {
     let area = frame.area();
     ui.term_width = area.width;

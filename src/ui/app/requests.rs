@@ -243,7 +243,11 @@ impl AppState {
                     match graph.fetch_virtual_list(VirtualListKind::Recent, 50).await {
                         Ok(fetch) => {
                             if fetch.status.is_available() {
-                                let _ = storage.replace_recent_items(&fetch.items);
+                                let items_for_db = fetch.items.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let _ = storage.replace_recent_items(&items_for_db);
+                                })
+                                .await;
                             }
                             let _ = tx.send(UiMsg::VirtualListLoaded {
                                 seq: vseq,
@@ -274,7 +278,11 @@ impl AppState {
                     match graph.fetch_virtual_list(VirtualListKind::SharedWithMe, 50).await {
                         Ok(fetch) => {
                             if fetch.status.is_available() {
-                                let _ = storage.replace_shared_items(&fetch.items);
+                                let items_for_db = fetch.items.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let _ = storage.replace_shared_items(&items_for_db);
+                                })
+                                .await;
                             }
                             let _ = tx.send(UiMsg::VirtualListLoaded {
                                 seq: vseq,
@@ -557,7 +565,11 @@ impl AppState {
                 .await
             {
                 Ok(item) => {
-                    let _ = storage.upsert_drive_items(std::slice::from_ref(&item));
+                    let item_for_db = item.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = storage.upsert_drive_items(std::slice::from_ref(&item_for_db));
+                    })
+                    .await;
                     let _ = tx.send(UiMsg::ItemUploaded {
                         item,
                         parent_id,

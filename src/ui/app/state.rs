@@ -378,6 +378,8 @@ pub struct AppState {
     pub sync_summary: String,
     pub text_previews: Option<(String, String)>,
     pub text_preview_revision: Option<String>,
+    /// Monotonic generation counter bumped whenever `text_previews` changes (O(1) cache key).
+    pub text_preview_gen: u64,
     pub item_versions: HashMap<String, Vec<DriveItemVersion>>,
     pub created_share_links: HashMap<String, String>,
     pub preview_errors: HashMap<String, String>,
@@ -458,6 +460,7 @@ impl AppState {
             sync_summary: "Ready".to_string(),
             text_previews: None,
             text_preview_revision: None,
+            text_preview_gen: 0,
             item_versions: HashMap::new(),
             created_share_links: HashMap::new(),
             preview_errors: HashMap::new(),

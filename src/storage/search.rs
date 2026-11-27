@@ -136,7 +136,7 @@ fn run_like_search(
         values.len()
     ));
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), map_drive_item_row)?;
     let items: Vec<DriveItem> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 

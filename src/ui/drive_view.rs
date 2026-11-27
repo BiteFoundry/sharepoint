@@ -568,7 +568,7 @@ pub fn draw_inspector(
 
     // Live inline image preview for image files
     let active_preview_key = AppState::text_preview_key(item.effective_drive_id(), &item.id);
-    if markup_kind.is_none()
+    if !item.is_text_previewable()
         || ui
             .markup_cache
             .as_ref()
@@ -579,6 +579,8 @@ pub fn draw_inspector(
 
     let mut inline_image_chip: Option<(usize, u16, usize)> = None;
     let mut deferred_pixel_graphic: Option<(String, usize, u16, u16, crate::img_preview::TerminalImageProtocol)> = None;
+    let mut halfblock_lines: Option<&[Line<'static>]> = None;
+    let mut use_markup_cache = false;
 
     if item.is_image() && ui.inline_images {
         let preview_key = app.inline_image_cache_key(&item);
@@ -611,9 +613,7 @@ pub fn draw_inspector(
             } else {
                 let chip_h = rendered.lines.len();
                 let chip_w = body_area.width.saturating_sub(2).min(rendered.cols.max(1));
-                for img_line in &rendered.lines {
-                    lines.push(img_line.clone());
-                }
+                halfblock_lines = Some(rendered.lines.as_slice());
                 if chip_w > 0 && chip_h > 0 {
                     inline_image_chip = Some((img_doc_row, chip_w, chip_h));
                 }
@@ -631,70 +631,72 @@ pub fn draw_inspector(
         }
     } else if item.is_text_previewable() {
         if let Some(content) = app.text_preview_for(&item) {
-            if let Some(kind) = markup_kind {
-                if ui.render_markup {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            " {} Preview (Rendered · m Raw · u Links · h href {}):",
-                            kind.label(),
-                            if ui.show_link_urls { "ON" } else { "OFF" }
-                        ),
-                        theme.accent_style(),
-                    )));
-                    let render_w = body_area.width.saturating_sub(2);
-                    let cache_key = MarkupCacheKey::new(
-                        &active_preview_key,
-                        kind,
-                        content,
-                        render_w,
-                        ui.theme_preset,
-                        theme.no_color,
-                        ui.show_link_urls,
-                    );
-                    let cache_hit = ui
-                        .markup_cache
-                        .as_ref()
-                        .is_some_and(|c| c.key == cache_key);
-                    if !cache_hit {
-                        let rendered = markup::render_markup(
+            let rendered_mode = markup_kind.is_some() && ui.render_markup;
+            let cache_key = MarkupCacheKey::new(
+                &active_preview_key,
+                markup_kind,
+                rendered_mode,
+                app.text_preview_gen,
+                body_area.width,
+                ui.theme_preset,
+                theme.no_color,
+                ui.show_link_urls,
+            );
+            let cache_hit = ui
+                .markup_cache
+                .as_ref()
+                .is_some_and(|c| c.key == cache_key);
+            if !cache_hit {
+                let mut body_lines: Vec<Line<'static>> = Vec::new();
+                if let Some(kind) = markup_kind {
+                    if rendered_mode {
+                        body_lines.push(Line::from(Span::styled(
+                            format!(
+                                " {} Preview (Rendered · m Raw · u Links · h href {}):",
+                                kind.label(),
+                                if ui.show_link_urls { "ON" } else { "OFF" }
+                            ),
+                            theme.accent_style(),
+                        )));
+                        let render_w = body_area.width.saturating_sub(2);
+                        body_lines.extend(markup::render_markup(
                             kind,
                             content,
                             render_w,
                             ui.show_link_urls,
                             theme,
-                        );
-                        ui.markup_cache = Some(CachedMarkupPreview {
-                            key: cache_key,
-                            lines: rendered,
-                        });
-                    }
-                    if let Some(ref cached) = ui.markup_cache {
-                        lines.extend(cached.lines.iter().cloned());
+                        ));
+                    } else {
+                        let total_lines = content.lines().count();
+                        body_lines.push(Line::from(Span::styled(
+                            format!(
+                                " {} Source (Raw · {} lines · m Render · u Links):",
+                                kind.label(),
+                                total_lines
+                            ),
+                            theme.accent_style(),
+                        )));
+                        push_capped_raw_preview_lines(&mut body_lines, content, total_lines, theme);
                     }
                 } else {
                     let total_lines = content.lines().count();
-                    lines.push(Line::from(Span::styled(
+                    body_lines.push(Line::from(Span::styled(
                         format!(
-                            " {} Source (Raw · {} lines · m Render · u Links):",
-                            kind.label(),
-                            total_lines
+                            " File Preview ({} lines · u Links · h href {}):",
+                            total_lines,
+                            if ui.show_link_urls { "ON" } else { "OFF" }
                         ),
                         theme.accent_style(),
                     )));
-                    push_capped_raw_preview_lines(&mut lines, content, total_lines, theme);
+                    push_capped_raw_preview_lines(&mut body_lines, content, total_lines, theme);
                 }
-            } else {
-                let total_lines = content.lines().count();
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        " File Preview ({} lines · u Links · h href {}):",
-                        total_lines,
-                        if ui.show_link_urls { "ON" } else { "OFF" }
-                    ),
-                    theme.accent_style(),
-                )));
-                push_capped_raw_preview_lines(&mut lines, content, total_lines, theme);
+                let wrapped_lines = crate::ui::wrap_lines_to_width(body_lines, body_area.width);
+                ui.markup_cache = Some(CachedMarkupPreview {
+                    key: cache_key,
+                    wrapped_lines,
+                });
             }
+            use_markup_cache = true;
         } else if let Some(err) = app.text_preview_error_for(&item) {
             lines.push(Line::from(Span::styled(
                 format!(" Text preview unavailable: {err}"),
@@ -718,9 +720,22 @@ pub fn draw_inspector(
         )));
     }
 
-    let visual_lines = crate::ui::wrapped_line_count(&lines, body_area.width);
+    let wrapped_prefix = crate::ui::wrap_lines_to_width(lines, body_area.width);
+    let body_slice: &[Line<'static>] = if use_markup_cache {
+        ui.markup_cache
+            .as_ref()
+            .map_or(&[], |c| c.wrapped_lines.as_slice())
+    } else if let Some(hb) = halfblock_lines {
+        hb
+    } else {
+        &[]
+    };
+
+    let prefix_len = wrapped_prefix.len();
+    let visual_lines = prefix_len + body_slice.len();
     ui.inspector_scroll.total_lines = visual_lines;
-    let max_off = visual_lines.saturating_sub(body_area.height as usize);
+    let avail_h = body_area.height as usize;
+    let max_off = visual_lines.saturating_sub(avail_h);
     ui.inspector_scroll.offset = ui.inspector_scroll.offset.min(max_off);
     let scroll_y = ui.inspector_scroll.offset as u16;
 
@@ -728,8 +743,8 @@ pub fn draw_inspector(
         let img_y = body_area.y.saturating_add(img_doc_row as u16);
         let scrolled_y = img_y.saturating_sub(scroll_y);
         if img_doc_row >= ui.inspector_scroll.offset && scrolled_y < body_area.bottom() {
-            let avail_h = body_area.bottom().saturating_sub(scrolled_y);
-            let rect = Rect::new(body_area.x + 1, img_y, chip_w, avail_h.min(img_rows));
+            let avail_px_h = body_area.bottom().saturating_sub(scrolled_y);
+            let rect = Rect::new(body_area.x + 1, img_y, chip_w, avail_px_h.min(img_rows));
             if rect.width > 0 && rect.height > 0 {
                 ui.pending_pixel_graphics.push(PendingPixelGraphic {
                     cache_key: preview_key,
@@ -743,7 +758,7 @@ pub fn draw_inspector(
 
     if let Some((img_doc_row, chip_w, chip_h)) = inline_image_chip {
         let view_top = ui.inspector_scroll.offset;
-        let view_bot = view_top.saturating_add(body_area.height as usize);
+        let view_bot = view_top.saturating_add(avail_h);
         let vis_top = img_doc_row.max(view_top);
         let vis_bot = img_doc_row.saturating_add(chip_h).min(view_bot);
         if vis_bot > vis_top {
@@ -756,12 +771,25 @@ pub fn draw_inspector(
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll_y, 0)),
-        body_area,
-    );
+    let view_top = ui.inspector_scroll.offset;
+    let view_bot = view_top.saturating_add(avail_h).min(visual_lines);
+    let mut visible_lines: Vec<Line<'static>> = Vec::with_capacity(view_bot.saturating_sub(view_top));
+    if view_top < prefix_len {
+        let p_end = view_bot.min(prefix_len);
+        visible_lines.extend(
+            wrapped_prefix
+                .into_iter()
+                .skip(view_top)
+                .take(p_end - view_top),
+        );
+    }
+    if view_bot > prefix_len {
+        let b_start = view_top.saturating_sub(prefix_len);
+        let b_end = view_bot - prefix_len;
+        visible_lines.extend(body_slice[b_start..b_end].iter().cloned());
+    }
+
+    frame.render_widget(Paragraph::new(visible_lines), body_area);
 }
 
 /// Narrowest breadcrumb worth keeping beside the short truncation note.
