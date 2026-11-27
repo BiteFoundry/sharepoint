@@ -467,9 +467,23 @@ async fn start_mock_graph() -> (String, MockGraphState, tokio::task::JoinHandle<
     (base_url, state, handle)
 }
 
+fn onedrive_alias_exe(dir: &std::path::Path) -> std::path::PathBuf {
+    let src = std::path::Path::new(env!("CARGO_BIN_EXE_sharepoint"));
+    let dst = dir.join(format!(
+        "bitefoundry-onedrive{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    if std::fs::hard_link(src, &dst).is_err() {
+        std::fs::copy(src, &dst).unwrap();
+    }
+    dst
+}
+
 fn make_graph_and_storage(base_url: &str) -> (AppConfig, GraphClient, Storage) {
-    let mut cfg = AppConfig::default();
-    cfg.graph_base_url = base_url.to_string();
+    let cfg = AppConfig {
+        graph_base_url: base_url.to_string(),
+        ..Default::default()
+    };
     let tokens = StoredTokens {
         access_token: "mock-access-token".to_string(),
         refresh_token: None,
@@ -860,14 +874,19 @@ async fn e2e_sync_fixes_write_targeting_conditional_upload_partial_limit_and_off
         resolver,
     };
 
+    type ItemMap = std::collections::HashMap<(String, String), Value>;
+    type ContentMap = std::collections::HashMap<(String, String), Vec<u8>>;
+    type SessionMap = std::collections::HashMap<String, (String, Option<String>, String)>;
+    type RequestLog = Vec<(String, String, Option<String>)>;
+
     #[derive(Clone)]
     struct SyncMock {
         base_url: String,
-        items: Arc<Mutex<std::collections::HashMap<(String, String), Value>>>,
-        contents: Arc<Mutex<std::collections::HashMap<(String, String), Vec<u8>>>>,
-        sessions: Arc<Mutex<std::collections::HashMap<String, (String, Option<String>, String)>>>,
+        items: Arc<Mutex<ItemMap>>,
+        contents: Arc<Mutex<ContentMap>>,
+        sessions: Arc<Mutex<SessionMap>>,
         followed_sites: Arc<Mutex<Vec<Value>>>,
-        requests: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+        requests: Arc<Mutex<RequestLog>>,
         /// When set, bumps `item-doc` eTag to this value right after the next GET /items/item-doc
         /// so we can test the documented `POST .../items/{id}/createUploadSession` If-Match 412 guard.
         mutate_doc_etag_after_next_get: Arc<Mutex<Option<String>>>,
@@ -1625,13 +1644,18 @@ async fn regression_sharepoint_sp_02_small_and_large_upload_with_item_id_target_
     use std::collections::HashMap;
     use tokio::process::Command;
 
+    type ItemMap = HashMap<(String, String), Value>;
+    type ContentMap = HashMap<(String, String), Vec<u8>>;
+    type SessionMap = HashMap<String, (String, String, Vec<u8>)>;
+    type RequestLog = Vec<(String, String, Option<String>)>;
+
     #[derive(Clone)]
     struct Sp02State {
         base_url: String,
-        items: Arc<Mutex<HashMap<(String, String), Value>>>,
-        contents: Arc<Mutex<HashMap<(String, String), Vec<u8>>>>,
-        sessions: Arc<Mutex<HashMap<String, (String, String, Vec<u8>)>>>,
-        requests: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+        items: Arc<Mutex<ItemMap>>,
+        contents: Arc<Mutex<ContentMap>>,
+        sessions: Arc<Mutex<SessionMap>>,
+        requests: Arc<Mutex<RequestLog>>,
     }
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2101,13 +2125,18 @@ async fn regression_sharepoint_sp_05_copy_upload_preserves_original_download_bas
     use std::collections::HashMap;
     use tokio::process::Command;
 
+    type ItemMap = HashMap<(String, String), Value>;
+    type ContentMap = HashMap<(String, String), Vec<u8>>;
+    type SessionMap = HashMap<String, (String, String, Vec<u8>)>;
+    type RequestLog = Vec<(String, String, Option<String>)>;
+
     #[derive(Clone)]
     struct Sp05State {
         base_url: String,
-        items: Arc<Mutex<HashMap<(String, String), Value>>>,
-        contents: Arc<Mutex<HashMap<(String, String), Vec<u8>>>>,
-        sessions: Arc<Mutex<HashMap<String, (String, String, Vec<u8>)>>>,
-        requests: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+        items: Arc<Mutex<ItemMap>>,
+        contents: Arc<Mutex<ContentMap>>,
+        sessions: Arc<Mutex<SessionMap>>,
+        requests: Arc<Mutex<RequestLog>>,
         next_seq: Arc<AtomicUsize>,
     }
 
@@ -2862,7 +2891,8 @@ async fn regression_sharepoint_sp_03_explicit_site_resolves_site_drives_named_pe
     // 7. bitefoundry-onedrive entrypoint also resolves explicit --site library without touching /me/drive
     let me_calls_before_od = st.me_drive_calls.load(Ordering::SeqCst);
     let od_profile = tempdir().unwrap();
-    let mut od_cmd = Command::new(env!("CARGO_BIN_EXE_bitefoundry-onedrive"));
+    let od_exe = onedrive_alias_exe(od_profile.path());
+    let mut od_cmd = Command::new(&od_exe);
     od_cmd.kill_on_drop(true);
     for (k, _) in std::env::vars_os() {
         let u = k.to_string_lossy().to_ascii_uppercase();
@@ -4503,7 +4533,8 @@ async fn regression_sharepoint_sp_15_limit_zero_returns_empty_and_preserves_cach
     assert_eq!(search_1_json.as_array().unwrap().len(), 1);
 
     // bitefoundry-onedrive entrypoint also returns empty list for --limit 0 without touching cache
-    let mut od_cmd = Command::new(env!("CARGO_BIN_EXE_bitefoundry-onedrive"));
+    let od_exe = onedrive_alias_exe(profile.path());
+    let mut od_cmd = Command::new(&od_exe);
     od_cmd.kill_on_drop(true);
     for (k, _) in std::env::vars_os() {
         let u = k.to_string_lossy().to_ascii_uppercase();

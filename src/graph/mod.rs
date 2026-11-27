@@ -66,6 +66,8 @@ fn build_download_clients(read_timeout: Duration) -> Result<(reqwest::Client, re
     Ok((http_download, http_no_redirect))
 }
 
+type ListColumnsCache = Arc<Mutex<HashMap<(String, String), Vec<ListColumn>>>>;
+
 #[derive(Clone)]
 pub struct GraphClient {
     auth: AuthManager,
@@ -79,7 +81,7 @@ pub struct GraphClient {
     resolve_user_mutex: Arc<tokio::sync::Mutex<()>>,
     list_item_expand_unsupported_drives: Arc<Mutex<HashSet<String>>>,
     cached_drive_root_ids: Arc<Mutex<HashMap<String, String>>>,
-    cached_list_columns: Arc<Mutex<HashMap<(String, String), Vec<ListColumn>>>>,
+    cached_list_columns: ListColumnsCache,
 }
 
 impl GraphClient {

@@ -217,16 +217,12 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     }
 
     // Route through top overlay first when any overlay is open
-    if !ui.overlays.is_empty() {
-        let outcome = {
-            let mut top = ui.overlays.pop().unwrap();
-            let res = top.handle(&action, app, ui);
-            match &res {
-                OverlayOutcome::Close | OverlayOutcome::CloseAndDispatch(_) => {}
-                _ => ui.overlays.push(top),
-            }
-            res
-        };
+    if let Some(mut top) = ui.overlays.pop() {
+        let outcome = top.handle(&action, app, ui);
+        match &outcome {
+            OverlayOutcome::Close | OverlayOutcome::CloseAndDispatch(_) => {}
+            _ => ui.overlays.push(top),
+        }
         match outcome {
             OverlayOutcome::Handled | OverlayOutcome::Close => return false,
             OverlayOutcome::Dispatch(next) | OverlayOutcome::CloseAndDispatch(next) => {
@@ -722,12 +718,18 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
             let storage = app.storage.clone();
             let tx = app.ui_tx.clone();
             tokio::spawn(async move {
-                match graph
-                    .rename_or_move_item(&drive_id, &item_id, Some(&new_name), None)
-                    .await
+                match crate::cli::rename_or_move_item_cached(
+                    &graph,
+                    &storage,
+                    &drive_id,
+                    &item_id,
+                    None,
+                    Some(&new_name),
+                    None,
+                )
+                .await
                 {
                     Ok(updated) => {
-                        let _ = storage.upsert_drive_items(std::slice::from_ref(&updated));
                         if let Some((raw_did, raw_iid)) = raw_pair {
                             if raw_did != updated.drive_id || raw_iid != updated.id {
                                 if let Ok(Some(mut shortcut)) =
@@ -924,10 +926,10 @@ fn dispatch_workspace(action: Action, app: &mut AppState, ui: &mut UiState) -> b
                 return false;
             }
             if let Some(html) = app.text_preview_for(&item).map(str::to_string) {
-                ui.push_overlay(Overlay::HtmlPreview(
+                ui.push_overlay(Overlay::HtmlPreview(Box::new(
                     HtmlPreviewOverlay::new(item.name.clone(), html, Some(item.id.clone()))
                         .with_source(item.effective_drive_id(), item.content_revision()),
-                ));
+                )));
             } else {
                 ui.toast(format!("Loading interactive HTML: {}...", item.name), ToastKind::Info);
                 app.spawn_shared_text_fetch(&item, true);
@@ -1409,9 +1411,7 @@ fn collapse_nav_row(row_idx: usize, app: &AppState, ui: &mut UiState) {
     let Some(row) = rows.get(row_idx) else {
         return;
     };
-    let parent_where = |pred: &dyn Fn(&NavRow) -> bool| {
-        rows[..row_idx].iter().rposition(|r| pred(r))
-    };
+    let parent_where = |pred: &dyn Fn(&NavRow) -> bool| rows[..row_idx].iter().rposition(pred);
     let is_section = |r: &NavRow| matches!(r, NavRow::SectionHeader { .. });
     match row {
         NavRow::SectionHeader {
@@ -1572,17 +1572,15 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             }
             Some(HitTarget::OverlayBody) => {
                 if matches!(ui.overlays.last(), Some(Overlay::HtmlPreview(_))) {
-                    let outcome = {
-                        let mut top = ui.overlays.pop().unwrap();
-                        let res = match &mut top {
+                    if let Some(mut top) = ui.overlays.pop() {
+                        let outcome = match &mut top {
                             Overlay::HtmlPreview(ov) => ov.handle_click_at(column, row, ui),
                             _ => OverlayOutcome::Handled,
                         };
                         ui.overlays.push(top);
-                        res
-                    };
-                    if let OverlayOutcome::Dispatch(next) = outcome {
-                        return dispatch_workspace(next, app, ui);
+                        if let OverlayOutcome::Dispatch(next) = outcome {
+                            return dispatch_workspace(next, app, ui);
+                        }
                     }
                 }
                 return false;
@@ -1869,7 +1867,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut picker = crate::ui::overlays::file_picker::FilePickerOverlay::new_in_dir(root.path().to_path_buf());
         picker.enter_zoxide_with_dirs(vec![root.path().to_path_buf()]);
-        ui.push_overlay(super::Overlay::FilePicker(picker));
+        ui.push_overlay(super::Overlay::FilePicker(Box::new(picker)));
         terminal
             .draw(|f| {
                 crate::ui::draw(f, &mut app, &mut ui);

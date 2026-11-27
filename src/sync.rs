@@ -309,7 +309,7 @@ impl PeriodicBackoffTracker {
             return true;
         }
         self.tick_count = self.tick_count.saturating_add(1);
-        self.tick_count % mult == 0
+        self.tick_count.is_multiple_of(mult)
     }
 }
 
@@ -1837,9 +1837,7 @@ async fn sync_core_discovery(
     };
 
     let active_folder_fut = async {
-        let Some((did, parent_id, limit)) = overlap_folder else {
-            return None;
-        };
+        let (did, parent_id, limit) = overlap_folder?;
         let mut local_rt = active_rt_seed.unwrap_or_default();
         let res = sync_drive_delta_once(
             graph,

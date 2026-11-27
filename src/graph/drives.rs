@@ -121,7 +121,7 @@ pub enum DriveDeltaChange {
         id: String,
     },
     Upserted {
-        item: DriveItem,
+        item: Box<DriveItem>,
         has_explicit_parent_path: bool,
     },
     Deleted {
@@ -404,11 +404,7 @@ struct GraphRemoteItem {
 }
 
 #[derive(Debug, Deserialize)]
-struct GraphDeletedFacet {
-    #[serde(default)]
-    #[allow(dead_code)]
-    state: Option<String>,
-}
+struct GraphDeletedFacet {}
 
 #[derive(Debug, Deserialize)]
 struct GraphDeltaPageWire {
@@ -519,7 +515,7 @@ impl GraphDriveItem {
             .is_some_and(|s| !s.trim().is_empty());
         let item = self.into_model(fallback_drive_id);
         DriveDeltaChange::Upserted {
-            item,
+            item: Box::new(item),
             has_explicit_parent_path,
         }
     }
@@ -1469,16 +1465,16 @@ impl GraphClient {
             )
             .await?;
 
-        if resp.status() == StatusCode::UNAUTHORIZED {
-            if self.auth().refresh_for_failed_token(&token).await.is_ok() {
-                token = self.auth().valid_access_token().await?;
-                resp = self
-                    .send_download_hop(
-                        &format!("Graph content download retry failed (GET {content_url})"),
-                        || self.http_no_redirect().get(&content_url).bearer_auth(&token),
-                    )
-                    .await?;
-            }
+        if resp.status() == StatusCode::UNAUTHORIZED
+            && self.auth().refresh_for_failed_token(&token).await.is_ok()
+        {
+            token = self.auth().valid_access_token().await?;
+            resp = self
+                .send_download_hop(
+                    &format!("Graph content download retry failed (GET {content_url})"),
+                    || self.http_no_redirect().get(&content_url).bearer_auth(&token),
+                )
+                .await?;
         }
 
         // Handle 302/301/303/307/308 redirect from `/content` by stripping Authorization header!

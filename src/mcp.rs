@@ -759,17 +759,18 @@ async fn call_tool(
             let resolved_parent_id = map_graph_err(graph, parent_res).await?;
             let updated = map_graph_err(
                 graph,
-                graph
-                    .rename_or_move_item(
-                        &drive.id,
-                        &item.id,
-                        new_name.as_deref(),
-                        resolved_parent_id.as_deref(),
-                    )
-                    .await,
+                cli::rename_or_move_item_cached(
+                    graph,
+                    storage,
+                    &drive.id,
+                    &item.id,
+                    Some(&item),
+                    new_name.as_deref(),
+                    resolved_parent_id.as_deref(),
+                )
+                .await,
             )
             .await?;
-            let _ = storage.upsert_drive_items(std::slice::from_ref(&updated));
             Ok(json!({ "item": updated }))
         }
         "delete_item" => {

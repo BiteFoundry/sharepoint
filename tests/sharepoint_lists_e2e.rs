@@ -26,10 +26,12 @@ struct Fixture {
     state: Arc<Mutex<ListState>>,
 }
 
+type RecordedRead = (String, Option<String>, Option<String>, Option<String>);
+
 struct ListState {
     revision: u32,
     fields: Value,
-    reads: Vec<(String, Option<String>, Option<String>, Option<String>)>,
+    reads: Vec<RecordedRead>,
     writes: Vec<(String, Option<String>, Value)>,
 }
 
@@ -1027,7 +1029,15 @@ async fn list_items_cursor_is_bound_to_site_list_and_fields() {
     let other_site = "other.sharepoint.com,99999999-9999-9999-9999-999999999999,88888888-8888-8888-8888-888888888888";
     let other_list = "44444444-4444-4444-4444-444444444444";
 
-    let cases: Vec<(&str, &str, Vec<&str>, Option<Vec<&str>>, &str, &str)> = vec![
+    type CursorMismatchCase<'a> = (
+        &'a str,
+        &'a str,
+        Vec<&'a str>,
+        Option<Vec<&'a str>>,
+        &'a str,
+        &'a str,
+    );
+    let cases: Vec<CursorMismatchCase<'_>> = vec![
         (
             SITE,
             other_list,

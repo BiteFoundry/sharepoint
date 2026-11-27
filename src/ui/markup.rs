@@ -113,7 +113,7 @@ pub fn render_html(
     // replace reserved graphic placeholder slots with clean text chips.
     if !rendered.graphics.is_empty() {
         let mut graphics = rendered.graphics;
-        graphics.sort_by(|a, b| b.line_start.cmp(&a.line_start));
+        graphics.sort_by_key(|g| std::cmp::Reverse(g.line_start));
         for g in graphics {
             let start = g.line_start.min(rendered.lines.len());
             let end = start.saturating_add(g.line_count).min(rendered.lines.len());

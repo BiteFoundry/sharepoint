@@ -489,7 +489,8 @@ mod tests {
         };
         let item = sample_image_item("img-ok-1", "chart.png");
         let mut overlay =
-            ImagePreviewOverlay::from_folder_items(&[item.clone()], Some("img-ok-1")).unwrap();
+            ImagePreviewOverlay::from_folder_items(std::slice::from_ref(&item), Some("img-ok-1"))
+                .unwrap();
         let area = Rect::new(0, 0, 80, 24);
         let (cols, rows) = ImagePreviewOverlay::viewport_dimensions(area.width, area.height);
         let key = app.modal_image_cache_key(&item, cols, rows, overlay.zoom_pct, ui.graphics_caps);
@@ -558,7 +559,8 @@ mod tests {
             };
             let item = sample_image_item("tall-1", "tall.png");
             let mut overlay =
-                ImagePreviewOverlay::from_folder_items(&[item.clone()], Some("tall-1")).unwrap();
+                ImagePreviewOverlay::from_folder_items(std::slice::from_ref(&item), Some("tall-1"))
+                    .unwrap();
             let fit = overlay.fit_box(area.width, area.height);
             let rendered =
                 decode_and_render_for_protocol(&png, fit, (25, 25, 25), ui.graphics_caps)

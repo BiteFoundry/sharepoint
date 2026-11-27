@@ -581,7 +581,7 @@ mod tests {
 
         // Remote delete of root spec.md pruned cleanly by authoritative root replace
         storage
-            .replace_folder_children("drv-me", None, &[folder.clone()])
+            .replace_folder_children("drv-me", None, std::slice::from_ref(&folder))
             .unwrap();
         assert!(storage.get_drive_item("drv-me", "item-spec").unwrap().is_none());
         assert!(storage
@@ -591,7 +591,7 @@ mod tests {
 
         // S2: Path-based folder replace prunes gone.md, then deleting fld-proj removes keep.md descendant
         storage
-            .replace_folder_children_by_path("drv-me", "/Projects", &[keep_proj.clone()])
+            .replace_folder_children_by_path("drv-me", "/Projects", std::slice::from_ref(&keep_proj))
             .unwrap();
         assert!(storage.get_drive_item("drv-me", "item-gone").unwrap().is_none());
         assert!(storage

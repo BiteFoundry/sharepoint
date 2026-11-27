@@ -298,9 +298,7 @@ impl CommandPalette {
             } else {
                 Style::default()
             };
-            let right_w = unicode_width::UnicodeWidthStr::width(item.shortcut.as_str())
-                .min(20)
-                .max(8);
+            let right_w = unicode_width::UnicodeWidthStr::width(item.shortcut.as_str()).clamp(8, 20);
             let label_w = (inner.width as usize).saturating_sub(right_w + 3).max(10);
             let truncated_label = crate::ui::truncate_width(&item.label, label_w);
             let used_w = unicode_width::UnicodeWidthStr::width(truncated_label.as_str());

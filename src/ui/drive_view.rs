@@ -515,7 +515,7 @@ pub fn draw_inspector(
     if let Some(ref mime) = item.mime_type {
         lines.push(meta_line("MIME", mime, theme));
     }
-    if let Some(ref author) = item.last_modified_by.as_ref().or(item.created_by.as_ref()) {
+    if let Some(author) = item.last_modified_by.as_ref().or(item.created_by.as_ref()) {
         lines.push(meta_line("Author", author, theme));
     }
     if let Some(ref modified) = item.last_modified_at {
@@ -524,7 +524,7 @@ pub fn draw_inspector(
     if let Some(ref scope) = item.shared_scope {
         lines.push(meta_line("Sharing", scope, theme));
     }
-    if let Some(ref share_url) = app.created_share_links.get(&item.id) {
+    if let Some(share_url) = app.created_share_links.get(&item.id) {
         lines.push(meta_line("Share Link", share_url, theme));
     }
     if let Some(ref url) = item.web_url {

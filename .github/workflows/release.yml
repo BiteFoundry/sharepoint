@@ -80,7 +80,6 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           node scripts/verify-glibc.mjs "target/${{ matrix.target }}/release/sharepoint" --max 2.28
-          node scripts/verify-glibc.mjs "target/${{ matrix.target }}/release/bitefoundry-onedrive" --max 2.28
 
       - name: Smoke test binary on AlmaLinux 8 container
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -89,7 +88,7 @@ jobs:
           set -euo pipefail
           docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/sharepoint --version
           docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/sharepoint --help >/dev/null
-          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/bitefoundry-onedrive --version
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 bash -c 'ln -s /work/sharepoint /tmp/bitefoundry-onedrive && /tmp/bitefoundry-onedrive --version'
 
       - name: Build release binary
         if: matrix.os != 'ubuntu-latest'
@@ -105,16 +104,21 @@ jobs:
           version=$(node -p "require('./package.json').version")
           name="sharepoint-${version}-${{ matrix.target }}"
           release_dir="target/${{ matrix.target }}/release"
-          mkdir -p release-staging
+          mkdir -p release-staging release-contents
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            mkdir -p release-contents
-            cp "$release_dir/sharepoint.exe" "$release_dir/bitefoundry-onedrive.exe" LICENSE release-contents/
+            cp "$release_dir/sharepoint.exe" release-contents/sharepoint.exe
+            cp "$release_dir/sharepoint.exe" release-contents/bitefoundry-onedrive.exe
+            cp LICENSE release-contents/
             (cd release-contents && 7z a "../release-staging/${name}.zip" sharepoint.exe bitefoundry-onedrive.exe LICENSE)
             if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
-              cp "$release_dir/sharepoint.exe" "$release_dir/bitefoundry-onedrive.exe" LICENSE release-staging/
+              cp "$release_dir/sharepoint.exe" release-staging/sharepoint.exe
+              cp "$release_dir/sharepoint.exe" release-staging/bitefoundry-onedrive.exe
+              cp LICENSE release-staging/
             fi
           else
-            tar -czf "release-staging/${name}.tar.gz" LICENSE -C "$release_dir" sharepoint bitefoundry-onedrive
+            cp "$release_dir/sharepoint" LICENSE release-contents/
+            ln -sf sharepoint release-contents/bitefoundry-onedrive
+            tar -czf "release-staging/${name}.tar.gz" -C release-contents LICENSE sharepoint bitefoundry-onedrive
           fi
 
       - name: Stage npm artifact directory

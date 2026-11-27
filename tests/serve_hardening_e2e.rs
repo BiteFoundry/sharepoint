@@ -93,9 +93,11 @@ async fn start(policy: RouterPolicy) -> Harness {
     });
 
     let download_dir = tempdir().unwrap();
-    let mut cfg = AppConfig::default();
-    cfg.graph_base_url = base_url;
-    cfg.download_dir = download_dir.path().to_string_lossy().into_owned();
+    let cfg = AppConfig {
+        graph_base_url: base_url,
+        download_dir: download_dir.path().to_string_lossy().into_owned(),
+        ..Default::default()
+    };
     let tokens = StoredTokens {
         access_token: "mock-access-token".to_string(),
         refresh_token: None,

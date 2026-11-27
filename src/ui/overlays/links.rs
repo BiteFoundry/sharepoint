@@ -1,10 +1,11 @@
 //! Link Extractor Overlay (`u`): extracts all URLs (HTML `<a href>`, Markdown `[label](url)`,
-//! and bare `https://...` / `http://...` links) from the currently open email or calendar event.
+//! and bare `https://...` / `http://...` links) from the currently open item.
 //!
 //! Controls: `j`/`k`/`↑`/`↓` navigate, `Enter` open in browser, `y` copy URL, `Esc`/`q`/`u` close.
 
 use std::collections::HashMap;
 
+use bitefoundry_html::{DomDocument, DomNodeId, DomNodeKind};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -12,7 +13,6 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
-use scraper::{Html, Selector};
 
 use crate::{
     models::DriveItem,
@@ -279,29 +279,51 @@ pub fn extract_links_from_html_and_text(html: &str, plain: &str) -> Vec<Extracte
     acc.finish()
 }
 
-fn extract_into_acc(acc: &mut LinkAccumulator, html: &str, plain: &str) {
-    if !html.trim().is_empty() {
-        let fragment = Html::parse_fragment(html);
-        if let Ok(sel) = Selector::parse("a[href]") {
-            for el in fragment.select(&sel) {
-                if let Some(href) = el.value().attr("href") {
-                    let label: String = el
-                        .text()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    acc.push(&label, href);
-                }
+fn collect_dom_text(doc: &DomDocument, node_id: DomNodeId, out: &mut Vec<String>) {
+    let Some(node) = doc.node(node_id) else {
+        return;
+    };
+    match &node.kind {
+        DomNodeKind::Text(t) => out.push(t.clone()),
+        DomNodeKind::Document | DomNodeKind::Element(_) => {
+            for &child in &node.children {
+                collect_dom_text(doc, child, out);
             }
         }
+    }
+}
+
+fn collect_dom_anchors(doc: &DomDocument, node_id: DomNodeId, acc: &mut LinkAccumulator) {
+    let Some(node) = doc.node(node_id) else {
+        return;
+    };
+    if let DomNodeKind::Element(el) = &node.kind {
+        if el.tag == "a" {
+            if let Some(href) = el.get_attr("href") {
+                let mut parts = Vec::new();
+                collect_dom_text(doc, node_id, &mut parts);
+                let label: String = parts
+                    .join(" ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                acc.push(&label, href);
+            }
+        }
+    }
+    for &child in &node.children {
+        collect_dom_anchors(doc, child, acc);
+    }
+}
+
+fn extract_into_acc(acc: &mut LinkAccumulator, html: &str, plain: &str) {
+    if !html.trim().is_empty() {
+        let doc = DomDocument::parse(html);
+        collect_dom_anchors(&doc, doc.root(), acc);
         // Also scan visible text nodes inside HTML for Markdown or bare URLs not wrapped in <a>
-        let html_text: String = fragment
-            .root_element()
-            .text()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let mut text_parts = Vec::new();
+        collect_dom_text(&doc, doc.root(), &mut text_parts);
+        let html_text = text_parts.join(" ");
         extract_markdown_and_bare_urls(acc, &html_text);
     }
     if !plain.trim().is_empty() {
@@ -403,10 +425,7 @@ fn find_matching_paren(bytes: &[u8], start: usize) -> Option<usize> {
 
 fn trim_trailing_url_punct(raw: &str) -> &str {
     let mut s = raw;
-    loop {
-        let Some(last) = s.chars().last() else {
-            break;
-        };
+    while let Some(last) = s.chars().last() {
         let should_strip = match last {
             '.' | ',' | ';' | ':' | '!' | '?' => true,
             ')' => {

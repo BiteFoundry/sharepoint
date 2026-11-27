@@ -225,15 +225,15 @@ impl GraphClient {
     ) -> Result<GraphGetOrGone<T>> {
         let url = self.resolve_delta_url(path_or_url)?;
         let resp = self
-            .execute_with_retry_inner(
-                Method::GET,
-                &url,
-                RequestBody::Empty,
-                &[],
-                true,
-                STANDARD_REQUEST_TIMEOUT,
-                true,
-            )
+            .execute_with_retry_inner(RetryRequest {
+                method: Method::GET,
+                url: &url,
+                body: RequestBody::Empty,
+                extra_headers: &[],
+                use_bearer: true,
+                timeout: STANDARD_REQUEST_TIMEOUT,
+                allow_gone: true,
+            })
             .await?;
         if resp.status() == StatusCode::GONE {
             let location = resp
@@ -690,20 +690,28 @@ impl GraphClient {
         use_bearer: bool,
         timeout: Duration,
     ) -> Result<reqwest::Response> {
-        self.execute_with_retry_inner(method, url, body, extra_headers, use_bearer, timeout, false)
-            .await
+        self.execute_with_retry_inner(RetryRequest {
+            method,
+            url,
+            body,
+            extra_headers,
+            use_bearer,
+            timeout,
+            allow_gone: false,
+        })
+        .await
     }
 
-    async fn execute_with_retry_inner(
-        &self,
-        method: Method,
-        url: &str,
-        body: RequestBody,
-        extra_headers: &[(&str, String)],
-        use_bearer: bool,
-        timeout: Duration,
-        allow_gone: bool,
-    ) -> Result<reqwest::Response> {
+    async fn execute_with_retry_inner(&self, spec: RetryRequest<'_>) -> Result<reqwest::Response> {
+        let RetryRequest {
+            method,
+            url,
+            body,
+            extra_headers,
+            use_bearer,
+            timeout,
+            allow_gone,
+        } = spec;
         let mut unauthorized_retried = false;
         let mut throttle_attempt = 0usize;
         let mut transport_retried = false;
@@ -799,6 +807,16 @@ impl GraphClient {
     }
 }
 
+struct RetryRequest<'a> {
+    method: Method,
+    url: &'a str,
+    body: RequestBody,
+    extra_headers: &'a [(&'a str, String)],
+    use_bearer: bool,
+    timeout: Duration,
+    allow_gone: bool,
+}
+
 pub(crate) fn parse_retry_after_secs(
     headers: &reqwest::header::HeaderMap,
     attempt: usize,
@@ -843,8 +861,10 @@ mod tests {
 
     #[test]
     fn test_resolve_url_relative_and_absolute() {
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = "https://graph.microsoft.com/v1.0/".to_string();
+        let cfg = AppConfig {
+            graph_base_url: "https://graph.microsoft.com/v1.0/".to_string(),
+            ..Default::default()
+        };
         let auth = AuthManager::from_tokens(
             cfg.clone(),
             crate::auth::StoredTokens {
@@ -998,10 +1018,12 @@ mod tests {
         });
 
         let dir = tempdir().unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
-        cfg.tenant_id = "tid".into();
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            graph_base_url: format!("http://{addr}/v1.0"),
+            tenant_id: "tid".into(),
+            ..Default::default()
+        };
 
         let tok = crate::auth::StoredTokens {
             access_token: "stale-token".into(),
@@ -1115,8 +1137,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -1159,8 +1183,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,

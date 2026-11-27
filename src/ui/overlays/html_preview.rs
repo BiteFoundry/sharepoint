@@ -33,6 +33,10 @@ use crate::ui::{
     truncate_width,
 };
 
+type GraphicCacheKey = (usize, u16, TerminalImageProtocol);
+type GraphicCacheEntry = (Arc<[u8]>, RenderedTerminalImage);
+type GraphicCacheEnv = ((u8, u8, u8), (u16, u16));
+
 pub struct HtmlPreviewOverlay {
     pub drive_id: Option<String>,
     pub item_id: Option<String>,
@@ -42,9 +46,9 @@ pub struct HtmlPreviewOverlay {
     pub viewport: Rect,
     pub max_scroll_y: u16,
     /// Per-overlay inline graphic cache keyed by `(node_id, width, protocol)` (dropped on close).
-    graphic_cache: HashMap<(usize, u16, TerminalImageProtocol), (Arc<[u8]>, RenderedTerminalImage)>,
+    graphic_cache: HashMap<GraphicCacheKey, GraphicCacheEntry>,
     /// Tracks `(bg_rgb, cell_px)` so theme or DPI changes invalidate cached graphics.
-    graphic_cache_env: Option<((u8, u8, u8), (u16, u16))>,
+    graphic_cache_env: Option<GraphicCacheEnv>,
 }
 
 impl fmt::Debug for HtmlPreviewOverlay {

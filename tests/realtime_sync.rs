@@ -44,8 +44,10 @@ use sharepoint_cli::{
 };
 
 fn build_graph_client(base_url: String) -> GraphClient {
-    let mut cfg = AppConfig::default();
-    cfg.graph_base_url = base_url;
+    let cfg = AppConfig {
+        graph_base_url: base_url,
+        ..Default::default()
+    };
     let auth = AuthManager::from_tokens(
         cfg.clone(),
         StoredTokens {
@@ -859,9 +861,11 @@ async fn direct_socketio_push_delta_fallback_reconnect_and_focus_gained() {
         let _ = axum::serve(http_listener, router).await;
     });
 
-    let mut cfg = AppConfig::default();
-    cfg.graph_base_url = base_url.clone();
-    cfg.active_poll_ms = 1_000; // fast fallback for test
+    let cfg = AppConfig {
+        graph_base_url: base_url.clone(),
+        active_poll_ms: 1_000, // fast fallback for test
+        ..Default::default()
+    };
     let graph = build_graph_client(base_url.clone());
     let storage = Storage::open_in_memory().unwrap();
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<CoreEvent>();

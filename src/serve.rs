@@ -368,7 +368,7 @@ pub(crate) fn is_allowed_host(raw: &str, allowed_hosts: &[String]) -> bool {
     let Some(host) = host_without_port(raw) else {
         return false;
     };
-    LOOPBACK_HOSTS.contains(&host.as_str()) || allowed_hosts.iter().any(|h| *h == host)
+    LOOPBACK_HOSTS.contains(&host.as_str()) || allowed_hosts.contains(&host)
 }
 
 /// Exact loopback-origin check for CORS. Accepts only `http://localhost`,
@@ -435,7 +435,7 @@ fn matches_extra_origin(origin: &str, cors_origins: &[String]) -> bool {
         return false;
     }
     let canonical = url.origin().ascii_serialization();
-    cors_origins.iter().any(|allowed| *allowed == canonical)
+    cors_origins.contains(&canonical)
 }
 
 /// Refuse to expose the API beyond loopback without a key.
@@ -1047,38 +1047,16 @@ async fn handle_patch_item(
         false,
     )
     .await?;
-    let mut pre_patch_folder_path: Option<String> = None;
-    let folder_cached = state
-        .storage
-        .get_drive_item(&drive.id, &id)
-        .ok()
-        .flatten()
-        .is_some();
-    if !folder_cached {
-        let has_direct_child = state
-            .storage
-            .has_cached_child_for_parent(&drive.id, &id)
-            .unwrap_or(false);
-        if !has_direct_child
-            && state
-                .storage
-                .has_nested_drive_items(&drive.id)
-                .unwrap_or(false)
-        {
-            if let Ok(existing) = state.graph.get_item(&drive.id, &id).await {
-                if existing.is_folder {
-                    pre_patch_folder_path = Some(existing.display_path());
-                }
-            }
-        }
-    }
-    let updated = state
-        .graph
-        .rename_or_move_item(&drive.id, &id, body.name.as_deref(), body.parent_id.as_deref())
-        .await?;
-    let _ = state
-        .storage
-        .upsert_drive_item_after_move(&updated, pre_patch_folder_path.as_deref());
+    let updated = cli::rename_or_move_item_cached(
+        &state.graph,
+        &state.storage,
+        &drive.id,
+        &id,
+        None,
+        body.name.as_deref(),
+        body.parent_id.as_deref(),
+    )
+    .await?;
     Ok(Json(json!({ "item": updated })))
 }
 
@@ -1232,7 +1210,9 @@ async fn handle_download(
         )
         .await?;
     cli::record_download_baseline(&state.storage, &item, &mut downloaded);
-    Ok(Json(serde_json::to_value(downloaded).unwrap()))
+    let value = serde_json::to_value(downloaded)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(value))
 }
 
 async fn handle_download_by_id(

@@ -1424,15 +1424,16 @@ pub async fn run_cli(cli: Cli, persona: Persona) -> Result<()> {
             let (item_res, dest_parent_res) = tokio::join!(item_fut, parent_fut);
             let item = item_res?;
             let dest_parent_id = dest_parent_res?;
-            let updated = graph
-                .rename_or_move_item(
-                    &target_drive.id,
-                    &item.id,
-                    name.as_deref(),
-                    dest_parent_id.as_deref(),
-                )
-                .await?;
-            let _ = storage.upsert_drive_items(std::slice::from_ref(&updated));
+            let updated = rename_or_move_item_cached(
+                &graph,
+                &storage,
+                &target_drive.id,
+                &item.id,
+                Some(&item),
+                name.as_deref(),
+                dest_parent_id.as_deref(),
+            )
+            .await?;
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&updated)?);
             } else {
@@ -2842,6 +2843,53 @@ async fn build_tree(
     build_tree_inner(graph, storage, drive_id, parent_id, depth, sem).await
 }
 
+/// Resolves pre-PATCH folder path when needed (so `upsert_drive_item_after_move` can rewrite
+/// cached descendant paths even when the target folder row was not yet cached), executes
+/// `rename_or_move_item`, and updates the SQLite cache atomically.
+pub async fn rename_or_move_item_cached(
+    graph: &GraphClient,
+    storage: &Storage,
+    drive_id: &str,
+    item_id: &str,
+    known_pre_patch_item: Option<&DriveItem>,
+    new_name: Option<&str>,
+    new_parent_id: Option<&str>,
+) -> Result<DriveItem> {
+    let pre_patch_folder_path = match known_pre_patch_item {
+        Some(item) => item.is_folder.then(|| item.display_path()),
+        None => {
+            let folder_cached = storage
+                .get_drive_item(drive_id, item_id)
+                .ok()
+                .flatten()
+                .is_some();
+            if !folder_cached
+                && !storage
+                    .has_cached_child_for_parent(drive_id, item_id)
+                    .unwrap_or(false)
+                && storage.has_nested_drive_items(drive_id).unwrap_or(false)
+            {
+                graph
+                    .get_item(drive_id, item_id)
+                    .await
+                    .ok()
+                    .filter(|existing| existing.is_folder)
+                    .map(|existing| existing.display_path())
+            } else {
+                None
+            }
+        }
+    };
+    let updated = graph
+        .rename_or_move_item(drive_id, item_id, new_name, new_parent_id)
+        .await?;
+    let _ = storage.upsert_drive_item_after_move(&updated, pre_patch_folder_path.as_deref());
+    Ok(updated)
+}
+
+type BuildTreeFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<TreeNode>, bool)>> + Send + 'a>>;
+
 fn build_tree_inner<'a>(
     graph: &'a GraphClient,
     storage: &'a Storage,
@@ -2849,8 +2897,7 @@ fn build_tree_inner<'a>(
     parent_id: Option<&'a str>,
     depth: usize,
     sem: std::sync::Arc<tokio::sync::Semaphore>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<TreeNode>, bool)>> + Send + 'a>>
-{
+) -> BuildTreeFuture<'a> {
     Box::pin(async move {
         let page = {
             let _permit = sem

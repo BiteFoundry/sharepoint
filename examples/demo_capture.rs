@@ -489,13 +489,15 @@ fn sharepoint_eng_docs_items() -> Vec<DriveItem> {
 fn build_demo_state() -> Result<(AppState, UiState)> {
     std::env::set_var("SHAREPOINT_CONFIG_DIR", r"~\.config\sharepoint-cli");
 
-    let mut cfg = AppConfig::default();
-    cfg.theme = ThemePreset::Dark;
-    cfg.density = DensityMode::Cozy;
-    cfg.show_nav_rail = true;
-    cfg.inline_images = true;
-    cfg.notify = true;
-    cfg.download_dir = r"~\Downloads\sharepoint".to_string();
+    let cfg = AppConfig {
+        theme: ThemePreset::Dark,
+        density: DensityMode::Cozy,
+        show_nav_rail: true,
+        inline_images: true,
+        notify: true,
+        download_dir: r"~\Downloads\sharepoint".to_string(),
+        ..Default::default()
+    };
 
     let dummy_tokens = StoredTokens {
         access_token: "demo-token".to_string(),
@@ -864,7 +866,7 @@ fn main() -> Result<()> {
     ui.overlays.clear();
 
     // Frame 5: Open Upload / File Picker overlay (Ctrl+F)
-    ui.overlays.push(Overlay::FilePicker(build_demo_file_picker()));
+    ui.overlays.push(Overlay::FilePicker(Box::new(build_demo_file_picker())));
     frames.push(capture_frame(
         &mut terminal,
         &mut app,

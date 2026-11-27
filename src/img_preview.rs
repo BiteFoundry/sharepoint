@@ -1466,9 +1466,10 @@ pub fn decode_and_render_halfblocks_with_cell_px(
     let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Lanczos3);
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
 
+    type HalfblockColorPair = ((u8, u8, u8), (u8, u8, u8));
     for y in (0..target_h).step_by(2) {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut current_pair: Option<((u8, u8, u8), (u8, u8, u8))> = None;
+        let mut current_pair: Option<HalfblockColorPair> = None;
         let mut run = String::new();
 
         for x in 0..target_w {
@@ -1751,7 +1752,7 @@ pub(crate) fn compute_halfblock_dims(
     let target_w = ((raw_w * cap_factor).round() as u32).clamp(1, max_w);
     let mut target_h = ((raw_h * cap_factor).round() as u32).clamp(2, max_h);
     if target_h % 2 != 0 {
-        if target_h + 1 <= max_h {
+        if target_h < max_h {
             target_h += 1;
         } else {
             target_h = target_h.saturating_sub(1).max(2);
@@ -2010,7 +2011,7 @@ fn quantize_rgba_to_256_with_stats(
     let mut indexed = Vec::with_capacity(pixel_count);
     let mut overflow = false;
 
-    for px in flat_rgba.chunks_exact(4).take(pixel_count) {
+    for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
         let key = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
         if let Some(&idx) = exact_map.get(&key) {
             indexed.push(idx);
@@ -2032,7 +2033,7 @@ fn quantize_rgba_to_256_with_stats(
     // Median-cut over 5-bit-per-channel RGB buckets with perceptual channel weights
     // and `weighted_span * ceil(sqrt(pop))` split scoring so minority UI text/accent colors keep slots.
     let mut hist: HashMap<u16, (u32, u64, u64, u64)> = HashMap::new();
-    for px in flat_rgba.chunks_exact(4).take(pixel_count) {
+    for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
         let qkey = (((px[0] as u16) >> 3) << 10)
             | (((px[1] as u16) >> 3) << 5)
             | ((px[2] as u16) >> 3);
@@ -2146,10 +2147,9 @@ fn quantize_rgba_to_256_with_stats(
                 sg += b.sum_g;
                 sb += b.sum_b;
             }
-            if cnt == 0 {
-                (0, 0, 0)
-            } else {
-                ((sr / cnt) as u8, (sg / cnt) as u8, (sb / cnt) as u8)
+            match (sr.checked_div(cnt), sg.checked_div(cnt), sb.checked_div(cnt)) {
+                (Some(r), Some(g), Some(b)) => (r as u8, g as u8, b as u8),
+                _ => (0, 0, 0),
             }
         })
         .collect();
@@ -2800,9 +2800,9 @@ mod tests {
                 let (r, g, b) = if y < 6 && x < 50 {
                     // >256 unique subtle colors to force median-cut quantization path
                     (
-                        (100 + (x * 3) as u8).min(255),
-                        (100 + (y * 20) as u8).min(255),
-                        (120 + ((x + y * 7) % 120) as u8),
+                        100 + (x * 3) as u8,
+                        100 + (y * 20) as u8,
+                        120 + ((x + y * 7) % 120) as u8,
                     )
                 } else if y == 20 && (20..60).contains(&x) {
                     (0, 100, 255) // vivid blue UI text
@@ -2855,7 +2855,7 @@ mod tests {
                 grad.extend_from_slice(&[
                     ((x * 255) / gw) as u8,
                     ((y * 255) / gh) as u8,
-                    (((x * 7 + y * 13) % 256)) as u8,
+                    ((x * 7 + y * 13) % 256) as u8,
                     255,
                 ]);
             }

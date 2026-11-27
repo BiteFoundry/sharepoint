@@ -342,8 +342,8 @@ pub async fn resolve_target_drive(
                     Err(_) if !offline => {}
                     Err(err) => return Err(err),
                 }
-            } else {
-                return Ok(cached_drives.into_iter().next().unwrap());
+            } else if let Some(first) = cached_drives.first() {
+                return Ok(first.clone());
             }
         }
         let drives = if offline {

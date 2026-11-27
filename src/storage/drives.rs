@@ -454,19 +454,20 @@ fn upsert_drive_items_tx_with_moves(
         }
     }
 
+    type DescendantRow = (
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
     for (drive_id, mut moves) in moved_by_drive {
         // Longest original folder prefix first so each cached descendant is rewritten exactly once.
-        moves.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        moves.sort_by_key(|(old_prefix, _)| std::cmp::Reverse(old_prefix.len()));
         let mut seen_rowids: HashSet<i64> = HashSet::new();
-        let mut descendants: Vec<(
-            i64,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        )> = Vec::new();
+        let mut descendants: Vec<DescendantRow> = Vec::new();
         {
             let mut stmt = tx.prepare_cached(
                 "SELECT rowid, id, parent_path, name, last_modified_by, created_by, mime_type
@@ -911,8 +912,7 @@ pub fn list_named_items(conn: &Connection, list_kind: &str, limit: usize) -> Res
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let sql = format!(
-        "
+    let sql = "
         SELECT d.drive_id, d.id, d.parent_id, d.parent_path, d.name, d.size, d.is_folder, d.child_count,
                d.mime_type, d.web_url, d.download_url, d.e_tag, d.c_tag, d.created_at, d.last_modified_at,
                d.created_by, d.last_modified_by, d.shared_scope, d.remote_drive_id, d.remote_item_id
@@ -921,9 +921,8 @@ pub fn list_named_items(conn: &Connection, list_kind: &str, limit: usize) -> Res
         WHERE l.list_kind = ?1
         ORDER BY l.position ASC
         LIMIT ?2
-        "
-    );
-    let mut stmt = conn.prepare_cached(&sql)?;
+        ";
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt.query_map(params![list_kind, limit as i64], map_drive_item_row)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
 }
@@ -1130,7 +1129,7 @@ pub fn apply_delta_page(
                     }
                 }
 
-                let mut resolved = item.clone();
+                let mut resolved = item.as_ref().clone();
                 if resolved.drive_id.trim().is_empty() {
                     resolved.drive_id = drive_id.to_string();
                 }
@@ -1246,7 +1245,7 @@ pub fn replace_drive_items_from_resync(
         } = ch
         {
             if item.is_folder {
-                let mut resolved = item.clone();
+                let mut resolved = item.as_ref().clone();
                 if resolved.drive_id.trim().is_empty() {
                     resolved.drive_id = drive_id.to_string();
                 }
@@ -1274,7 +1273,7 @@ pub fn replace_drive_items_from_resync(
         } = ch
         {
             if !item.is_folder {
-                let mut resolved = item.clone();
+                let mut resolved = item.as_ref().clone();
                 if resolved.drive_id.trim().is_empty() {
                     resolved.drive_id = drive_id.to_string();
                 }

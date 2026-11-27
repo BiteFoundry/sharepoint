@@ -763,13 +763,20 @@ async fn cli_hyphen_filenames_search_and_lists_negative_number_on_both_binaries(
     std::fs::write(&local_file, b"hyphen payload bytes").unwrap();
     let local_file_str = local_file.to_string_lossy().into_owned();
 
+    let od_exe = {
+        let src = Path::new(env!("CARGO_BIN_EXE_sharepoint"));
+        let dst = tmp
+            .path()
+            .join(format!("bitefoundry-onedrive{}", std::env::consts::EXE_SUFFIX));
+        if std::fs::hard_link(src, &dst).is_err() {
+            std::fs::copy(src, &dst).unwrap();
+        }
+        dst
+    };
+
     let binaries = [
         ("sharepoint", Path::new(env!("CARGO_BIN_EXE_sharepoint")), DRIVE_SP),
-        (
-            "bitefoundry-onedrive",
-            Path::new(env!("CARGO_BIN_EXE_bitefoundry-onedrive")),
-            DRIVE_ME,
-        ),
+        ("bitefoundry-onedrive", od_exe.as_path(), DRIVE_ME),
     ];
 
     for (label, exe, expected_drive) in binaries {
@@ -1582,8 +1589,10 @@ async fn regression_sharepoint_sp_13_nested_folder_batch_and_uncached_http_renam
     });
 
     let (base_url, _st, graph_server) = start_mock_server(mock_state).await;
-    let mut cfg = AppConfig::default();
-    cfg.graph_base_url = base_url.clone();
+    let cfg = AppConfig {
+        graph_base_url: base_url.clone(),
+        ..Default::default()
+    };
     let tokens = StoredTokens {
         access_token: "sp13-token".into(),
         refresh_token: None,
@@ -1677,5 +1686,185 @@ async fn regression_sharepoint_sp_13_nested_folder_batch_and_uncached_http_renam
         .is_none());
 
     api_server.abort();
+    graph_server.abort();
+}
+
+#[tokio::test]
+async fn regression_sharepoint_sp_13_mcp_and_cli_uncached_folder_rename_cache_paths() {
+    use sharepoint_cli::{
+        auth::{AuthManager, StoredTokens},
+        cli,
+        config::AppConfig,
+        graph::GraphClient,
+        mcp,
+        models::DriveItem,
+        storage::Storage,
+    };
+
+    let mut mock_state = MockDriveState::default();
+    mock_state.seed_item(MockItem {
+        id: "fld-mcp-1".into(),
+        drive_id: DRIVE_ME.into(),
+        parent_id: "root".into(),
+        parent_path: String::new(),
+        name: "McpTop".into(),
+        is_folder: true,
+        size: 0,
+        mime_type: None,
+    });
+    mock_state.seed_item(MockItem {
+        id: "fld-mcp-mid".into(),
+        drive_id: DRIVE_ME.into(),
+        parent_id: "fld-mcp-1".into(),
+        parent_path: "/McpTop".into(),
+        name: "Sub".into(),
+        is_folder: true,
+        size: 0,
+        mime_type: None,
+    });
+    mock_state.seed_item(MockItem {
+        id: "item-mcp-grand".into(),
+        drive_id: DRIVE_ME.into(),
+        parent_id: "fld-mcp-mid".into(),
+        parent_path: "/McpTop/Sub".into(),
+        name: "grand.txt".into(),
+        is_folder: false,
+        size: 11,
+        mime_type: Some("text/plain".into()),
+    });
+    mock_state.seed_item(MockItem {
+        id: "fld-cli-1".into(),
+        drive_id: DRIVE_ME.into(),
+        parent_id: "root".into(),
+        parent_path: String::new(),
+        name: "CliTop".into(),
+        is_folder: true,
+        size: 0,
+        mime_type: None,
+    });
+    mock_state.seed_item(MockItem {
+        id: "fld-cli-mid".into(),
+        drive_id: DRIVE_ME.into(),
+        parent_id: "fld-cli-1".into(),
+        parent_path: "/CliTop".into(),
+        name: "Sub".into(),
+        is_folder: true,
+        size: 0,
+        mime_type: None,
+    });
+    mock_state.seed_item(MockItem {
+        id: "item-cli-grand".into(),
+        drive_id: DRIVE_ME.into(),
+        parent_id: "fld-cli-mid".into(),
+        parent_path: "/CliTop/Sub".into(),
+        name: "leaf.txt".into(),
+        is_folder: false,
+        size: 7,
+        mime_type: Some("text/plain".into()),
+    });
+
+    let (base_url, _st, graph_server) = start_mock_server(mock_state).await;
+    let cfg = AppConfig {
+        graph_base_url: base_url,
+        ..Default::default()
+    };
+    let tokens = StoredTokens {
+        access_token: "sp13-mcp-cli-token".into(),
+        refresh_token: None,
+        expires_at: chrono::Utc::now().timestamp() + 3600,
+        client_id: cfg.client_id.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        user_id: Some("user-1".into()),
+        user_display_name: Some("Tester".into()),
+        user_email: Some("tester@example.com".into()),
+        auth_mode: "access_token".into(),
+    };
+    let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+    let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+    let storage = Storage::open_in_memory().unwrap();
+
+    // Cache ONLY grandchildren (neither top nor mid folder rows are cached)
+    storage
+        .upsert_drive_items(&[
+            DriveItem {
+                id: "item-mcp-grand".into(),
+                drive_id: DRIVE_ME.into(),
+                parent_id: Some("fld-mcp-mid".into()),
+                parent_path: "/McpTop/Sub".into(),
+                name: "grand.txt".into(),
+                size: 11,
+                ..Default::default()
+            },
+            DriveItem {
+                id: "item-cli-grand".into(),
+                drive_id: DRIVE_ME.into(),
+                parent_id: Some("fld-cli-mid".into()),
+                parent_path: "/CliTop/Sub".into(),
+                name: "leaf.txt".into(),
+                size: 7,
+                ..Default::default()
+            },
+        ])
+        .unwrap();
+
+    // 1. MCP move_or_rename_item renames uncached fld-mcp-1 -> McpTopRenamed
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "move_or_rename_item",
+            "arguments": {
+                "drive": "me",
+                "item_id": "fld-mcp-1",
+                "new_name": "McpTopRenamed"
+            }
+        }
+    });
+    let resp = mcp::handle_rpc_line(&cfg, &graph, &storage, &req.to_string())
+        .await
+        .expect("MCP response");
+    assert_eq!(resp["result"]["isError"], Value::Bool(false), "{resp}");
+    assert_eq!(
+        storage
+            .get_drive_item_by_path(DRIVE_ME, "/McpTopRenamed/Sub/grand.txt")
+            .unwrap()
+            .as_ref()
+            .map(|i| i.id.as_str()),
+        Some("item-mcp-grand"),
+        "MCP move_or_rename_item must rewrite cached grandchild path for uncached folder"
+    );
+    assert!(storage
+        .get_drive_item_by_path(DRIVE_ME, "/McpTop/Sub/grand.txt")
+        .unwrap()
+        .is_none());
+
+    // 2. Shared CLI move helper renames uncached fld-cli-1 -> CliTopRenamed (even with known_pre_patch_item = None)
+    let updated = cli::rename_or_move_item_cached(
+        &graph,
+        &storage,
+        DRIVE_ME,
+        "fld-cli-1",
+        None,
+        Some("CliTopRenamed"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.name, "CliTopRenamed");
+    assert_eq!(
+        storage
+            .get_drive_item_by_path(DRIVE_ME, "/CliTopRenamed/Sub/leaf.txt")
+            .unwrap()
+            .as_ref()
+            .map(|i| i.id.as_str()),
+        Some("item-cli-grand"),
+        "CLI move helper must rewrite cached grandchild path for uncached folder"
+    );
+    assert!(storage
+        .get_drive_item_by_path(DRIVE_ME, "/CliTop/Sub/leaf.txt")
+        .unwrap()
+        .is_none());
+
     graph_server.abort();
 }

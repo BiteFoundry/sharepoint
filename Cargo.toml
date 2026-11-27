@@ -14,11 +14,6 @@ path = "src/lib.rs"
 name = "sharepoint"
 path = "src/main.rs"
 
-[[bin]]
-name = "bitefoundry-onedrive"
-path = "src/onedrive_main.rs"
-test = false
-
 [dependencies]
 anyhow = "1"
 arboard = { version = "3", features = ["image-data"] }
@@ -40,19 +35,17 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-native-certs = "0.8"
-scraper = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 unicode-width = "0.2"
 url = "2"
 urlencoding = "2"
-uuid = { version = "1", features = ["v4"] }
 webpki-roots = "1"
 
 [target.'cfg(windows)'.dependencies]

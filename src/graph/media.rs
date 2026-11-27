@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
-use uuid::Uuid;
+use rand::RngCore;
 
 pub fn should_send_bearer(graph_base_url: &str, target_url: &str) -> bool {
     let trimmed = target_url.trim();
@@ -91,7 +91,22 @@ pub fn deduplicate_dest_path(dest_dir: &Path, safe_name: &str) -> PathBuf {
             return next_path;
         }
     }
-    dest_dir.join(format!("{stem}_{}", Uuid::new_v4()))
+    dest_dir.join(format!("{stem}_{}", random_uuid_v4()))
+}
+
+fn random_uuid_v4() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex::encode(&bytes[0..4]),
+        hex::encode(&bytes[4..6]),
+        hex::encode(&bytes[6..8]),
+        hex::encode(&bytes[8..10]),
+        hex::encode(&bytes[10..16]),
+    )
 }
 
 pub fn guess_mime_type(path: &Path) -> &'static str {
@@ -156,12 +171,9 @@ pub(crate) fn decode_text_file(bytes: &[u8]) -> Result<String> {
         (&[0xfe, 0xff][..], u16::from_be_bytes, "UTF-16BE"),
     ] {
         if let Some(payload) = bytes.strip_prefix(bom) {
-            let units = payload.chunks_exact(2);
-            ensure!(
-                units.remainder().is_empty(),
-                "Truncated {encoding} code unit"
-            );
-            let units: Vec<_> = units.map(|pair| read_unit([pair[0], pair[1]])).collect();
+            let (pairs, remainder) = payload.as_chunks::<2>();
+            ensure!(remainder.is_empty(), "Truncated {encoding} code unit");
+            let units: Vec<_> = pairs.iter().copied().map(read_unit).collect();
             return String::from_utf16(&units).with_context(|| format!("Invalid {encoding} text"));
         }
     }

@@ -290,13 +290,13 @@ fn pixel_graphics_allowed_for_overlays(overlays: &[Overlay], cache_key: &str) ->
 fn evaluate_pixel_placement(
     cache_key: &str,
     pending_rect: Rect,
-    rendered_cols: u16,
-    rendered_rows: u16,
+    rendered_size: (u16, u16),
     inspector_area: Rect,
     inspector_scroll_y: u16,
-    term_width: u16,
-    term_height: u16,
+    term_size: (u16, u16),
 ) -> std::result::Result<Rect, Option<(u16, u16)>> {
+    let (rendered_cols, rendered_rows) = rendered_size;
+    let (term_width, term_height) = term_size;
     let mut rect = pending_rect;
     let is_inline = cache_key.starts_with("inline:");
 
@@ -820,12 +820,10 @@ fn draw_frame(
         match evaluate_pixel_placement(
             &pending.cache_key,
             pending.rect,
-            draw_cols,
-            draw_rows,
+            (draw_cols, draw_rows),
             ui.inspector_scroll.area,
             inspector_scroll_y,
-            ui.term_width,
-            ui.term_height,
+            (ui.term_width, ui.term_height),
         ) {
             Ok(placement_rect) => {
                 desired.push(ActivePixelGraphic {
@@ -1028,7 +1026,7 @@ mod tests {
         );
         tracker.commit(vec![img_a.clone()], (120, 36));
 
-        let plan = tracker.plan_transition(&[img_a.clone()], (120, 36), false);
+        let plan = tracker.plan_transition(std::slice::from_ref(&img_a), (120, 36), false);
         assert!(!plan.erase_and_redraw);
         assert!(!plan.delete_kitty);
         assert!(plan.erase_rects.is_empty());
@@ -1092,7 +1090,7 @@ mod tests {
             "<html><body><p>Hi</p></body></html>".into(),
             None,
         );
-        let only_html = vec![Overlay::HtmlPreview(html_ov)];
+        let only_html = vec![Overlay::HtmlPreview(Box::new(html_ov))];
         assert!(pixel_graphics_allowed_for_overlays(
             &only_html,
             "html:3:0:40:8:kitty"
@@ -1106,10 +1104,12 @@ mod tests {
             "modal:d1:img1:80x24:sixel"
         ));
         let stacked_html = vec![
-            Overlay::HtmlPreview(crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(
-                "chart.html",
-                "<html><body><p>Hi</p></body></html>".into(),
-                None,
+            Overlay::HtmlPreview(Box::new(
+                crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(
+                    "chart.html",
+                    "<html><body><p>Hi</p></body></html>".into(),
+                    None,
+                ),
             )),
             Overlay::confirm("Close?", None),
         ];
@@ -1142,12 +1142,10 @@ mod tests {
         let res = evaluate_pixel_placement(
             "inline:d1:i1",
             pending_rect,
-            40,
-            12,
+            (40, 12),
             inspector_area,
             0,
-            120,
-            26,
+            (120, 26),
         );
         // Bottom-row guard reserves row 25 (`term_height - 1`), so safe_max_h = 25 - 18 = 7
         assert_eq!(res, Err(Some((48, 7))));
@@ -1156,12 +1154,10 @@ mod tests {
         let ok = evaluate_pixel_placement(
             "inline:d1:i1",
             pending_rect,
-            40,
-            7,
+            (40, 7),
             inspector_area,
             0,
-            120,
-            26,
+            (120, 26),
         );
         assert_eq!(ok, Ok(Rect::new(61, 18, 40, 7)));
 
@@ -1169,12 +1165,10 @@ mod tests {
         let scrolled_out = evaluate_pixel_placement(
             "inline:d1:i1",
             Rect::new(61, 10, 40, 7),
-            40,
-            7,
+            (40, 7),
             inspector_area,
             12,
-            120,
-            26,
+            (120, 26),
         );
         assert_eq!(scrolled_out, Err(None));
 
@@ -1182,12 +1176,10 @@ mod tests {
         let too_small = evaluate_pixel_placement(
             "inline:d1:i1",
             Rect::new(61, 24, 40, 1),
-            40,
-            7,
+            (40, 7),
             inspector_area,
             0,
-            120,
-            26,
+            (120, 26),
         );
         assert_eq!(too_small, Err(None));
     }

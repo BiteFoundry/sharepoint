@@ -134,8 +134,10 @@ async fn start(mock: Mock) -> (GraphClient, tokio::task::JoinHandle<()>) {
         let _ = axum::serve(listener, app).await;
     });
 
-    let mut cfg = AppConfig::default();
-    cfg.graph_base_url = base_url;
+    let cfg = AppConfig {
+        graph_base_url: base_url,
+        ..Default::default()
+    };
     let tokens = StoredTokens {
         access_token: "mock-access-token".to_string(),
         refresh_token: None,

@@ -1767,7 +1767,7 @@ impl AppState {
                         let mut ov = HtmlPreviewOverlay::new(it.name, content, Some(item_id));
                         ov.drive_id = Some(drive_id);
                         ov.revision = current_rev;
-                        ui.push_overlay(Overlay::HtmlPreview(ov));
+                        ui.push_overlay(Overlay::HtmlPreview(Box::new(ov)));
                     }
                 }
             }
@@ -1874,11 +1874,11 @@ impl AppState {
                     Some(Overlay::HtmlPreview(ov)) if ov.item_id.as_deref() == Some(item_id.as_str())
                 );
                 if !already_open {
-                    ui.push_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
+                    ui.push_overlay(Overlay::HtmlPreview(Box::new(HtmlPreviewOverlay::new(
                         title,
                         html,
                         Some(item_id),
-                    )));
+                    ))));
                 }
                 ui.toast(
                     "HTML content detected — opened interactive HTML viewer",
@@ -1916,7 +1916,7 @@ impl AppState {
                 let mut ov = HtmlPreviewOverlay::new(title, html, Some(item_id));
                 ov.drive_id = Some(drive_id);
                 ov.revision = current_rev;
-                ui.push_overlay(Overlay::HtmlPreview(ov));
+                ui.push_overlay(Overlay::HtmlPreview(Box::new(ov)));
             }
             UiMsg::HtmlServed { url } => match open::that(&url) {
                 Ok(()) => ui.toast(format!("Serving HTML at {url}"), ToastKind::Success),

@@ -379,12 +379,12 @@ fn draw_status_bar(
 
     let mut chosen: Vec<(&str, ButtonId, u16)> = Vec::new();
     let mut right_w: u16 = 0;
+    const PILL_GAP: u16 = 1;
     for (label, btn) in pills.iter().rev() {
         let w = label.width() as u16;
-        let gap: u16 = if chosen.is_empty() { 1 } else { 1 };
-        if area.width > right_w + w + gap + 12 {
+        if area.width > right_w + w + PILL_GAP + 12 {
             chosen.push((*label, *btn, w));
-            right_w = right_w.saturating_add(w + gap);
+            right_w = right_w.saturating_add(w + PILL_GAP);
         }
     }
     chosen.reverse();

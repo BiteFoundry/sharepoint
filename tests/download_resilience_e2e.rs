@@ -154,8 +154,10 @@ async fn start_mock() -> (Mock, tokio::task::JoinHandle<()>) {
 }
 
 fn graph_for(mock: &Mock, header: Duration, read: Duration) -> GraphClient {
-    let mut cfg = AppConfig::default();
-    cfg.graph_base_url = format!("{}/v1.0", mock.origin);
+    let cfg = AppConfig {
+        graph_base_url: format!("{}/v1.0", mock.origin),
+        ..Default::default()
+    };
     let tokens = StoredTokens {
         access_token: "mock-access-token".to_string(),
         refresh_token: None,

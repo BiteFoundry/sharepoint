@@ -65,11 +65,11 @@ pub enum Overlay {
     CommandPalette(CommandPalette),
     Settings(SettingsState),
     Search(SearchOverlay),
-    FilePicker(FilePickerOverlay),
+    FilePicker(Box<FilePickerOverlay>),
     Links(LinkExtractorOverlay),
     QuickInput(QuickInputOverlay),
     ImagePreview(ImagePreviewOverlay),
-    HtmlPreview(HtmlPreviewOverlay),
+    HtmlPreview(Box<HtmlPreviewOverlay>),
     Help(HelpOverlay),
     Confirm(ConfirmDialog),
 }
@@ -119,7 +119,7 @@ impl Overlay {
     }
 
     pub fn file_picker() -> Self {
-        Overlay::FilePicker(FilePickerOverlay::new())
+        Overlay::FilePicker(Box::default())
     }
 
     pub fn links(overlay: LinkExtractorOverlay) -> Self {
